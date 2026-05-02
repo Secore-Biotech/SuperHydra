@@ -196,3 +196,11 @@ sed -i '/#FROZEN.*PROXY_URL/d' /root/.env
 **Date:** 2026-05-02
 **Author:** Wasseem
 **Decision:** CANCEL TODAY. Decodo provides zero value after the Polymarket order-placement freeze. All remaining operations (reads, resolution checks, on-chain redemption) work from Singapore without proxy. Savings: $85/month.
+
+
+## Execution log
+- 2026-05-02: Subscription cancelled by Wasseem via Decodo dashboard
+- Billing end date: [paste from your cancellation confirmation]
+- Refund: [amount, or "none -- monthly billing, runs to end of cycle"]
+- Confirmation reference: [email subject or screenshot path]
+- Status: cancelled, account dormant (not deleted, in case re-subscription ever needed)
