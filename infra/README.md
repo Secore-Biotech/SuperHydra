@@ -2,7 +2,7 @@
 
 ## Phase 1 development environment
 
-Local Postgres 16 + TimescaleDB + pg_partman via Docker Compose.
+Local Postgres 16 + TimescaleDB via Docker Compose. Partition lifecycle is application-managed (native Postgres PARTITION BY RANGE); TimescaleDB hypertables handle time-series tables.
 
 ### Start the database
 
@@ -32,7 +32,7 @@ Inside psql, verify extensions:
 SELECT extname, extversion FROM pg_extension ORDER BY extname;
 ```
 
-Expected extensions: pgcrypto, pg_partman, plpgsql, timescaledb.
+Expected extensions: pgcrypto, plpgsql, timescaledb.
 
 Verify UUIDv7 function:
 
@@ -57,3 +57,30 @@ Available as `DATABASE_URL` environment variable when `.env` is copied from `.en
 ### Migrations
 
 SQL migrations live in `infra/postgres/migrations/`, applied in lexicographic order. The first migration creates the schemas and tables per ledger schema v0.3 (`docs/decisions/2026-05-02-ledger-schema-design-v0.3.md`).
+
+## Migrations (Phase 1+)
+
+Migrations use Alembic with handwritten SQL. Migration files live in `infra/migrations/versions/`.
+
+### Run migrations
+
+```bash
+cd ~/Downloads/hydra-next
+pip install -e .  # one time
+alembic -c infra/migrations/alembic.ini upgrade head
+```
+
+### Run migration tests
+
+```bash
+docker compose -f infra/docker/docker-compose.yml up -d
+pytest tests/integration/test_migrations.py -v
+```
+
+Migration tests require the Docker Postgres to be running on localhost:5432.
+
+### Rollback to clean state
+
+```bash
+alembic -c infra/migrations/alembic.ini downgrade base
+```
