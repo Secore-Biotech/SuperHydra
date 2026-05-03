@@ -1,0 +1,23 @@
+# Phase 1 dev environment
+.env
+infra/docker/.env
+
+# Python virtual environments (Phase 1 implementation)
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Database dumps and local data
+*.sql.gz
+local_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store

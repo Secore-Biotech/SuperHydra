@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    container_name: superhydra_postgres
+    environment:
+      POSTGRES_DB: superhydra
+      POSTGRES_USER: superhydra
+      POSTGRES_PASSWORD: superhydra_dev_only
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - superhydra_pgdata:/home/postgres/pgdata/data
+      - ../postgres/extensions:/docker-entrypoint-initdb.d:ro
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c log_timezone=UTC
+      -c timezone=UTC
+      -c log_min_duration_statement=200
+      -c log_statement=ddl
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U superhydra -d superhydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+volumes:
+  superhydra_pgdata:
+    driver: local
