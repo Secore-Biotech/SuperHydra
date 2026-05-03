@@ -875,3 +875,524 @@ def test_0003_downgrade_clean(fresh_db):
 
     missing_core = core_tables - remaining
     assert not missing_core, f"Core tables wrongly dropped: {missing_core}"
+
+
+# ============================================================
+# Migration 0004 tests: registry_strategy_model
+# ============================================================
+
+
+def _setup_strategy_for_promotion(cur):
+    """Helper: insert a strategy."""
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES ('mn_ls_test', 'MN L/S Test', 'research', NOW(), 'docs/hypotheses/mn_ls.md')
+        RETURNING id
+    """)
+    return cur.fetchone()[0]
+
+
+def test_0004_creates_all_tables(fresh_db):
+    """Migration 0004 must create 11 tables."""
+    result = _alembic("upgrade", "0004")
+    assert result.returncode == 0, f"Migration failed: {result.stderr}"
+
+    expected_tables = {
+        "promotions", "features", "models", "model_deployments",
+        "signal_batches", "allocator_runs", "allocator_run_signal_batches",
+        "target_weights", "portfolio_strategies", "model_features",
+        "strategy_feature_dependencies",
+    }
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'registry' AND table_name = ANY(%s)
+            """, (list(expected_tables),))
+            found = {row[0] for row in cur.fetchall()}
+
+    assert found == expected_tables, f"Missing tables: {expected_tables - found}"
+
+
+def test_0004_promotion_yubikey_required_for_canary(fresh_db):
+    """Promotion to canary/scale requires yubikey signature method."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            conn.commit()
+
+            # GPG for shadow: accepted
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'gpg-sig',
+                        'gpg', 'docs/reports/mn_ls_shadow.md')
+                RETURNING id
+            """, (strategy_id,))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+            # GPG for canary: rejected
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO registry.promotions
+                        (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                         signature_method, gate_evidence_doc_path)
+                    VALUES (%s, 'shadow', 'canary', 'wasseem', 'gpg-sig',
+                            'gpg', 'docs/reports/mn_ls_canary.md')
+                """, (strategy_id,))
+            conn.rollback()
+
+
+def test_0004_active_promotion_uniqueness(fresh_db):
+    """Each strategy has at most one active (un-revoked) promotion."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            conn.commit()
+
+            # First active promotion
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig1',
+                        'gpg', 'docs/p1.md')
+                RETURNING id
+            """, (strategy_id,))
+            first_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Second active promotion: rejected by partial unique index
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO registry.promotions
+                        (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                         signature_method, gate_evidence_doc_path)
+                    VALUES (%s, 'shadow', 'canary', 'wasseem', 'sig2',
+                            'yubikey', 'docs/p2.md')
+                """, (strategy_id,))
+            conn.rollback()
+
+            # Revoke first with full audit fields
+            cur.execute("""
+                UPDATE registry.promotions
+                SET revoked_at = NOW(), revoked_by = 'wasseem',
+                    revocation_signature = 'rev-sig', revocation_signature_method = 'gpg',
+                    revocation_reason = 'Superseded by canary promotion'
+                WHERE id = %s
+            """, (first_id,))
+            conn.commit()
+
+            # New active promotion now accepted
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'shadow', 'canary', 'wasseem', 'sig2',
+                        'yubikey', 'docs/p2.md')
+                RETURNING id
+            """, (strategy_id,))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004_revocation_audit_completeness(fresh_db):
+    """Revocation requires all 4 audit fields together; partial revocation rejected."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+                RETURNING id
+            """, (strategy_id,))
+            promo_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Setting only revoked_at without revoked_by: rejected
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    UPDATE registry.promotions
+                    SET revoked_at = NOW()
+                    WHERE id = %s
+                """, (promo_id,))
+            conn.rollback()
+
+
+def test_0004_feature_data_sources_must_be_array(fresh_db):
+    """data_sources JSONB must be an array, not object or scalar."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            # Object rejected
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO registry.features
+                        (feature_name, version, definition, computation_script_path,
+                         data_sources, refresh_cadence)
+                    VALUES ('bad', 1, 'def', 'p.py', '{}'::jsonb, '1h')
+                """)
+            conn.rollback()
+
+            # Array accepted
+            cur.execute("""
+                INSERT INTO registry.features
+                    (feature_name, version, definition, computation_script_path,
+                     data_sources, refresh_cadence)
+                VALUES ('good', 1, 'def', 'p.py',
+                        '[{"vendor_id": 1, "data_type": "ohlcv"}]'::jsonb, '1h')
+                RETURNING id
+            """)
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004_model_deployment_strategy_role(fresh_db):
+    """Two primary deployments for same strategy/environment overlapping rejected; different roles allowed."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+
+            # Create two models for the strategy
+            cur.execute("""
+                INSERT INTO registry.models
+                    (strategy_id, version_id, model_class, training_data_hash,
+                     feature_set_hash, hyperparam_hash, artifact_path, artifact_hash, trained_at)
+                VALUES
+                    (%s, 'model_a', 'lightgbm', 'data_v1', 'feat_v1', 'h1', 's3://m_a', 'sha:a', NOW()),
+                    (%s, 'model_b', 'lightgbm', 'data_v1', 'feat_v1', 'h2', 's3://m_b', 'sha:b', NOW())
+                RETURNING id
+            """, (strategy_id, strategy_id))
+            ids = [row[0] for row in cur.fetchall()]
+            model_a, model_b = ids[0], ids[1]
+            conn.commit()
+
+            # First primary deployment for strategy in shadow
+            cur.execute("""
+                INSERT INTO registry.model_deployments
+                    (model_id, strategy_id, environment, deployment_role,
+                     deployed_at, retired_at, deployed_by)
+                VALUES (%s, %s, 'shadow', 'primary',
+                        '2024-01-01 00:00:00+00', '2024-12-01 00:00:00+00', 'wasseem')
+            """, (model_a, strategy_id))
+            conn.commit()
+
+            # Second primary deployment for SAME strategy/environment overlapping: rejected
+            with pytest.raises(psycopg.errors.ExclusionViolation):
+                cur.execute("""
+                    INSERT INTO registry.model_deployments
+                        (model_id, strategy_id, environment, deployment_role,
+                         deployed_at, deployed_by)
+                    VALUES (%s, %s, 'shadow', 'primary',
+                            '2024-06-01 00:00:00+00', 'wasseem')
+                """, (model_b, strategy_id))
+            conn.rollback()
+
+            # Challenger role overlapping with primary: accepted (different role)
+            cur.execute("""
+                INSERT INTO registry.model_deployments
+                    (model_id, strategy_id, environment, deployment_role,
+                     deployed_at, deployed_by)
+                VALUES (%s, %s, 'shadow', 'challenger',
+                        '2024-06-01 00:00:00+00', 'wasseem')
+                RETURNING id
+            """, (model_b, strategy_id))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004_signal_batch_uses_uuidv7(fresh_db):
+    """signal_batches PK is UUIDv7."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO registry.signal_batches
+                    (strategy_id, feature_version, data_snapshot_id, batch_size, generated_at)
+                VALUES (%s, 'features_v1', 'snap_001', 50, NOW())
+                RETURNING id
+            """, (strategy_id,))
+            from uuid import UUID
+            uuid_obj = UUID(str(cur.fetchone()[0]))
+            assert (uuid_obj.int >> 76) & 0xF == 7
+
+
+def test_0004_allocator_run_jsonb_array_check(fresh_db):
+    """input_signal_batch_ids must be JSONB array."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('p1', 'P1', 'market_neutral_fund', 'research')
+                RETURNING id
+            """)
+            portfolio_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Object rejected
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO registry.allocator_runs
+                        (portfolio_id, input_signal_batch_ids, objective_version,
+                         constraints_version, solve_status, generated_at)
+                    VALUES (%s, '{}'::jsonb, 'obj_v1', 'cons_v1', 'optimal', NOW())
+                """, (portfolio_id,))
+            conn.rollback()
+
+            # Empty array accepted
+            cur.execute("""
+                INSERT INTO registry.allocator_runs
+                    (portfolio_id, input_signal_batch_ids, objective_version,
+                     constraints_version, solve_status, generated_at)
+                VALUES (%s, '[]'::jsonb, 'obj_v1', 'cons_v1', 'optimal', NOW())
+                RETURNING id
+            """, (portfolio_id,))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004_allocator_signal_bridge(fresh_db):
+    """allocator_run_signal_batches enforces FK and queryable lineage."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('p1', 'P1', 'market_neutral_fund', 'research')
+                RETURNING id
+            """)
+            portfolio_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Create signal batch
+            cur.execute("""
+                INSERT INTO registry.signal_batches
+                    (strategy_id, feature_version, data_snapshot_id, batch_size, generated_at)
+                VALUES (%s, 'fv1', 'snap_001', 50, NOW())
+                RETURNING id
+            """, (strategy_id,))
+            batch_id = cur.fetchone()[0]
+
+            # Create allocator run
+            cur.execute("""
+                INSERT INTO registry.allocator_runs
+                    (portfolio_id, input_signal_batch_ids, objective_version,
+                     constraints_version, solve_status, generated_at)
+                VALUES (%s, '[]'::jsonb, 'obj_v1', 'cons_v1', 'optimal', NOW())
+                RETURNING id
+            """, (portfolio_id,))
+            run_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Bridge accepts valid signal_batch_id
+            cur.execute("""
+                INSERT INTO registry.allocator_run_signal_batches
+                    (allocator_run_id, signal_batch_id)
+                VALUES (%s, %s)
+            """, (run_id, batch_id))
+            conn.commit()
+
+            # Bridge rejects nonexistent signal_batch_id
+            from uuid import uuid4
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                cur.execute("""
+                    INSERT INTO registry.allocator_run_signal_batches
+                        (allocator_run_id, signal_batch_id)
+                    VALUES (%s, %s)
+                """, (run_id, uuid4()))
+            conn.rollback()
+
+            # Queryable lineage: signal batches consumed by run
+            cur.execute("""
+                SELECT signal_batch_id FROM registry.allocator_run_signal_batches
+                WHERE allocator_run_id = %s
+            """, (run_id,))
+            consumed = [row[0] for row in cur.fetchall()]
+            assert len(consumed) == 1
+
+
+def test_0004_target_weights_signed(fresh_db):
+    """target_weight allows positive (long) and negative (short) values."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            venue_id, _, _, instrument_id, _ = _setup_basic_registry(cur)
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('p1', 'P1', 'market_neutral_fund', 'research')
+                RETURNING id
+            """)
+            portfolio_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO registry.allocator_runs
+                    (portfolio_id, input_signal_batch_ids, objective_version,
+                     constraints_version, solve_status, generated_at)
+                VALUES (%s, '[]'::jsonb, 'obj_v1', 'cons_v1', 'optimal', NOW())
+                RETURNING id
+            """, (portfolio_id,))
+            run_id = cur.fetchone()[0]
+            conn.commit()
+
+            # Negative weight (short) accepted
+            cur.execute("""
+                INSERT INTO registry.target_weights
+                    (allocator_run_id, instrument_id, target_weight)
+                VALUES (%s, %s, -0.05)
+                RETURNING id
+            """, (run_id, instrument_id))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004_portfolio_strategy_active_risk_nonneg(fresh_db):
+    """active_risk_weight must be nonnegative."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('p1', 'P1', 'market_neutral_fund', 'research')
+                RETURNING id
+            """)
+            portfolio_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO registry.portfolio_strategies
+                        (portfolio_id, strategy_id, active_risk_weight, starts_at)
+                    VALUES (%s, %s, -0.5, NOW())
+                """, (portfolio_id, strategy_id))
+            conn.rollback()
+
+
+def test_0004_model_features_simple_bridge(fresh_db):
+    """model_features bridge with simplified (model_id, feature_id) PK."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            cur.execute("""
+                INSERT INTO registry.models
+                    (strategy_id, version_id, model_class, training_data_hash,
+                     feature_set_hash, hyperparam_hash, artifact_path, artifact_hash, trained_at)
+                VALUES (%s, 'm1', 'lightgbm', 'data_v1', 'feat_v1', 'h1', 's3://m', 'sha:1', NOW())
+                RETURNING id
+            """, (strategy_id,))
+            model_id = cur.fetchone()[0]
+
+            cur.execute("""
+                INSERT INTO registry.features
+                    (feature_name, version, definition, computation_script_path,
+                     data_sources, refresh_cadence)
+                VALUES ('funding_zscore', 1, 'fz', 'fz.py', '[]'::jsonb, '1h')
+                RETURNING id
+            """)
+            feature_id = cur.fetchone()[0]
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO registry.model_features (model_id, feature_id)
+                VALUES (%s, %s)
+            """, (model_id, feature_id))
+            conn.commit()
+
+            # Duplicate (model, feature) rejected
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO registry.model_features (model_id, feature_id)
+                    VALUES (%s, %s)
+                """, (model_id, feature_id))
+            conn.rollback()
+
+
+def test_0004_strategy_feature_dependencies_for_oms(fresh_db):
+    """strategy_feature_dependencies enables OMS require_data_fresh check."""
+    _alembic("upgrade", "0004")
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_promotion(cur)
+            cur.execute("""
+                INSERT INTO registry.features
+                    (feature_name, version, definition, computation_script_path,
+                     data_sources, refresh_cadence)
+                VALUES ('fz', 1, 'fz', 'fz.py', '[]'::jsonb, '1h')
+                RETURNING id
+            """)
+            feature_id = cur.fetchone()[0]
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO registry.strategy_feature_dependencies
+                    (strategy_id, feature_id, required)
+                VALUES (%s, %s, TRUE)
+            """, (strategy_id, feature_id))
+            conn.commit()
+
+            cur.execute("""
+                SELECT feature_id, required
+                FROM registry.strategy_feature_dependencies
+                WHERE strategy_id = %s AND required = TRUE
+            """, (strategy_id,))
+            deps = cur.fetchall()
+            assert len(deps) == 1
+            assert deps[0] == (feature_id, True)
+
+
+def test_0004_downgrade_clean(fresh_db):
+    """Downgrade to 0003 drops all 11 tables; earlier registry preserved."""
+    _alembic("upgrade", "0004")
+    result = _alembic("downgrade", "0003")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+
+    strategy_model_tables = {
+        "promotions", "features", "models", "model_deployments",
+        "signal_batches", "allocator_runs", "allocator_run_signal_batches",
+        "target_weights", "portfolio_strategies", "model_features",
+        "strategy_feature_dependencies",
+    }
+    earlier_tables = {
+        "venues", "assets", "instruments", "accounts", "portfolios", "strategies",
+        "vendors", "symbol_translations", "instrument_specs_history", "fee_schedules",
+        "asset_clusters", "asset_cluster_memberships", "venue_capabilities",
+    }
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables WHERE table_schema = 'registry'
+            """)
+            remaining = {row[0] for row in cur.fetchall()}
+
+    leaked = remaining & strategy_model_tables
+    assert not leaked, f"Strategy/model tables not dropped: {leaked}"
+    missing_earlier = earlier_tables - remaining
+    assert not missing_earlier, f"Earlier tables wrongly dropped: {missing_earlier}"
