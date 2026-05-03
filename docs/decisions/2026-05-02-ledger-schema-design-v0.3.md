@@ -203,3 +203,52 @@ These tests fail if the schema doesn't enforce the typing correctly.
 | 0.1 | 2026-05-02 | Wasseem Katt | Initial design |
 | 0.2 | 2026-05-02 | Wasseem Katt + external reviewer | Enterprise ledger upgrade |
 | 0.3 | 2026-05-02 | Wasseem Katt + external reviewer | Added pnl_environment and pnl_settlement_type columns to accounting.strategy_pnl, accounting.ledger_entries, positions.position_snapshots. Refined conservation trigger to scope per environment. Added partial indexes on LIVE + CONFIRMED_SETTLED query path. Added two acceptance criteria for environment-aware Sharpe and conservative-NAV queries |
+
+---
+
+## Addendum: corrected gen_uuidv7() function (2026-05-03)
+
+The gen_uuidv7() function specified in the original v0.3 body is incorrect. It produces 18-byte hex strings (36 chars) which cannot be cast to UUID (16 bytes / 32 hex chars). The bug: int8send(unix_ts_ms) returns 8 bytes; concatenated with gen_random_bytes(10) the result is 18 bytes, not 16.
+
+Discovered at Phase 1 dev environment setup (commit b01e333). The corrected implementation, verified working with init-time sanity test:
+
+```sql
+CREATE OR REPLACE FUNCTION gen_uuidv7() RETURNS UUID AS $$
+DECLARE
+    unix_ts_ms_bytes BYTEA;
+    rand_bytes BYTEA;
+    uuid_bytes BYTEA;
+BEGIN
+    -- 48-bit timestamp: take last 6 bytes of the 8-byte BIGINT
+    unix_ts_ms_bytes := substring(int8send((EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT) FROM 3 FOR 6);
+    
+    -- 10 random bytes for the rest of the 16-byte UUID
+    rand_bytes := gen_random_bytes(10);
+    
+    -- Concatenate: 6 timestamp + 10 random = 16 bytes
+    uuid_bytes := unix_ts_ms_bytes || rand_bytes;
+    
+    -- Set version 7 in byte 6 (top 4 bits = 0111)
+    uuid_bytes := set_byte(uuid_bytes, 6, (get_byte(uuid_bytes, 6) & 15) | 112);
+    
+    -- Set RFC 4122 variant in byte 8 (top 2 bits = 10)
+    uuid_bytes := set_byte(uuid_bytes, 8, (get_byte(uuid_bytes, 8) & 63) | 128);
+    
+    RETURN encode(uuid_bytes, 'hex')::UUID;
+END;
+$$ LANGUAGE plpgsql VOLATILE;
+```
+
+Validation: after install, test with:
+```sql
+SELECT 
+    gen_uuidv7() AS sample,
+    length(gen_uuidv7()::text) AS should_be_36,
+    substring(gen_uuidv7()::text, 15, 1) AS should_be_7;
+```
+
+Expected: valid UUID; length 36; version nibble 7.
+
+Time-ordering: UUIDv7 sorts by millisecond timestamp; sub-millisecond ordering is random per RFC 9562. UUIDs generated in different milliseconds sort in generation order; UUIDs generated within the same millisecond sort randomly. This is by design and acceptable for UUIDv7 use cases (primary keys, time-ordered indexes).
+
+Production reference: infra/postgres/extensions/00_init_extensions.sql committed at b01e333.
