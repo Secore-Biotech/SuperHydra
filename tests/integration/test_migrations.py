@@ -2872,3 +2872,411 @@ def test_0005_downgrade_clean(fresh_db):
                 WHERE table_schema = 'registry' AND table_type = 'BASE TABLE'
             """)
             assert cur.fetchone()[0] == 24
+
+
+# ============================================================
+# Migration 0004c tests: registry_guardrails_followup (v3)
+# ============================================================
+
+
+def _setup_strategy_for_0004c(cur, name='mn_ls_test'):
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES (%s, 'Test', 'research', NOW(), 'docs/h.md')
+        RETURNING id
+    """, (name,))
+    return cur.fetchone()[0]
+
+
+def _setup_model_for_0004c(cur, strategy_id, version_id='m1'):
+    cur.execute("""
+        INSERT INTO registry.models
+            (strategy_id, version_id, model_class, training_data_hash,
+             feature_set_hash, hyperparam_hash, artifact_path, artifact_hash, trained_at)
+        VALUES (%s, %s, 'lightgbm', 'd1', 'f1', 'h1', 's3://m', 'sha:1', NOW())
+        RETURNING id
+    """, (strategy_id, version_id))
+    return cur.fetchone()[0]
+
+
+def _setup_active_deployment(cur, strategy_id, model_id, slot='default'):
+    cur.execute("""
+        INSERT INTO registry.model_deployments
+            (model_id, strategy_id, environment, deployment_role, deployment_slot,
+             deployed_at, deployed_by)
+        VALUES (%s, %s, 'shadow', 'primary', %s, NOW(), 'wasseem')
+        RETURNING id
+    """, (model_id, strategy_id, slot))
+    return cur.fetchone()[0]
+
+
+def test_0004c_direct_strategy_phase_update_blocked(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.strategies SET current_phase = 'canary' WHERE id = %s", (strategy_id,))
+            conn.rollback()
+            cur.execute("UPDATE registry.strategies SET description = 'updated' WHERE id = %s RETURNING description", (strategy_id,))
+            assert cur.fetchone()[0] == 'updated'
+            conn.commit()
+
+
+def test_0004c_promotion_syncs_strategy_phase(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            conn.commit()
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+            """, (strategy_id,))
+            conn.commit()
+            cur.execute("SELECT current_phase FROM registry.strategies WHERE id = %s", (strategy_id,))
+            assert cur.fetchone()[0] == 'shadow'
+
+
+def test_0004c_revocation_with_no_active_promotion_sets_paused(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+                RETURNING id
+            """, (strategy_id,))
+            promo_id = cur.fetchone()[0]
+            conn.commit()
+            cur.execute("""
+                UPDATE registry.promotions
+                SET revoked_at = NOW(), revoked_by = 'wasseem',
+                    revocation_signature = 'rev-sig', revocation_signature_method = 'gpg',
+                    revocation_reason = 'test'
+                WHERE id = %s
+            """, (promo_id,))
+            conn.commit()
+            cur.execute("SELECT current_phase FROM registry.strategies WHERE id = %s", (strategy_id,))
+            assert cur.fetchone()[0] == 'paused'
+
+
+def test_0004c_promotion_must_be_inserted_active(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO registry.promotions
+                        (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                         signature_method, gate_evidence_doc_path,
+                         revoked_at, revoked_by, revocation_signature,
+                         revocation_signature_method, revocation_reason)
+                    VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md',
+                            NOW(), 'wasseem', 'rev', 'gpg', 'pre-revoked')
+                """, (strategy_id,))
+            assert 'inserted active' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0004c_promotion_event_immutability(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+                RETURNING id
+            """, (strategy_id,))
+            promo_id = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.promotions SET to_phase = 'canary' WHERE id = %s", (promo_id,))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.promotions SET gate_evidence_doc_path = 'fake.md' WHERE id = %s", (promo_id,))
+            conn.rollback()
+            cur.execute("""
+                UPDATE registry.promotions
+                SET revoked_at = NOW(), revoked_by = 'wasseem',
+                    revocation_signature = 'rev', revocation_signature_method = 'gpg',
+                    revocation_reason = 'test'
+                WHERE id = %s
+                RETURNING revoked_at
+            """, (promo_id,))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.promotions SET revocation_reason = 'changed' WHERE id = %s", (promo_id,))
+            conn.rollback()
+
+
+def test_0004c_model_must_be_inserted_active(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO registry.models
+                        (strategy_id, version_id, model_class, training_data_hash,
+                         feature_set_hash, hyperparam_hash, artifact_path, artifact_hash, trained_at,
+                         retired_at, retired_by, retirement_reason)
+                    VALUES (%s, 'm_pre_retired', 'lightgbm', 'd1', 'f1', 'h1', 's3://m', 'sha:1', NOW(),
+                            NOW(), 'wasseem', 'pre-retired')
+                """, (strategy_id,))
+            assert 'inserted active' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0004c_deployment_must_be_inserted_active(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO registry.model_deployments
+                        (model_id, strategy_id, environment, deployment_role, deployment_slot,
+                         deployed_at, deployed_by, retired_at, retired_by, retirement_reason)
+                    VALUES (%s, %s, 'shadow', 'primary', 'default', NOW(), 'wasseem',
+                            NOW(), 'wasseem', 'pre-retired')
+                """, (model_id, strategy_id))
+            assert 'inserted active' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0004c_model_retirement_requires_full_metadata(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("UPDATE registry.models SET retired_at = NOW() WHERE id = %s", (model_id,))
+            conn.rollback()
+            cur.execute("""
+                UPDATE registry.models
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'replaced'
+                WHERE id = %s
+                RETURNING retired_at, retired_by, retirement_reason
+            """, (model_id,))
+            row = cur.fetchone()
+            assert row[0] is not None
+            assert row[1] == 'wasseem'
+            assert row[2] == 'replaced'
+            conn.commit()
+
+
+def test_0004c_model_retirement_irreversible(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            cur.execute("""
+                UPDATE registry.models
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'replaced'
+                WHERE id = %s
+            """, (model_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""
+                    UPDATE registry.models
+                    SET retired_at = NULL, retired_by = NULL, retirement_reason = NULL
+                    WHERE id = %s
+                """, (model_id,))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.models SET retirement_reason = 'different' WHERE id = %s", (model_id,))
+            conn.rollback()
+
+
+def test_0004c_deployment_identity_immutability(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_a = _setup_model_for_0004c(cur, strategy_id, 'm_a')
+            model_b = _setup_model_for_0004c(cur, strategy_id, 'm_b')
+            deployment_id = _setup_active_deployment(cur, strategy_id, model_a)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.model_deployments SET model_id = %s WHERE id = %s",
+                           (model_b, deployment_id))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE registry.model_deployments SET environment = 'canary' WHERE id = %s",
+                           (deployment_id,))
+            conn.rollback()
+
+
+def test_0004c_deployment_retirement_irreversible(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            deployment_id = _setup_active_deployment(cur, strategy_id, model_id)
+            conn.commit()
+            import time; time.sleep(0.01)
+            cur.execute("""
+                UPDATE registry.model_deployments
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'paused'
+                WHERE id = %s
+            """, (deployment_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""
+                    UPDATE registry.model_deployments
+                    SET retired_at = NULL, retired_by = NULL, retirement_reason = NULL
+                    WHERE id = %s
+                """, (deployment_id,))
+            conn.rollback()
+
+
+def test_0004c_cannot_deploy_retired_model(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            cur.execute("""
+                UPDATE registry.models
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'experimental'
+                WHERE id = %s
+            """, (model_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO registry.model_deployments
+                        (model_id, strategy_id, environment, deployment_role, deployment_slot,
+                         deployed_at, deployed_by)
+                    VALUES (%s, %s, 'shadow', 'primary', 'default', NOW(), 'wasseem')
+                """, (model_id, strategy_id))
+            assert 'retired' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0004c_cannot_retire_model_with_active_deployment(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            _setup_active_deployment(cur, strategy_id, model_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE registry.models
+                    SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'replaced'
+                    WHERE id = %s
+                """, (model_id,))
+            assert 'active deployment' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0004c_can_retire_deployment_then_model(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            deployment_id = _setup_active_deployment(cur, strategy_id, model_id)
+            conn.commit()
+            cur.execute("""
+                UPDATE registry.model_deployments
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'switching'
+                WHERE id = %s
+            """, (deployment_id,))
+            cur.execute("""
+                UPDATE registry.models
+                SET retired_at = NOW(), retired_by = 'wasseem', retirement_reason = 'replaced'
+                WHERE id = %s
+                RETURNING retired_at
+            """, (model_id,))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0004c_audit_records_cannot_be_deleted(fresh_db):
+    _alembic("upgrade", "0004c")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            strategy_id = _setup_strategy_for_0004c(cur)
+            model_id = _setup_model_for_0004c(cur, strategy_id)
+            deployment_id = _setup_active_deployment(cur, strategy_id, model_id)
+            cur.execute("""
+                INSERT INTO registry.promotions
+                    (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+                     signature_method, gate_evidence_doc_path)
+                VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+                RETURNING id
+            """, (strategy_id,))
+            promo_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO registry.features
+                    (feature_name, version, definition, computation_script_path,
+                     data_sources, refresh_cadence)
+                VALUES ('feat_test', 1, 'def', 'fz.py', '[]'::jsonb, '1h')
+                RETURNING id
+            """)
+            feature_id = cur.fetchone()[0]
+            conn.commit()
+
+            for table, row_id in [
+                ('promotions', promo_id),
+                ('model_deployments', deployment_id),
+                ('models', model_id),
+                ('features', feature_id),
+            ]:
+                with pytest.raises(psycopg.errors.RaiseException) as exc:
+                    cur.execute(f"DELETE FROM registry.{table} WHERE id = %s", (row_id,))
+                assert 'append-only' in str(exc.value).lower() or 'forbidden' in str(exc.value).lower()
+                conn.rollback()
+
+
+def test_0004c_downgrade_clean(fresh_db):
+    _alembic("upgrade", "0004c")
+    result = _alembic("downgrade", "0005")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'registry'
+                  AND proname IN ('enforce_strategy_phase_cache_update',
+                                  'enforce_no_deploy_retired_model',
+                                  'enforce_no_retire_with_active_deployments',
+                                  'enforce_model_retirement_irreversibility',
+                                  'enforce_deployment_retirement_irreversibility',
+                                  'enforce_promotion_event_immutability',
+                                  'enforce_deployment_identity_immutability',
+                                  'enforce_model_insert_active',
+                                  'enforce_deployment_insert_active',
+                                  'prevent_registry_audit_delete')
+            """)
+            assert cur.fetchall() == []
+            cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_schema = 'registry'
+                  AND ((table_name = 'models' AND column_name = 'retired_by')
+                       OR (table_name = 'model_deployments' AND column_name IN ('retired_by', 'retirement_reason')))
+            """)
+            assert cur.fetchall() == []
