@@ -16,6 +16,9 @@ __pycache__/
 *.sql.gz
 local_data/
 
+# Build artifacts
+*.egg-info/
+
 # IDE
 .vscode/
 .idea/

@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "superhydra"
 version = "0.1.0"
@@ -18,9 +22,23 @@ dev = [
     "mypy>=1.10",
 ]
 
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "core*",
+    "data*",
+    "execution*",
+    "research*",
+]
+exclude = [
+    "tests*",
+    "infra*",
+    "docs*",
+]
+
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "N", "B"]
