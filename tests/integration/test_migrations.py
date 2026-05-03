@@ -1928,3 +1928,947 @@ def test_0004b_downgrade_clean(fresh_db):
                   AND column_name = 'input_signal_batch_ids'
             """)
             assert cur.fetchone() is not None
+
+
+# ============================================================
+# Migration 0005 tests: accounting_double_entry (v7)
+# ============================================================
+
+from datetime import datetime, timezone
+from decimal import Decimal
+
+
+def _setup_basic_accounting(cur):
+    """Helper: registry data + ledger accounts. Returns dict of IDs."""
+    cur.execute("""
+        INSERT INTO registry.venues (venue_code, display_name, venue_type, status)
+        VALUES ('binance_futures', 'Binance Futures', 'cex_futures', 'active')
+        RETURNING id
+    """)
+    venue_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status)
+        VALUES ('BTC', 'Bitcoin', 'crypto', 8, 'active'),
+               ('USDT', 'Tether', 'stablecoin', 6, 'active')
+        RETURNING id
+    """)
+    ids = [row[0] for row in cur.fetchall()]
+    btc_id, usdt_id = ids[0], ids[1]
+
+    cur.execute("""
+        INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status)
+        VALUES (%s, 'binance_master', 'Master', 'trading', 'active')
+        RETURNING id
+    """, (venue_id,))
+    registry_account_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+        VALUES ('mn_ls_p1', 'MN L/S P1', 'market_neutral_fund', 'research')
+        RETURNING id
+    """)
+    portfolio_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES ('mn_ls_test', 'MN L/S Test', 'research', NOW(), 'docs/h.md')
+        RETURNING id
+    """)
+    strategy_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.ledger_accounts
+            (account_code, account_name, account_type, account_subtype,
+             portfolio_id, strategy_id, registry_account_id, asset_id)
+        VALUES
+            ('USDT_CASH', 'USDT Cash', 'asset', 'cash',
+             %s, %s, %s, %s),
+            ('BTC_POSITION', 'BTC Position', 'asset', 'position',
+             %s, %s, %s, %s),
+            ('FEE_EXPENSE', 'Fee Expense', 'expense', 'fee_expense',
+             %s, %s, %s, %s)
+        RETURNING id
+    """, (portfolio_id, strategy_id, registry_account_id, usdt_id,
+          portfolio_id, strategy_id, registry_account_id, btc_id,
+          portfolio_id, strategy_id, registry_account_id, usdt_id))
+    ledger_ids = [row[0] for row in cur.fetchall()]
+
+    return {
+        'portfolio_id': portfolio_id, 'strategy_id': strategy_id,
+        'registry_account_id': registry_account_id, 'venue_id': venue_id,
+        'btc_id': btc_id, 'usdt_id': usdt_id,
+        'cash_acct': ledger_ids[0], 'pos_acct': ledger_ids[1], 'fee_acct': ledger_ids[2],
+    }
+
+
+def _create_draft_journal(cur, ctx, source_id='fill_001', journal_at=None,
+                           source_namespace='binance_futures'):
+    """Helper: create a draft trade journal."""
+    if journal_at is None:
+        journal_at = datetime.now(timezone.utc)
+    cur.execute("""
+        INSERT INTO accounting.journals
+            (journal_type, portfolio_id, strategy_id, journal_at,
+             source_type, source_namespace, source_id, created_by)
+        VALUES ('trade', %s, %s, %s, 'fill', %s, %s, 'wasseem')
+        RETURNING id
+    """, (ctx['portfolio_id'], ctx['strategy_id'], journal_at, source_namespace, source_id))
+    return cur.fetchone()[0]
+
+
+def test_0005_creates_all_tables(fresh_db):
+    """Migration 0005 creates 3 accounting tables."""
+    result = _alembic("upgrade", "0005")
+    assert result.returncode == 0, f"Migration failed: {result.stderr}"
+
+    expected = {"ledger_accounts", "journals", "ledger_entries"}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'accounting' AND table_name = ANY(%s)
+            """, (list(expected),))
+            assert {row[0] for row in cur.fetchall()} == expected
+
+
+def test_0005_journal_at_required(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.NotNullViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id,
+                         source_type, source_namespace, source_id, created_by)
+                    VALUES ('trade', %s, %s, 'fill', 'global', 'f1', 'wasseem')
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            conn.rollback()
+
+
+def test_0005_balanced_journal_posts(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx)
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, quantity, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 0.01, 1000),
+                       (%s, %s, 'credit', %s, 1000, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            conn.commit()
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            cur.execute("SELECT status, posted_at, posted_by FROM accounting.journals WHERE id = %s", (j_id,))
+            status, posted_at, posted_by = cur.fetchone()
+            assert status == 'posted'
+            assert posted_at is not None
+            assert posted_by == 'wasseem'
+
+
+def test_0005_unbalanced_journal_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='unbal_1')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 999)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            assert 'unbalanced' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_one_sided_journal_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='one_sided')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.rollback()
+
+
+def test_0005_zero_amount_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='zero_amt')
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.ledger_entries
+                        (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                    VALUES (%s, %s, 'debit', %s, 0)
+                """, (j_id, ctx['pos_acct'], ctx['btc_id']))
+            conn.rollback()
+
+
+def test_0005_direct_status_update_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='direct_post_attack')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE accounting.journals
+                    SET status = 'posted', posted_at = NOW(), posted_by = 'attacker'
+                    WHERE id = %s
+                """, (j_id,))
+            assert 'forbidden' in str(exc.value).lower() or 'use accounting.post_journal' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_direct_posted_insert_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, status, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, source_id, created_by, posted_by, posted_at)
+                    VALUES ('trade', 'posted', %s, %s, NOW(),
+                            'fill', 'binance_futures', 'sneak_1', 'attacker', 'attacker', NOW())
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            assert 'must be inserted as draft' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_posted_journal_no_new_entries(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='no_new_entries')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""
+                    INSERT INTO accounting.ledger_entries
+                        (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                    VALUES (%s, %s, 'debit', %s, 100)
+                """, (j_id, ctx['fee_acct'], ctx['usdt_id']))
+            conn.rollback()
+
+
+def test_0005_entry_move_to_posted_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_a = _create_draft_journal(cur, ctx, source_id='post_a')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+                RETURNING id
+            """, (j_a, ctx['pos_acct'], ctx['btc_id'],
+                  j_a, ctx['cash_acct'], ctx['usdt_id']))
+            entry_ids = [row[0] for row in cur.fetchall()]
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_a,))
+            j_b = _create_draft_journal(cur, ctx, source_id='draft_b')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""
+                    UPDATE accounting.ledger_entries SET journal_id = %s WHERE id = %s
+                """, (j_b, entry_ids[0]))
+            conn.rollback()
+
+
+def test_0005_posted_entries_immutable(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='imm_1')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+                RETURNING id
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            entry_ids = [row[0] for row in cur.fetchall()]
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.ledger_entries SET amount_usd = 999 WHERE id = %s", (entry_ids[0],))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM accounting.ledger_entries WHERE id = %s", (entry_ids[0],))
+            conn.rollback()
+
+
+def test_0005_draft_journal_editable(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='draft_edit')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 500)
+                RETURNING id
+            """, (j_id, ctx['pos_acct'], ctx['btc_id']))
+            e_id = cur.fetchone()[0]
+            cur.execute("UPDATE accounting.ledger_entries SET amount_usd = 1000 WHERE id = %s", (e_id,))
+            cur.execute("DELETE FROM accounting.ledger_entries WHERE id = %s", (e_id,))
+            conn.commit()
+
+
+def test_0005_draft_journal_metadata_editable(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='metadata_edit')
+            conn.commit()
+            cur.execute("""
+                UPDATE accounting.journals
+                SET description = 'edited draft', source_hash = 'sha:abc123'
+                WHERE id = %s
+                RETURNING description, source_hash
+            """, (j_id,))
+            desc, hsh = cur.fetchone()
+            assert desc == 'edited draft'
+            assert hsh == 'sha:abc123'
+            conn.commit()
+
+
+def test_0005_draft_to_reversal_update_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_victim = _create_draft_journal(cur, ctx, source_id='victim_for_fake_reversal')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_victim, ctx['pos_acct'], ctx['btc_id'],
+                  j_victim, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_victim,))
+            j_normal = _create_draft_journal(cur, ctx, source_id='normal_draft_to_reversal')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE accounting.journals
+                    SET journal_type = 'reversal', voids_journal_id = %s
+                    WHERE id = %s
+                """, (j_victim, j_normal))
+            assert 'reversal' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_idempotent_source_event(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            _create_draft_journal(cur, ctx, source_id='idem_1', source_namespace='binance_futures')
+            conn.commit()
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                _create_draft_journal(cur, ctx, source_id='idem_1', source_namespace='binance_futures')
+            conn.rollback()
+
+
+def test_0005_source_namespace_isolation(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j1 = _create_draft_journal(cur, ctx, source_id='same_id_12345', source_namespace='binance_futures')
+            conn.commit()
+            j2 = _create_draft_journal(cur, ctx, source_id='same_id_12345', source_namespace='okx')
+            conn.commit()
+            assert j1 != j2
+
+
+def test_0005_void_journal_creates_reversal_original_stays_posted(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='void_test')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, quantity, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 0.01, 1000),
+                       (%s, %s, 'credit', %s, 1000, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem', 'Test')", (j_id,))
+            reversal_id = cur.fetchone()[0]
+            conn.commit()
+            cur.execute("""
+                SELECT status, voided_at, voided_by, voided_by_journal_id
+                FROM accounting.journals WHERE id = %s
+            """, (j_id,))
+            status, voided_at, voided_by, voided_by_jid = cur.fetchone()
+            assert status == 'posted'
+            assert voided_at is not None
+            assert voided_by == 'wasseem'
+            assert voided_by_jid == reversal_id
+
+
+def test_0005_void_net_zero_per_ledger_account(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='per_account_net_zero')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, quantity, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 0.01, 1000),
+                       (%s, %s, 'credit', %s, 1000, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (j_id,))
+            reversal_id = cur.fetchone()[0]
+            conn.commit()
+            cur.execute("""
+                SELECT e.ledger_account_id,
+                    SUM(CASE e.debit_credit WHEN 'debit' THEN e.amount_usd ELSE -e.amount_usd END)
+                FROM accounting.ledger_entries e
+                JOIN accounting.journals j ON j.id = e.journal_id
+                WHERE j.status = 'posted' AND j.id IN (%s, %s)
+                GROUP BY e.ledger_account_id
+            """, (j_id, reversal_id))
+            for ledger_account_id, account_net in cur.fetchall():
+                assert account_net == Decimal("0"), \
+                    f"Account {ledger_account_id} net is {account_net}, expected 0"
+
+
+def test_0005_double_void_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='double_void')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (j_id,))
+            assert 'already voided' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_reversal_of_reversal_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='reversal_of_reversal')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (j_id,))
+            reversal_id = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (reversal_id,))
+            assert 'reversal' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_cross_asset_trade_balances_in_usd(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='cross_asset_1')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, quantity, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 0.02, 1000),
+                       (%s, %s, 'credit', %s, 1000, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            conn.commit()
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            cur.execute("SELECT status FROM accounting.journals WHERE id = %s", (j_id,))
+            assert cur.fetchone()[0] == 'posted'
+
+
+def test_0005_reversal_entries_by_account(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='reversal_by_account')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, quantity, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 0.01, 1000),
+                       (%s, %s, 'credit', %s, 1000, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem')", (j_id,))
+            reversal_id = cur.fetchone()[0]
+            conn.commit()
+            cur.execute("""
+                SELECT debit_credit FROM accounting.ledger_entries
+                WHERE journal_id = %s AND ledger_account_id = %s
+            """, (reversal_id, ctx['pos_acct']))
+            assert cur.fetchone()[0] == 'credit'
+            cur.execute("""
+                SELECT debit_credit FROM accounting.ledger_entries
+                WHERE journal_id = %s AND ledger_account_id = %s
+            """, (reversal_id, ctx['cash_acct']))
+            assert cur.fetchone()[0] == 'debit'
+
+
+def test_0005_posted_journal_core_immutable(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='core_imm_1')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.journals SET description = 'modified' WHERE id = %s", (j_id,))
+            conn.rollback()
+
+
+def test_0005_source_id_required_except_system(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, created_by)
+                    VALUES ('trade', %s, %s, NOW(), 'fill', 'binance_futures', 'wasseem')
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            conn.rollback()
+            cur.execute("""
+                INSERT INTO accounting.journals
+                    (journal_type, portfolio_id, strategy_id, journal_at,
+                     source_type, source_namespace, created_by, description)
+                VALUES ('adjustment', %s, %s, NOW(), 'system', 'global', 'wasseem', 'period close')
+                RETURNING id
+            """, (ctx['portfolio_id'], ctx['strategy_id']))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0005_direct_void_metadata_update_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j1 = _create_draft_journal(cur, ctx, source_id='void_direct_1')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j1, ctx['pos_acct'], ctx['btc_id'],
+                  j1, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j1,))
+            j2 = _create_draft_journal(cur, ctx, source_id='void_direct_2')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 500), (%s, %s, 'credit', %s, 500)
+            """, (j2, ctx['pos_acct'], ctx['btc_id'],
+                  j2, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j2,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE accounting.journals
+                    SET voided_at = NOW(), voided_by = 'attacker', voided_by_journal_id = %s
+                    WHERE id = %s
+                """, (j2, j1))
+            assert 'use accounting.void_journal' in str(exc.value).lower() or \
+                   'forbidden' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_direct_reversal_journal_creation_blocked(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_victim = _create_draft_journal(cur, ctx, source_id='victim_for_direct_reversal')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_victim, ctx['pos_acct'], ctx['btc_id'],
+                  j_victim, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_victim,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, source_id, created_by, voids_journal_id)
+                    VALUES ('reversal', %s, %s, NOW(),
+                            'reversal', 'binance_futures', %s, 'attacker', %s)
+                """, (ctx['portfolio_id'], ctx['strategy_id'], str(j_victim), j_victim))
+            assert 'reversal' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_ledger_account_identity_immutable_after_posted_use(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            cur.execute("""
+                UPDATE accounting.ledger_accounts
+                SET asset_id = %s
+                WHERE id = %s
+                RETURNING asset_id
+            """, (ctx['usdt_id'], ctx['pos_acct']))
+            assert cur.fetchone()[0] == ctx['usdt_id']
+            cur.execute("""
+                UPDATE accounting.ledger_accounts SET asset_id = %s WHERE id = %s
+            """, (ctx['btc_id'], ctx['pos_acct']))
+            conn.commit()
+            j_id = _create_draft_journal(cur, ctx, source_id='identity_imm')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE accounting.ledger_accounts SET asset_id = %s WHERE id = %s
+                """, (ctx['usdt_id'], ctx['pos_acct']))
+            assert 'identity fields cannot change' in str(exc.value).lower()
+            conn.rollback()
+            cur.execute("""
+                UPDATE accounting.ledger_accounts
+                SET account_name = 'BTC Position (Renamed)', is_active = FALSE
+                WHERE id = %s
+                RETURNING account_name, is_active
+            """, (ctx['pos_acct'],))
+            name, active = cur.fetchone()
+            assert name == 'BTC Position (Renamed)'
+            assert active is False
+            conn.commit()
+
+
+def test_0005_account_type_subtype_alignment(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.ledger_accounts
+                        (account_code, account_name, account_type, account_subtype,
+                         portfolio_id, asset_id)
+                    VALUES ('BAD_1', 'Bad', 'asset', 'fee_expense', %s, %s)
+                """, (ctx['portfolio_id'], ctx['btc_id']))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.ledger_accounts
+                        (account_code, account_name, account_type, account_subtype,
+                         portfolio_id, asset_id)
+                    VALUES ('BAD_2', 'Bad', 'liability', 'cash', %s, %s)
+                """, (ctx['portfolio_id'], ctx['btc_id']))
+            conn.rollback()
+            cur.execute("""
+                INSERT INTO accounting.ledger_accounts
+                    (account_code, account_name, account_type, account_subtype,
+                     portfolio_id, asset_id)
+                VALUES ('DEBT_1', 'Borrow Debt', 'liability', 'debt', %s, %s)
+                RETURNING id
+            """, (ctx['portfolio_id'], ctx['usdt_id']))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0005_empty_text_fields_rejected(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, source_id, created_by)
+                    VALUES ('trade', %s, %s, NOW(), 'fill', '', 'fill_x', 'wasseem')
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, source_id, created_by)
+                    VALUES ('trade', %s, %s, NOW(), 'fill', 'binance', '   ', 'wasseem')
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, strategy_id, journal_at,
+                         source_type, source_namespace, source_id, created_by)
+                    VALUES ('trade', %s, %s, NOW(), 'fill', 'binance', 'fill_y', '')
+                """, (ctx['portfolio_id'], ctx['strategy_id']))
+            conn.rollback()
+
+
+def test_0005_entry_asset_must_match_ledger_account_asset(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='asset_mismatch')
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.ledger_entries
+                        (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                    VALUES (%s, %s, 'credit', %s, 1000)
+                """, (j_id, ctx['cash_acct'], ctx['btc_id']))
+            assert 'asset mismatch' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_entry_portfolio_must_match_journal_portfolio(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('other_portfolio', 'Other Portfolio', 'paper', 'research')
+                RETURNING id
+            """)
+            other_portfolio_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO accounting.ledger_accounts
+                    (account_code, account_name, account_type, account_subtype,
+                     portfolio_id, asset_id)
+                VALUES ('OTHER_CASH', 'Other Cash', 'asset', 'cash', %s, %s)
+                RETURNING id
+            """, (other_portfolio_id, ctx['usdt_id']))
+            other_cash_acct = cur.fetchone()[0]
+            j_id = _create_draft_journal(cur, ctx, source_id='portfolio_mismatch')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.ledger_entries
+                        (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                    VALUES (%s, %s, 'debit', %s, 1000)
+                """, (j_id, other_cash_acct, ctx['usdt_id']))
+            assert 'portfolio mismatch' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_entry_strategy_must_match_journal_strategy(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            cur.execute("""
+                INSERT INTO registry.strategies
+                    (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+                VALUES ('other_strategy', 'Other', 'research', NOW(), 'docs/o.md')
+                RETURNING id
+            """)
+            other_strategy_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO accounting.ledger_accounts
+                    (account_code, account_name, account_type, account_subtype,
+                     portfolio_id, strategy_id, asset_id)
+                VALUES ('OTHER_STRAT_CASH', 'Other Strat Cash', 'asset', 'cash',
+                        %s, %s, %s)
+                RETURNING id
+            """, (ctx['portfolio_id'], other_strategy_id, ctx['usdt_id']))
+            other_strat_acct = cur.fetchone()[0]
+            j_id = _create_draft_journal(cur, ctx, source_id='strategy_mismatch')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.ledger_entries
+                        (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                    VALUES (%s, %s, 'debit', %s, 1000)
+                """, (j_id, other_strat_acct, ctx['usdt_id']))
+            assert 'strategy mismatch' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0005_v5_post_journal_revalidates_after_journal_portfolio_mutation(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('other_portfolio', 'Other Portfolio', 'paper', 'research')
+                RETURNING id
+            """)
+            other_portfolio_id = cur.fetchone()[0]
+            j_id = _create_draft_journal(cur, ctx, source_id='post_time_portfolio_mut')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            conn.commit()
+            cur.execute("""
+                UPDATE accounting.journals SET portfolio_id = %s WHERE id = %s
+            """, (other_portfolio_id, j_id))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            err = str(exc.value).lower()
+            assert 'dimensionally inconsistent' in err or 'portfolio mismatch' in err
+            conn.rollback()
+
+
+def test_0005_v5_post_journal_revalidates_after_journal_strategy_mutation(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            cur.execute("""
+                INSERT INTO registry.strategies
+                    (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+                VALUES ('other_strat', 'Other', 'research', NOW(), 'docs/o.md')
+                RETURNING id
+            """)
+            other_strategy_id = cur.fetchone()[0]
+            j_id = _create_draft_journal(cur, ctx, source_id='post_time_strategy_mut')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000), (%s, %s, 'credit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id'],
+                  j_id, ctx['cash_acct'], ctx['usdt_id']))
+            conn.commit()
+            cur.execute("""
+                UPDATE accounting.journals SET strategy_id = %s WHERE id = %s
+            """, (other_strategy_id, j_id))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+            err = str(exc.value).lower()
+            assert 'dimensionally inconsistent' in err or 'strategy mismatch' in err
+            conn.rollback()
+
+
+def test_0005_v5_ledger_account_identity_immutable_after_draft_entry(fresh_db):
+    _alembic("upgrade", "0005")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_accounting(cur)
+            j_id = _create_draft_journal(cur, ctx, source_id='draft_use_identity')
+            cur.execute("""
+                INSERT INTO accounting.ledger_entries
+                    (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 1000)
+            """, (j_id, ctx['pos_acct'], ctx['btc_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    UPDATE accounting.ledger_accounts SET asset_id = %s WHERE id = %s
+                """, (ctx['usdt_id'], ctx['pos_acct']))
+            assert 'identity fields cannot change' in str(exc.value).lower()
+            conn.rollback()
+            cur.execute("""
+                UPDATE accounting.ledger_accounts
+                SET account_name = 'Renamed', is_active = FALSE
+                WHERE id = %s
+                RETURNING account_name
+            """, (ctx['pos_acct'],))
+            assert cur.fetchone()[0] == 'Renamed'
+            conn.commit()
+
+
+def test_0005_downgrade_clean(fresh_db):
+    _alembic("upgrade", "0005")
+    result = _alembic("downgrade", "0004b")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'accounting' AND table_type = 'BASE TABLE'
+            """)
+            assert cur.fetchall() == []
+            cur.execute("""
+                SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'accounting'
+            """)
+            assert cur.fetchall() == []
+            cur.execute("""
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = 'registry' AND table_type = 'BASE TABLE'
+            """)
+            assert cur.fetchone()[0] == 24
