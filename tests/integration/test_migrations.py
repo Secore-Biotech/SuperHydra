@@ -3280,3 +3280,1002 @@ def test_0004c_downgrade_clean(fresh_db):
                        OR (table_name = 'model_deployments' AND column_name IN ('retired_by', 'retirement_reason')))
             """)
             assert cur.fetchall() == []
+
+
+# ============================================================
+# Migration 0006 tests: accounting_balances_nav_marks_events (v4)
+# ============================================================
+
+from datetime import datetime, timezone, date
+from decimal import Decimal
+
+
+def _setup_basic_0006(cur):
+    """Helper: minimum registry data for 0006 tests."""
+    cur.execute("""
+        INSERT INTO registry.venues (venue_code, display_name, venue_type, status)
+        VALUES ('binance_futures', 'Binance Futures', 'cex_futures', 'active')
+        RETURNING id
+    """)
+    venue_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status)
+        VALUES ('BTC', 'Bitcoin', 'crypto', 8, 'active'),
+               ('USDT', 'Tether', 'stablecoin', 6, 'active')
+        RETURNING id
+    """)
+    ids = [r[0] for r in cur.fetchall()]
+    btc_id, usdt_id = ids[0], ids[1]
+
+    cur.execute("""
+        INSERT INTO registry.instruments
+            (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id,
+             instrument_type, status, config)
+        VALUES ('BTCUSDT-PERP-BINANCE', 'BTC USDT Perp', %s, %s, %s,
+                'perp', 'active', '{}'::jsonb)
+        RETURNING id
+    """, (venue_id, btc_id, usdt_id))
+    instrument_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status)
+        VALUES (%s, 'binance_master', 'Master', 'trading', 'active')
+        RETURNING id
+    """, (venue_id,))
+    account_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+        VALUES ('mn_ls_p1', 'MN L/S P1', 'market_neutral_fund', 'research')
+        RETURNING id
+    """)
+    portfolio_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES ('mn_ls_test', 'MN L/S Test', 'research', NOW(), 'docs/h.md')
+        RETURNING id
+    """)
+    strategy_id = cur.fetchone()[0]
+
+    return {
+        'venue_id': venue_id, 'btc_id': btc_id, 'usdt_id': usdt_id,
+        'instrument_id': instrument_id, 'account_id': account_id,
+        'portfolio_id': portfolio_id, 'strategy_id': strategy_id,
+    }
+
+
+def _create_posted_journal(cur, ctx, journal_type, source_type, source_id,
+                            source_namespace='binance_futures', strategy_id_override='ctx'):
+    """Helper: balanced journal posted via accounting.post_journal()."""
+    cur.execute("""
+        INSERT INTO accounting.ledger_accounts
+            (account_code, account_name, account_type, account_subtype,
+             portfolio_id, strategy_id, registry_account_id, asset_id)
+        VALUES
+            ('USDT_CASH_TEST', 'USDT Cash Test', 'asset', 'cash',
+             %s, %s, %s, %s),
+            ('BTC_POS_TEST', 'BTC Pos Test', 'asset', 'position',
+             %s, %s, %s, %s)
+        ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name
+        RETURNING id
+    """, (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['usdt_id'],
+          ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['btc_id']))
+    rows = cur.fetchall()
+    cash_acct = rows[0][0]
+    pos_acct = rows[1][0]
+
+    if strategy_id_override == 'ctx':
+        sid = ctx['strategy_id']
+    else:
+        sid = strategy_id_override
+
+    cur.execute("""
+        INSERT INTO accounting.journals
+            (journal_type, portfolio_id, strategy_id, journal_at,
+             source_type, source_namespace, source_id, created_by)
+        VALUES (%s, %s, %s, NOW(), %s, %s, %s, 'wasseem')
+        RETURNING id
+    """, (journal_type, ctx['portfolio_id'], sid,
+          source_type, source_namespace, source_id))
+    journal_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.ledger_entries
+            (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+        VALUES (%s, %s, 'debit', %s, 100), (%s, %s, 'credit', %s, 100)
+    """, (journal_id, pos_acct, ctx['btc_id'],
+          journal_id, cash_acct, ctx['usdt_id']))
+    cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+    return journal_id
+
+
+def _create_portfolio_cash_journal(cur, ctx, source_type, source_id, journal_type='cashflow',
+                                     source_namespace='binance_futures'):
+    """Helper for cashflow tests: creates a portfolio-level journal (NULL strategy_id)."""
+    cur.execute("""
+        INSERT INTO accounting.ledger_accounts
+            (account_code, account_name, account_type, account_subtype,
+             portfolio_id, registry_account_id, asset_id)
+        VALUES
+            ('USDT_CASH_PORTFOLIO', 'USDT Portfolio Cash', 'asset', 'cash',
+             %s, %s, %s),
+            ('USDT_CASH_PORTFOLIO_2', 'USDT Portfolio Cash 2', 'asset', 'cash',
+             %s, %s, %s)
+        ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name
+        RETURNING id
+    """, (ctx['portfolio_id'], ctx['account_id'], ctx['usdt_id'],
+          ctx['portfolio_id'], ctx['account_id'], ctx['usdt_id']))
+    rows = cur.fetchall()
+    cash1, cash2 = rows[0][0], rows[1][0]
+
+    cur.execute("""
+        INSERT INTO accounting.journals
+            (journal_type, portfolio_id, strategy_id, journal_at,
+             source_type, source_namespace, source_id, created_by)
+        VALUES (%s, %s, NULL, NOW(), %s, %s, %s, 'wasseem')
+        RETURNING id
+    """, (journal_type, ctx['portfolio_id'], source_type, source_namespace, source_id))
+    j_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.ledger_entries
+            (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+        VALUES (%s, %s, 'debit', %s, 100), (%s, %s, 'credit', %s, 100)
+    """, (j_id, cash1, ctx['usdt_id'], j_id, cash2, ctx['usdt_id']))
+    cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (j_id,))
+    return j_id
+
+
+def _create_mark_set_with_one_mark(cur, ctx, set_hash, purpose='performance_nav',
+                                     mark_type='mid', source_id_suffix=None):
+    """Helper: mark set + one mark with unique source_id and source per set."""
+    if source_id_suffix is None:
+        source_id_suffix = mark_type
+
+    cur.execute("""
+        INSERT INTO accounting.mark_prices
+            (instrument_id, mark_type, price, source, source_namespace, source_id, source_timestamp)
+        VALUES (%s, %s, 50000, %s, 'test', %s, clock_timestamp())
+        RETURNING id
+    """, (ctx['instrument_id'], mark_type, f'test_source_{set_hash}',
+          f'{set_hash}_{source_id_suffix}'))
+    mark_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.mark_price_sets (set_hash, purpose, created_by)
+        VALUES (%s, %s, 'wasseem')
+        RETURNING id
+    """, (set_hash, purpose))
+    set_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.mark_price_set_items (mark_price_set_id, mark_price_id)
+        VALUES (%s, %s)
+    """, (set_id, mark_id))
+
+    return set_id, mark_id
+
+
+def _create_valuation_run(cur, ctx, set_id, val_date=None, hash_suffix='1'):
+    if val_date is None:
+        val_date = date(2026, 5, 1)
+    cur.execute("""
+        INSERT INTO accounting.valuation_runs
+            (portfolio_id, run_type, valuation_date, mark_price_set_id,
+             journal_cutoff_at, engine_version, calculation_hash, created_by)
+        VALUES (%s, 'eod_close', %s, %s, NOW(), 'v0.1', %s, 'wasseem')
+        RETURNING id
+    """, (ctx['portfolio_id'], val_date, set_id, f'hash_run_{hash_suffix}'))
+    return cur.fetchone()[0], val_date
+
+
+def test_0006_creates_all_eleven_tables(fresh_db):
+    """Migration 0006 creates 11 accounting tables."""
+    result = _alembic("upgrade", "0006")
+    assert result.returncode == 0, f"Migration failed: {result.stderr}"
+
+    expected = {
+        "cash_balances", "cashflows", "fees", "funding_payments",
+        "borrow_costs", "mark_prices", "mark_price_sets",
+        "mark_price_set_items", "valuation_runs",
+        "nav_snapshots", "strategy_pnl"
+    }
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'accounting'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name = ANY(%s)
+            """, (list(expected),))
+            assert {r[0] for r in cur.fetchall()} == expected
+
+
+def test_0006_borrow_journal_type_allowed(fresh_db):
+    """journal_type='borrow' was added to journals CHECK in 0006."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO accounting.journals
+                    (journal_type, portfolio_id, strategy_id, journal_at,
+                     source_type, source_namespace, source_id, created_by)
+                VALUES ('borrow', %s, %s, NOW(),
+                        'borrow_event', 'binance_futures', 'borrow_test_1', 'wasseem')
+                RETURNING id
+            """, (ctx['portfolio_id'], ctx['strategy_id']))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0006_cash_balance_negative_balance_requires_zero_locked(fresh_db):
+    """When balance < 0, balance_locked must be 0."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.cash_balances
+                        (account_id, asset_id, balance, balance_locked,
+                         source, source_namespace, snapshot_at)
+                    VALUES (%s, %s, -100, 50, 'venue_api', 'binance_futures', NOW())
+                """, (ctx['account_id'], ctx['usdt_id']))
+            conn.rollback()
+
+            cur.execute("""
+                INSERT INTO accounting.cash_balances
+                    (account_id, asset_id, balance, balance_locked,
+                     source, source_namespace, snapshot_at)
+                VALUES (%s, %s, -100, 0, 'venue_api', 'binance_futures', NOW())
+                RETURNING balance_available
+            """, (ctx['account_id'], ctx['usdt_id']))
+            assert cur.fetchone()[0] == Decimal('-100')
+            conn.commit()
+
+
+def test_0006_cashflow_direction_constraints(fresh_db):
+    """Direction-account combinations enforced."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_portfolio_cash_journal(cur, ctx, 'cashflow', 'cf_dir_journal')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_from_id, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, %s, 1000,
+                            'cashflow', 'binance_futures', 'cf_dir_journal', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['account_id'], ctx['usdt_id'], j_id))
+            conn.rollback()
+
+
+def test_0006_event_journal_link_rejects_draft(fresh_db):
+    """Event linked to draft (unposted) journal is rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+
+            cur.execute("""
+                INSERT INTO accounting.journals
+                    (journal_type, portfolio_id, strategy_id, journal_at,
+                     source_type, source_namespace, source_id, created_by)
+                VALUES ('cashflow', %s, NULL, NOW(),
+                        'cashflow', 'binance_futures', 'cf_draft_1', 'wasseem')
+                RETURNING id
+            """, (ctx['portfolio_id'],))
+            draft_journal_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, 1000,
+                            'cashflow', 'binance_futures', 'cf_draft_1', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['usdt_id'], draft_journal_id))
+            assert 'must be posted' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_event_journal_link_rejects_voided_journal(fresh_db):
+    """v4: Event linked to a voided journal is rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_portfolio_cash_journal(cur, ctx, 'cashflow', 'cf_voided_1')
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem', 'test void')", (j_id,))
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, 1000,
+                            'cashflow', 'binance_futures', 'cf_voided_1', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['usdt_id'], j_id))
+            assert 'voided' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_event_journal_link_rejects_wrong_source_id(fresh_db):
+    """Event source_id mismatch with linked journal is rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_portfolio_cash_journal(cur, ctx, 'cashflow', 'cf_src_match')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, 1000,
+                            'cashflow', 'binance_futures', 'DIFFERENT_ID', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['usdt_id'], j_id))
+            assert 'source_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_event_journal_link_rejects_wrong_journal_type(fresh_db):
+    """Event with wrong journal_type is rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_posted_journal(cur, ctx, 'cashflow', 'fill', 'fee_wrong_type_1')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.fees
+                        (account_id, strategy_id, asset_id, fee_type, amount, amount_usd,
+                         source_type, source_namespace, source_id, charged_at, journal_id)
+                    VALUES (%s, %s, %s, 'taker', 5, 5,
+                            'fill', 'binance_futures', 'fee_wrong_type_1', NOW(), %s)
+                """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j_id))
+            assert 'journal_type' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_event_journal_link_rejects_strategy_mismatch(fresh_db):
+    """Event with strategy_id different from linked journal's is rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+
+            cur.execute("""
+                INSERT INTO registry.strategies
+                    (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+                VALUES ('other_strat', 'Other', 'research', NOW(), 'docs/h.md')
+                RETURNING id
+            """)
+            other_strategy_id = cur.fetchone()[0]
+
+            j_id = _create_posted_journal(cur, ctx, 'fee', 'fill', 'fee_strat_mismatch')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.fees
+                        (account_id, strategy_id, asset_id, fee_type, amount, amount_usd,
+                         source_type, source_namespace, source_id, charged_at, journal_id)
+                    VALUES (%s, %s, %s, 'taker', 5, 5,
+                            'fill', 'binance_futures', 'fee_strat_mismatch', NOW(), %s)
+                """, (ctx['account_id'], other_strategy_id, ctx['usdt_id'], j_id))
+            assert 'strategy_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_cashflow_rejected_with_strategy_journal(fresh_db):
+    """v4: Cashflow journals must be portfolio-level (NULL strategy_id)."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_posted_journal(cur, ctx, 'cashflow', 'cashflow', 'cf_strat_journal')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, 1000,
+                            'cashflow', 'binance_futures', 'cf_strat_journal', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['usdt_id'], j_id))
+            assert 'portfolio-level' in str(exc.value).lower() or 'null strategy_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_cashflow_one_event_per_journal(fresh_db):
+    """UNIQUE(journal_id) prevents two cashflows pointing at the same journal."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_id = _create_portfolio_cash_journal(cur, ctx, 'cashflow', 'cf_one_per_journal')
+
+            cur.execute("""
+                INSERT INTO accounting.cashflows
+                    (direction, account_to_id, asset_id, amount,
+                     source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                VALUES ('deposit', %s, %s, 1000,
+                        'cashflow', 'binance_futures', 'cf_one_per_journal', 'wasseem', NOW(), %s)
+            """, (ctx['account_id'], ctx['usdt_id'], j_id))
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO accounting.cashflows
+                        (direction, account_to_id, asset_id, amount,
+                         source_type, source_namespace, source_id, operator_id, flow_at, journal_id)
+                    VALUES ('deposit', %s, %s, 500,
+                            'cashflow', 'binance_futures', 'cf_one_per_journal', 'wasseem', NOW(), %s)
+                """, (ctx['account_id'], ctx['usdt_id'], j_id))
+            conn.rollback()
+
+
+def test_0006_fee_one_event_per_journal(fresh_db):
+    """UNIQUE(journal_id) on fees."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j1 = _create_posted_journal(cur, ctx, 'fee', 'fill', 'fee_one_journal')
+
+            cur.execute("""
+                INSERT INTO accounting.fees
+                    (account_id, strategy_id, asset_id, fee_type, amount, amount_usd,
+                     source_type, source_namespace, source_id, charged_at, journal_id)
+                VALUES (%s, %s, %s, 'taker', 5, 5,
+                        'fill', 'binance_futures', 'fee_one_journal', NOW(), %s)
+            """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j1))
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO accounting.fees
+                        (account_id, strategy_id, asset_id, fee_type, amount, amount_usd,
+                         source_type, source_namespace, source_id, charged_at, journal_id)
+                    VALUES (%s, %s, %s, 'taker', 5, 5,
+                            'fill', 'binance_futures', 'fee_one_journal', NOW(), %s)
+                """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j1))
+            conn.rollback()
+
+
+def test_0006_funding_one_event_per_journal(fresh_db):
+    """UNIQUE(journal_id) on funding_payments."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j1 = _create_posted_journal(cur, ctx, 'funding', 'funding_event', 'funding_one_journal')
+
+            cur.execute("""
+                INSERT INTO accounting.funding_payments
+                    (account_id, strategy_id, instrument_id, asset_id,
+                     direction, amount, amount_usd, funding_rate,
+                     source_type, source_namespace, source_id, funded_at, journal_id)
+                VALUES (%s, %s, %s, %s, 'paid', 1, 1, 0.0001,
+                        'funding_event', 'binance_futures', 'funding_one_journal', NOW(), %s)
+            """, (ctx['account_id'], ctx['strategy_id'], ctx['instrument_id'], ctx['usdt_id'], j1))
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO accounting.funding_payments
+                        (account_id, strategy_id, instrument_id, asset_id,
+                         direction, amount, amount_usd, funding_rate,
+                         source_type, source_namespace, source_id, funded_at, journal_id)
+                    VALUES (%s, %s, %s, %s, 'paid', 1, 1, 0.0001,
+                            'funding_event', 'binance_futures', 'funding_one_journal', NOW(), %s)
+                """, (ctx['account_id'], ctx['strategy_id'], ctx['instrument_id'], ctx['usdt_id'], j1))
+            conn.rollback()
+
+
+def test_0006_borrow_one_event_per_journal(fresh_db):
+    """UNIQUE(journal_id) on borrow_costs."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j1 = _create_posted_journal(cur, ctx, 'borrow', 'borrow_event', 'borrow_one_journal')
+
+            cur.execute("""
+                INSERT INTO accounting.borrow_costs
+                    (account_id, strategy_id, asset_id,
+                     borrowed_amount, cost_amount, cost_amount_usd, rate, period_seconds,
+                     source_type, source_namespace, source_id, charged_at, journal_id)
+                VALUES (%s, %s, %s, 100, 0.01, 0.01, 0.0001, 3600,
+                        'borrow_event', 'binance_futures', 'borrow_one_journal', NOW(), %s)
+            """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j1))
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO accounting.borrow_costs
+                        (account_id, strategy_id, asset_id,
+                         borrowed_amount, cost_amount, cost_amount_usd, rate, period_seconds,
+                         source_type, source_namespace, source_id, charged_at, journal_id)
+                    VALUES (%s, %s, %s, 100, 0.01, 0.01, 0.0001, 3600,
+                            'borrow_event', 'binance_futures', 'borrow_one_journal', NOW(), %s)
+                """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j1))
+            conn.rollback()
+
+
+def test_0006_source_unique_indexes_exist(fresh_db):
+    """Verify source-idempotency unique indexes exist on event tables."""
+    _alembic("upgrade", "0006")
+    expected_indexes = {
+        'uniq_cashflow_source',
+        'uniq_fee_source',
+        'uniq_funding_source',
+        'uniq_borrow_source',
+        'uniq_mark_prices_source_id',
+    }
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT indexname FROM pg_indexes
+                WHERE schemaname = 'accounting'
+                  AND indexname = ANY(%s)
+            """, (list(expected_indexes),))
+            assert {r[0] for r in cur.fetchall()} == expected_indexes
+
+
+def test_0006_mark_prices_append_only(fresh_db):
+    """mark_prices cannot be UPDATEd or DELETEd."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            cur.execute("""
+                INSERT INTO accounting.mark_prices
+                    (instrument_id, mark_type, price, source, source_timestamp)
+                VALUES (%s, 'mid', 50000, 'binance_api', NOW())
+                RETURNING id
+            """, (ctx['instrument_id'],))
+            mark_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.mark_prices SET price = 51000 WHERE id = %s", (mark_id,))
+            conn.rollback()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM accounting.mark_prices WHERE id = %s", (mark_id,))
+            conn.rollback()
+
+
+def test_0006_mark_prices_source_id_narrow_index(fresh_db):
+    """v4: Narrowed source_id index permits same source_id with different mark_type."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            ts = datetime.now(timezone.utc)
+
+            cur.execute("""
+                INSERT INTO accounting.mark_prices
+                    (instrument_id, mark_type, price, source, source_namespace, source_id, source_timestamp)
+                VALUES
+                    (%s, 'bid', 49999, 'binance_api', 'binance', 'snap_1', %s),
+                    (%s, 'ask', 50001, 'binance_api', 'binance', 'snap_1', %s),
+                    (%s, 'mid', 50000, 'binance_api', 'binance', 'snap_1', %s)
+                RETURNING id
+            """, (ctx['instrument_id'], ts,
+                  ctx['instrument_id'], ts,
+                  ctx['instrument_id'], ts))
+            ids = [r[0] for r in cur.fetchall()]
+            assert len(ids) == 3
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""
+                    INSERT INTO accounting.mark_prices
+                        (instrument_id, mark_type, price, source, source_namespace, source_id, source_timestamp)
+                    VALUES (%s, 'bid', 49998, 'binance_api', 'binance', 'snap_1', NOW())
+                """, (ctx['instrument_id'],))
+            conn.rollback()
+
+
+def test_0006_mark_price_set_immutable_after_use(fresh_db):
+    """Once a mark_price_set is referenced by a valuation_run, no more items can be added."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_imm_1')
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO accounting.mark_prices
+                    (instrument_id, mark_type, price, source, source_namespace, source_id, source_timestamp)
+                VALUES (%s, 'bid', 49999, 'test_source_hash_imm_1', 'test',
+                        'hash_imm_1_bid_extra', clock_timestamp())
+                RETURNING id
+            """, (ctx['instrument_id'],))
+            mark2 = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO accounting.mark_price_set_items (mark_price_set_id, mark_price_id)
+                VALUES (%s, %s)
+            """, (set_id, mark2))
+            conn.commit()
+
+            run_id, _ = _create_valuation_run(cur, ctx, set_id, hash_suffix='imm')
+            conn.commit()
+
+            cur.execute("""
+                INSERT INTO accounting.mark_prices
+                    (instrument_id, mark_type, price, source, source_namespace, source_id, source_timestamp)
+                VALUES (%s, 'ask', 50001, 'test_source_hash_imm_1', 'test',
+                        'hash_imm_1_ask_extra', clock_timestamp())
+                RETURNING id
+            """, (ctx['instrument_id'],))
+            mark3 = cur.fetchone()[0]
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.mark_price_set_items (mark_price_set_id, mark_price_id)
+                    VALUES (%s, %s)
+                """, (set_id, mark3))
+            assert 'already referenced' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_mark_price_set_references_real_marks(fresh_db):
+    """mark_price_set_items requires existing mark_price_id (FK)."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_real_1')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                cur.execute("""
+                    INSERT INTO accounting.mark_price_set_items (mark_price_set_id, mark_price_id)
+                    VALUES (%s, 999999)
+                """, (set_id,))
+            conn.rollback()
+
+
+def test_0006_valuation_run_requires_mark_set(fresh_db):
+    """v4: valuation_runs.mark_price_set_id is NOT NULL."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.NotNullViolation):
+                cur.execute("""
+                    INSERT INTO accounting.valuation_runs
+                        (portfolio_id, run_type, valuation_date,
+                         journal_cutoff_at, engine_version, calculation_hash, created_by)
+                    VALUES (%s, 'eod_close', %s, NOW(), 'v0.1', 'hash_no_set', 'wasseem')
+                """, (ctx['portfolio_id'], date(2026, 5, 1)))
+            conn.rollback()
+
+
+def test_0006_nav_snapshot_consistency_portfolio(fresh_db):
+    """nav_snapshots.portfolio_id must match valuation_run.portfolio_id."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('other_p', 'Other', 'paper', 'research')
+                RETURNING id
+            """)
+            other_portfolio_id = cur.fetchone()[0]
+
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_consist_1')
+            run_id, val_date = _create_valuation_run(cur, ctx, set_id, hash_suffix='consist')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.nav_snapshots
+                        (valuation_run_id, portfolio_id, snapshot_date,
+                         nav_total, nav_realized, nav_unrealized,
+                         nav_breakdown, nav_environment, nav_settlement_type, computation_metadata)
+                    VALUES (%s, %s, %s, 1000, 500, 500,
+                            '{}'::jsonb, 'LIVE', 'MIXED', '{}'::jsonb)
+                """, (run_id, other_portfolio_id, val_date))
+            assert 'portfolio_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_nav_snapshot_consistency_date(fresh_db):
+    """nav_snapshots.snapshot_date must match valuation_run.valuation_date."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_date_1')
+            run_id, _ = _create_valuation_run(cur, ctx, set_id,
+                                                val_date=date(2026, 5, 1), hash_suffix='date')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""
+                    INSERT INTO accounting.nav_snapshots
+                        (valuation_run_id, portfolio_id, snapshot_date,
+                         nav_total, nav_realized, nav_unrealized,
+                         nav_breakdown, nav_environment, nav_settlement_type, computation_metadata)
+                    VALUES (%s, %s, %s, 1000, 500, 500,
+                            '{}'::jsonb, 'LIVE', 'MIXED', '{}'::jsonb)
+                """, (run_id, ctx['portfolio_id'], date(2026, 5, 2)))
+            assert 'date' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0006_strategy_pnl_consistency_date(fresh_db):
+    """strategy_pnl.pnl_date must match valuation_run.valuation_date."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_pnl_date')
+            run_id, _ = _create_valuation_run(cur, ctx, set_id,
+                                                val_date=date(2026, 5, 1), hash_suffix='pnl_date')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""
+                    INSERT INTO accounting.strategy_pnl
+                        (valuation_run_id, strategy_id, portfolio_id, pnl_date,
+                         pnl_realized_gross, pnl_unrealized,
+                         pnl_type, pnl_environment, pnl_settlement_type)
+                    VALUES (%s, %s, %s, %s, 100, 0,
+                            'REALIZED', 'LIVE', 'CONFIRMED_SETTLED')
+                """, (run_id, ctx['strategy_id'], ctx['portfolio_id'], date(2026, 5, 2)))
+            conn.rollback()
+
+
+def test_0006_nav_snapshots_allow_multiple_runs_same_date(fresh_db):
+    """Two valuation runs for the same date can produce coexisting NAV rows."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set1, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_multi_1')
+            set2, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_multi_2')
+            run1, val_date = _create_valuation_run(cur, ctx, set1, hash_suffix='m1')
+            run2, _ = _create_valuation_run(cur, ctx, set2, val_date=val_date, hash_suffix='m2')
+
+            for run in [run1, run2]:
+                cur.execute("""
+                    INSERT INTO accounting.nav_snapshots
+                        (valuation_run_id, portfolio_id, snapshot_date,
+                         nav_total, nav_realized, nav_unrealized,
+                         nav_breakdown, nav_environment, nav_settlement_type, computation_metadata)
+                    VALUES (%s, %s, %s, 1000, 500, 500,
+                            '{}'::jsonb, 'LIVE', 'MIXED', '{}'::jsonb)
+                    RETURNING id
+                """, (run, ctx['portfolio_id'], val_date))
+                assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0006_strategy_pnl_realized_rejects_unrealized(fresh_db):
+    """pnl_type='REALIZED' with nonzero pnl_unrealized rejected."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_pnl_r1')
+            run_id, val_date = _create_valuation_run(cur, ctx, set_id, hash_suffix='pr1')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.strategy_pnl
+                        (valuation_run_id, strategy_id, portfolio_id, pnl_date,
+                         pnl_realized_gross, pnl_unrealized,
+                         pnl_type, pnl_environment, pnl_settlement_type)
+                    VALUES (%s, %s, %s, %s, 100, 50,
+                            'REALIZED', 'LIVE', 'CONFIRMED_SETTLED')
+                """, (run_id, ctx['strategy_id'], ctx['portfolio_id'], val_date))
+            conn.rollback()
+
+
+def test_0006_strategy_pnl_live_rejects_modeled_fill(fresh_db):
+    """LIVE environment cannot have MODELED_FILL settlement type."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_pnl_lm')
+            run_id, val_date = _create_valuation_run(cur, ctx, set_id, hash_suffix='lm')
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.strategy_pnl
+                        (valuation_run_id, strategy_id, portfolio_id, pnl_date,
+                         pnl_realized_gross, pnl_unrealized,
+                         pnl_type, pnl_environment, pnl_settlement_type)
+                    VALUES (%s, %s, %s, %s, 100, 0,
+                            'REALIZED', 'LIVE', 'MODELED_FILL')
+                """, (run_id, ctx['strategy_id'], ctx['portfolio_id'], val_date))
+            conn.rollback()
+
+            cur.execute("""
+                INSERT INTO accounting.strategy_pnl
+                    (valuation_run_id, strategy_id, portfolio_id, pnl_date,
+                     pnl_realized_gross, pnl_unrealized,
+                     pnl_type, pnl_environment, pnl_settlement_type)
+                VALUES (%s, %s, %s, %s, 100, 0,
+                        'REALIZED', 'SHADOW', 'MODELED_FILL')
+                RETURNING id
+            """, (run_id, ctx['strategy_id'], ctx['portfolio_id'], val_date))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0006_nav_snapshots_append_only(fresh_db):
+    """nav_snapshots cannot be UPDATEd or DELETEd."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_nav_ap')
+            run_id, val_date = _create_valuation_run(cur, ctx, set_id, hash_suffix='nav_ap')
+
+            cur.execute("""
+                INSERT INTO accounting.nav_snapshots
+                    (valuation_run_id, portfolio_id, snapshot_date,
+                     nav_total, nav_realized, nav_unrealized,
+                     nav_breakdown, nav_environment, nav_settlement_type, computation_metadata)
+                VALUES (%s, %s, %s, 1000, 1000, 0,
+                        '{}'::jsonb, 'LIVE', 'CONFIRMED_SETTLED', '{}'::jsonb)
+                RETURNING id
+            """, (run_id, ctx['portfolio_id'], val_date))
+            nav_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.nav_snapshots SET nav_total = 2000 WHERE id = %s", (nav_id,))
+            conn.rollback()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM accounting.nav_snapshots WHERE id = %s", (nav_id,))
+            conn.rollback()
+
+
+def test_0006_strategy_pnl_append_only(fresh_db):
+    """strategy_pnl cannot be UPDATEd or DELETEd."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            set_id, _ = _create_mark_set_with_one_mark(cur, ctx, 'hash_spnl_ap')
+            run_id, val_date = _create_valuation_run(cur, ctx, set_id, hash_suffix='spnl_ap')
+
+            cur.execute("""
+                INSERT INTO accounting.strategy_pnl
+                    (valuation_run_id, strategy_id, portfolio_id, pnl_date,
+                     pnl_realized_gross, pnl_unrealized,
+                     pnl_type, pnl_environment, pnl_settlement_type)
+                VALUES (%s, %s, %s, %s, 100, 0,
+                        'REALIZED', 'LIVE', 'CONFIRMED_SETTLED')
+                RETURNING id
+            """, (run_id, ctx['strategy_id'], ctx['portfolio_id'], val_date))
+            pnl_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.strategy_pnl SET pnl_unrealized = 50 WHERE id = %s", (pnl_id,))
+            conn.rollback()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM accounting.strategy_pnl WHERE id = %s", (pnl_id,))
+            conn.rollback()
+
+
+def test_0006_audit_tables_cannot_be_mutated(fresh_db):
+    """fees append-only verification."""
+    _alembic("upgrade", "0006")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0006(cur)
+            j_fee = _create_posted_journal(cur, ctx, 'fee', 'fill', 'audit_test_fee')
+
+            cur.execute("""
+                INSERT INTO accounting.fees
+                    (account_id, strategy_id, asset_id, fee_type, amount, amount_usd,
+                     source_type, source_namespace, source_id, charged_at, journal_id)
+                VALUES (%s, %s, %s, 'taker', 5, 5,
+                        'fill', 'binance_futures', 'audit_test_fee', NOW(), %s)
+                RETURNING id
+            """, (ctx['account_id'], ctx['strategy_id'], ctx['usdt_id'], j_fee))
+            fee_id = cur.fetchone()[0]
+            conn.commit()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE accounting.fees SET amount = 3 WHERE id = %s", (fee_id,))
+            conn.rollback()
+
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM accounting.fees WHERE id = %s", (fee_id,))
+            conn.rollback()
+
+
+def test_0006_downgrade_clean(fresh_db):
+    """Downgrade removes 0006 and restores 0005's CHECK without 'borrow'."""
+    _alembic("upgrade", "0006")
+    result = _alembic("downgrade", "0004c")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'accounting'
+                  AND table_type = 'BASE TABLE'
+                  AND table_name IN ('cash_balances', 'cashflows', 'fees',
+                                     'funding_payments', 'borrow_costs',
+                                     'mark_prices', 'mark_price_sets',
+                                     'mark_price_set_items', 'valuation_runs',
+                                     'nav_snapshots', 'strategy_pnl')
+            """)
+            assert cur.fetchall() == []
+
+            cur.execute("""
+                SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'accounting'
+                  AND proname IN ('prevent_accounting_audit_mutation',
+                                  'enforce_event_journal_link',
+                                  'enforce_mark_price_set_not_used',
+                                  'enforce_valuation_output_consistency',
+                                  'lock_mark_price_set_for_valuation_run')
+            """)
+            assert cur.fetchall() == []
+
+            cur.execute("""
+                SELECT COUNT(*) FROM information_schema.tables
+                WHERE table_schema = 'accounting' AND table_type = 'BASE TABLE'
+            """)
+            assert cur.fetchone()[0] == 3
+
+            cur.execute("""
+                INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('downgrade_test_p', 'Test', 'paper', 'research')
+                RETURNING id
+            """)
+            portfolio_id = cur.fetchone()[0]
+
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""
+                    INSERT INTO accounting.journals
+                        (journal_type, portfolio_id, journal_at,
+                         source_type, source_namespace, source_id, created_by)
+                    VALUES ('borrow', %s, NOW(),
+                            'borrow_event', 'test', 'downgrade_borrow', 'wasseem')
+                """, (portfolio_id,))
+            conn.rollback()
