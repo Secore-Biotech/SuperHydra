@@ -5774,3 +5774,796 @@ def test_0007_downgrade_clean(fresh_db):
             assert cur.fetchall() == []
             cur.execute("SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'trading'")
             assert cur.fetchall() == []
+
+
+# ============================================================
+# Migration 0008 tests: positions (v1.5)
+# ============================================================
+
+from datetime import datetime, timezone, date, timedelta
+from decimal import Decimal
+
+
+def _setup_basic_0008(cur):
+    """Helper: full registry+trading chain for 0008 tests."""
+    cur.execute("INSERT INTO registry.venues (venue_code, display_name, venue_type, status) VALUES ('binance_futures', 'Binance Futures', 'cex_futures', 'active') RETURNING id")
+    venue_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status) VALUES ('BTC', 'Bitcoin', 'crypto', 8, 'active'), ('USDT', 'Tether', 'stablecoin', 6, 'active') RETURNING id")
+    ids = [r[0] for r in cur.fetchall()]; btc_id, usdt_id = ids[0], ids[1]
+    cur.execute("INSERT INTO registry.instruments (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id, instrument_type, status, config) VALUES ('BTCUSDT-PERP-BINANCE', 'BTC USDT Perp', %s, %s, %s, 'perp', 'active', '{}'::jsonb) RETURNING id", (venue_id, btc_id, usdt_id))
+    instrument_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status) VALUES (%s, 'binance_master', 'Master', 'trading', 'active') RETURNING id", (venue_id,))
+    account_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status) VALUES ('mn_ls_p1', 'MN L/S P1', 'market_neutral_fund', 'research') RETURNING id")
+    portfolio_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.strategies (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path) VALUES ('mn_ls_test', 'MN L/S Test', 'research', NOW(), 'docs/h.md') RETURNING id")
+    strategy_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.promotions (strategy_id, from_phase, to_phase, operator_id, operator_signature, signature_method, gate_evidence_doc_path) VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md') RETURNING id", (strategy_id,))
+    cur.execute("INSERT INTO registry.allocator_runs (portfolio_id, objective_version, constraints_version, solve_status, generated_at) VALUES (%s, 'obj_v1', 'cons_v1', 'optimal', NOW()) RETURNING id", (portfolio_id,))
+    allocator_run_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO registry.target_weights (allocator_run_id, instrument_id, target_weight, target_notional_usd, target_quantity) VALUES (%s, %s, 0.05, 5000, 0.1) RETURNING id", (allocator_run_id, instrument_id))
+    target_weight_id = cur.fetchone()[0]
+    return {'venue_id': venue_id, 'btc_id': btc_id, 'usdt_id': usdt_id, 'instrument_id': instrument_id, 'account_id': account_id, 'portfolio_id': portfolio_id, 'strategy_id': strategy_id, 'allocator_run_id': allocator_run_id, 'target_weight_id': target_weight_id}
+
+
+def _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='1', fill_environment='SHADOW', fill_settlement_type='MODELED_FILL', filled_at=None, target_weight_id=None, instrument_id=None, strategy_id=None, derive_positions=True):
+    eff_tw = target_weight_id if target_weight_id is not None else ctx['target_weight_id']
+    eff_inst = instrument_id if instrument_id is not None else ctx['instrument_id']
+    eff_strat = strategy_id if strategy_id is not None else ctx['strategy_id']
+    cur.execute("INSERT INTO trading.order_intents (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id, instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd, intent_type, urgency, execution_environment, created_via, intended_at, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', %s, %s, %s, 'open', 'normal', %s, 'allocator', NOW(), 'wasseem') RETURNING id, intent_uuid",
+        (ctx['allocator_run_id'], eff_tw, eff_strat, ctx['portfolio_id'], ctx['account_id'], eff_inst, ctx['venue_id'], side, quantity, quantity * price, 'SHADOW' if fill_environment == 'SHADOW' else 'CANARY'))
+    intent_id, intent_uuid = cur.fetchone()
+    cur.execute("INSERT INTO trading.order_reservations (intent_id, account_id, asset_id, reservation_type, amount_reserved) VALUES (%s, %s, %s, 'cash', %s)", (intent_id, ctx['account_id'], ctx['usdt_id'], quantity * price))
+    hex_str = str(intent_uuid).replace('-', '')[:16]
+    coid = f"so_{hex_str}_{side}"
+    cur.execute("INSERT INTO trading.orders (intent_id, account_id, instrument_id, venue_id, venue_namespace, client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by) VALUES (%s, %s, %s, %s, 'binance_futures', %s, %s, 'limit', %s, %s, 'gtc', 'allocator', 'wasseem') RETURNING id, order_uuid",
+        (intent_id, ctx['account_id'], eff_inst, ctx['venue_id'], coid, side, quantity, price))
+    order_id, order_uuid = cur.fetchone()
+    cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', %s, '{}'::jsonb)", (order_id, f'submit:{order_uuid}'))
+    cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'venue accepted', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+    cur.execute("SELECT trading.record_order_ack(%s, %s, '{\"x\":1}'::jsonb, 'wasseem')", (order_id, f'venue_{suffix}'))
+    fill_at_clause = "NOW()" if filled_at is None else "%s"
+    fill_at_params = () if filled_at is None else (filled_at,)
+    cur.execute(f"INSERT INTO trading.fills (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value, fill_environment, fill_settlement_type, filled_at, raw_record) VALUES (%s, %s, %s, 'binance_futures', %s, %s, %s, %s, %s, %s, {fill_at_clause}, '{{}}'::jsonb) RETURNING id",
+        (order_id, eff_inst, f'fill_{suffix}', side, quantity, price, quantity * price, fill_environment, fill_settlement_type) + fill_at_params)
+    fill_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO accounting.ledger_accounts (account_code, account_name, account_type, account_subtype, portfolio_id, strategy_id, registry_account_id, asset_id) VALUES (%s, 'Cash', 'asset', 'cash', %s, %s, %s, %s), (%s, 'Pos', 'asset', 'position', %s, %s, %s, %s) ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name RETURNING id",
+        (f'CASH_{suffix}', ctx['portfolio_id'], eff_strat, ctx['account_id'], ctx['usdt_id'], f'POS_{suffix}', ctx['portfolio_id'], eff_strat, ctx['account_id'], ctx['btc_id']))
+    rows = cur.fetchall(); cash_acct, pos_acct = rows[0][0], rows[1][0]
+    cur.execute("INSERT INTO accounting.journals (journal_type, portfolio_id, strategy_id, journal_at, source_type, source_namespace, source_id, created_by) VALUES ('trade', %s, %s, NOW(), 'fill', 'binance_futures', %s, 'wasseem') RETURNING id", (ctx['portfolio_id'], eff_strat, f'fill_{suffix}'))
+    journal_id = cur.fetchone()[0]
+    cur.execute("INSERT INTO accounting.ledger_entries (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd) VALUES (%s, %s, 'debit', %s, %s), (%s, %s, 'credit', %s, %s)",
+        (journal_id, pos_acct, ctx['btc_id'], quantity * price, journal_id, cash_acct, ctx['usdt_id'], quantity * price))
+    cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+    if not derive_positions:
+        cur.execute("ALTER TABLE trading.fills DISABLE TRIGGER fills_reconciled_derive_positions")
+    try:
+        cur.execute("SELECT trading.reconcile_fill(%s, %s, 'wasseem')", (fill_id, journal_id))
+    finally:
+        if not derive_positions:
+            cur.execute("ALTER TABLE trading.fills ENABLE TRIGGER fills_reconciled_derive_positions")
+    return fill_id
+
+
+def test_0008_creates_all_five_tables(fresh_db):
+    result = _alembic("upgrade", "0008")
+    assert result.returncode == 0, f"Migration failed: {result.stderr}"
+    expected = {"position_snapshots", "position_snapshot_fills", "position_lots", "position_lot_closures", "position_reconciliations"}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'positions' AND table_type = 'BASE TABLE'")
+            assert {r[0] for r in cur.fetchall()} == expected
+
+
+def test_0008_creates_15_functions(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'positions'")
+            assert cur.fetchone()[0] == 15
+
+
+def test_0008_direct_snapshot_insert_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO positions.position_snapshots (portfolio_id, strategy_id, account_id, instrument_id, quantity, position_environment, snapshot_at, fill_cutoff_at, contributing_fill_count, computation_hash, computation_version, created_by) VALUES (%s, %s, %s, %s, 0, 'SHADOW', NOW(), NOW(), 0, 'fakehash', 'v0', 'attacker')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0008_direct_snapshot_fills_insert_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            _setup_basic_0008(cur); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO positions.position_snapshot_fills (snapshot_id, fill_id) VALUES (1, 1)")
+            conn.rollback()
+
+
+def test_0008_direct_lot_insert_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO positions.position_lots (portfolio_id, strategy_id, account_id, instrument_id, opening_fill_id, side, original_quantity, cost_basis, notional_value_usd, position_environment, opened_at) VALUES (%s, %s, %s, %s, 1, 'long', 0.1, 50000, 5000, 'SHADOW', NOW())", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0008_direct_closure_insert_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (1, 1, %s, %s, %s, %s, 0.05, 51000, 50, 'SHADOW', NOW())", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0008_direct_reconciliation_insert_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO positions.position_reconciliations (portfolio_id, strategy_id, account_id, instrument_id, snapshot_id, computed_quantity, venue_reported_quantity, drift_tolerance, position_environment, venue_namespace, raw_venue_response, reconciled_at, reconciled_by) VALUES (%s, %s, %s, %s, 1, 0.1, 0.1, 0.001, 'SHADOW', 'binance_futures', '{}'::jsonb, NOW(), 'attacker')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0008_buy_fill_creates_long_lot(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            fill_id = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='buy_long')
+            conn.commit()
+            cur.execute("SELECT side, original_quantity, cost_basis, position_environment FROM positions.position_lots WHERE opening_fill_id = %s", (fill_id,))
+            row = cur.fetchone()
+            assert row is not None and row[0] == 'long' and row[1] == Decimal('0.1') and row[2] == Decimal('50000') and row[3] == 'SHADOW'
+
+
+def test_0008_sell_fill_creates_short_lot(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            fill_id = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='sell_short')
+            conn.commit()
+            cur.execute("SELECT side, original_quantity FROM positions.position_lots WHERE opening_fill_id = %s", (fill_id,))
+            assert cur.fetchone() == ('short', Decimal('0.1'))
+
+
+def test_0008_lot_only_after_reconciliation(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            cur.execute("INSERT INTO trading.order_intents (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id, instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd, intent_type, urgency, execution_environment, created_via, intended_at, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', 'buy', 0.1, 5000, 'open', 'normal', 'SHADOW', 'allocator', NOW(), 'wasseem') RETURNING id, intent_uuid",
+                (ctx['allocator_run_id'], ctx['target_weight_id'], ctx['strategy_id'], ctx['portfolio_id'], ctx['account_id'], ctx['instrument_id'], ctx['venue_id']))
+            intent_id, intent_uuid = cur.fetchone()
+            cur.execute("INSERT INTO trading.order_reservations (intent_id, account_id, asset_id, reservation_type, amount_reserved) VALUES (%s, %s, %s, 'cash', 5000)", (intent_id, ctx['account_id'], ctx['usdt_id']))
+            hex_str = str(intent_uuid).replace('-', '')[:16]; coid = f"so_{hex_str}_buy"
+            cur.execute("INSERT INTO trading.orders (intent_id, account_id, instrument_id, venue_id, venue_namespace, client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by) VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem') RETURNING id, order_uuid", (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], coid))
+            order_id, order_uuid = cur.fetchone()
+            cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', %s, '{}'::jsonb)", (order_id, f'submit:{order_uuid}'))
+            cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'r', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+            cur.execute("SELECT trading.record_order_ack(%s, 'venue_pre', '{}'::jsonb, 'wasseem')", (order_id,))
+            cur.execute("INSERT INTO trading.fills (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value, fill_environment, fill_settlement_type, filled_at, raw_record) VALUES (%s, %s, 'fill_unreconciled', 'binance_futures', 'buy', 0.1, 50000, 5000, 'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id", (order_id, ctx['instrument_id']))
+            fill_id = cur.fetchone()[0]; conn.commit()
+            cur.execute("SELECT COUNT(*) FROM positions.position_lots WHERE opening_fill_id = %s", (fill_id,))
+            assert cur.fetchone()[0] == 0
+
+
+def test_0008_opposing_fill_closes_oldest_lot_first(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lot_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='lot_b', filled_at=base + timedelta(minutes=1))
+            f3 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.05'), price=Decimal('52000'), suffix='close_oldest', filled_at=base + timedelta(minutes=2))
+            conn.commit()
+            cur.execute("SELECT lot_id, closed_quantity, closing_price, realized_pnl_usd FROM positions.position_lot_closures WHERE closing_fill_id = %s", (f3,))
+            closures = cur.fetchall()
+            assert len(closures) == 1
+            lot_id, qty, price, pnl = closures[0]
+            assert qty == Decimal('0.05') and price == Decimal('52000') and pnl == Decimal('100')
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,))
+            assert lot_id == cur.fetchone()[0]
+
+
+def test_0008_partial_close_leaves_lot_open(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='partial_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.04'), price=Decimal('51000'), suffix='partial_b', filled_at=base + timedelta(minutes=1))
+            conn.commit()
+            cur.execute("SELECT closed_quantity, open_quantity, fully_closed_at FROM positions.position_lots WHERE opening_fill_id = %s", (f1,))
+            closed, open_qty, fully = cur.fetchone()
+            assert closed == Decimal('0.04') and open_qty == Decimal('0.06') and fully is None
+
+
+def test_0008_full_close_marks_lot_terminal_with_filled_at(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            close_at = base + timedelta(minutes=1)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='full_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='full_b', filled_at=close_at)
+            conn.commit()
+            cur.execute("SELECT closed_quantity, open_quantity, fully_closed_at FROM positions.position_lots WHERE opening_fill_id = %s", (f1,))
+            closed, open_qty, fully = cur.fetchone()
+            assert closed == Decimal('0.1') and open_qty == Decimal('0') and fully == close_at
+
+
+def test_0008_position_flip_closes_existing_and_opens_residual(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='flip_long', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.15'), price=Decimal('52000'), suffix='flip_sell', filled_at=base + timedelta(minutes=1))
+            conn.commit()
+            cur.execute("SELECT closed_quantity, realized_pnl_usd FROM positions.position_lot_closures WHERE closing_fill_id = %s", (f2,))
+            closures = cur.fetchall()
+            assert len(closures) == 1 and closures[0] == (Decimal('0.1'), Decimal('200'))
+            cur.execute("SELECT side, original_quantity FROM positions.position_lots WHERE opening_fill_id = %s", (f2,))
+            assert cur.fetchone() == ('short', Decimal('0.05'))
+
+
+def test_0008_fifo_trigger_blocks_out_of_order_close(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='fifo_old', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='fifo_new', filled_at=base + timedelta(minutes=1))
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f2,))
+            new_lot_id = cur.fetchone()[0]
+            f3 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.001'), price=Decimal('52000'), suffix='fifo_close_attempt', filled_at=base + timedelta(minutes=2))
+            conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.001, 52000, 1, 'SHADOW', %s)",
+                    (new_lot_id, f3, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=2)))
+            assert 'fifo' in str(exc.value).lower() or 'older' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_realized_pnl_long_positive(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lp_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='lp_b', filled_at=base + timedelta(minutes=1))
+            conn.commit()
+            cur.execute("SELECT realized_pnl_usd FROM positions.position_lot_closures WHERE closing_fill_id = %s", (f2,))
+            assert cur.fetchone()[0] == Decimal('100')
+
+
+def test_0008_realized_pnl_short_negative_when_price_rises(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='sp_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='sp_b', filled_at=base + timedelta(minutes=1))
+            conn.commit()
+            cur.execute("SELECT realized_pnl_usd FROM positions.position_lot_closures WHERE closing_fill_id = %s", (f2,))
+            assert cur.fetchone()[0] == Decimal('-100')
+
+
+def test_0008_lot_identity_immutable(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='imm')
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); lot_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_lots SET cost_basis = 99999 WHERE id = %s", (lot_id,))
+            conn.rollback()
+
+
+def test_0008_lot_lifecycle_direct_update_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lf')
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); lot_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_lots SET closed_quantity = 0.05 WHERE id = %s", (lot_id,))
+            conn.rollback()
+
+
+def test_0008_lot_updated_at_direct_update_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='ua')
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); lot_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_lots SET updated_at = NOW() + interval '1 day' WHERE id = %s", (lot_id,))
+            conn.rollback()
+
+
+def test_0008_lot_no_delete(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='nodel')
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); lot_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM positions.position_lots WHERE id = %s", (lot_id,))
+            conn.rollback()
+
+
+def test_0008_lot_open_fill_must_be_reconciled(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            cur.execute("INSERT INTO trading.order_intents (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id, instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd, intent_type, urgency, execution_environment, created_via, intended_at, created_by) VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', 'buy', 0.1, 5000, 'open', 'normal', 'SHADOW', 'allocator', NOW(), 'wasseem') RETURNING id, intent_uuid",
+                (ctx['allocator_run_id'], ctx['target_weight_id'], ctx['strategy_id'], ctx['portfolio_id'], ctx['account_id'], ctx['instrument_id'], ctx['venue_id']))
+            intent_id, intent_uuid = cur.fetchone()
+            cur.execute("INSERT INTO trading.order_reservations (intent_id, account_id, asset_id, reservation_type, amount_reserved) VALUES (%s, %s, %s, 'cash', 5000)", (intent_id, ctx['account_id'], ctx['usdt_id']))
+            hex_str = str(intent_uuid).replace('-', '')[:16]; coid = f"so_{hex_str}_buy"
+            cur.execute("INSERT INTO trading.orders (intent_id, account_id, instrument_id, venue_id, venue_namespace, client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by) VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem') RETURNING id, order_uuid", (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], coid))
+            order_id, order_uuid = cur.fetchone()
+            cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', %s, '{}'::jsonb)", (order_id, f'submit:{order_uuid}'))
+            cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'r', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+            cur.execute("SELECT trading.record_order_ack(%s, 'venue_unrec', '{}'::jsonb, 'wasseem')", (order_id,))
+            cur.execute("INSERT INTO trading.fills (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value, fill_environment, fill_settlement_type, filled_at, raw_record) VALUES (%s, %s, 'fill_unrec_for_consistency', 'binance_futures', 'buy', 0.1, 50000, 5000, 'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id", (order_id, ctx['instrument_id']))
+            unrec_fill_id = cur.fetchone()[0]; conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lots (portfolio_id, strategy_id, account_id, instrument_id, opening_fill_id, side, original_quantity, cost_basis, notional_value_usd, position_environment, opened_at) SELECT %s, %s, %s, %s, %s, 'long', 0.1, 50000, 5000, 'SHADOW', filled_at FROM trading.fills WHERE id = %s",
+                    (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], unrec_fill_id, unrec_fill_id))
+            assert 'unreconciled' in str(exc.value).lower() or 'journal_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_lot_opening_fill_attribution_mismatch_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            cur.execute("INSERT INTO registry.strategies (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path) VALUES ('wrong_strat', 'Wrong', 'research', NOW(), 'docs/h.md') RETURNING id")
+            wrong_strategy_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.promotions (strategy_id, from_phase, to_phase, operator_id, operator_signature, signature_method, gate_evidence_doc_path) VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')", (wrong_strategy_id,))
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='attr_mm', filled_at=base, derive_positions=False)
+            conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lots (portfolio_id, strategy_id, account_id, instrument_id, opening_fill_id, side, original_quantity, cost_basis, notional_value_usd, position_environment, opened_at) VALUES (%s, %s, %s, %s, %s, 'long', 0.1, 50000, 5000, 'SHADOW', %s)",
+                    (ctx['portfolio_id'], wrong_strategy_id, ctx['account_id'], ctx['instrument_id'], f1, base))
+            assert 'strategy_id' in str(exc.value).lower() or 'attribution' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_closure_row_wrong_attribution_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='cra_long', filled_at=base)
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); long_lot_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.strategies (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path) VALUES ('alt_strat_cra', 'Alt CRA', 'research', NOW(), 'docs/h.md') RETURNING id")
+            alt_strategy_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.promotions (strategy_id, from_phase, to_phase, operator_id, operator_signature, signature_method, gate_evidence_doc_path) VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')", (alt_strategy_id,))
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.05'), price=Decimal('51000'), suffix='cra_sell', filled_at=base + timedelta(minutes=1), derive_positions=False)
+            conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.05, 51000, 50, 'SHADOW', %s)",
+                    (long_lot_id, f2, ctx['portfolio_id'], alt_strategy_id, ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=1)))
+            assert 'attribution' in str(exc.value).lower() or 'strategy' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_closing_fill_lineage_mismatch_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            cur.execute("INSERT INTO registry.strategies (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path) VALUES ('strat_b', 'Strategy B', 'research', NOW(), 'docs/h.md') RETURNING id")
+            strat_b_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.promotions (strategy_id, from_phase, to_phase, operator_id, operator_signature, signature_method, gate_evidence_doc_path) VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')", (strat_b_id,))
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lin_long_a', filled_at=base)
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f1,)); long_lot_id = cur.fetchone()[0]
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.05'), price=Decimal('51000'), suffix='lin_sell_b', filled_at=base + timedelta(minutes=1), strategy_id=strat_b_id, derive_positions=False)
+            conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.05, 51000, 50, 'SHADOW', %s)",
+                    (long_lot_id, f2, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=1)))
+            assert 'closing fill' in str(exc.value).lower() or 'attribution' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_voided_journal_blocks_reprocessing(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='void_test')
+            cur.execute("SELECT journal_id FROM trading.fills WHERE id = %s", (f1,)); jrn_id = cur.fetchone()[0]; conn.commit()
+            cur.execute("SELECT accounting.void_journal(%s, 'wasseem', 'test reprocessing rejection')", (jrn_id,)); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT positions.process_fill_to_lots(%s)", (f1,))
+            assert 'voided' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_usd_quote_enforcement_rejects_btc_quoted(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            cur.execute("INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status) VALUES ('ETH', 'Ether', 'crypto', 18, 'active') RETURNING id")
+            eth_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.instruments (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id, instrument_type, status, config) VALUES ('ETHBTC', 'ETH/BTC', %s, %s, %s, 'spot', 'active', '{}'::jsonb) RETURNING id", (ctx['venue_id'], eth_id, ctx['btc_id']))
+            ethbtc_id = cur.fetchone()[0]
+            cur.execute("INSERT INTO registry.target_weights (allocator_run_id, instrument_id, target_weight, target_notional_usd, target_quantity) VALUES (%s, %s, 0.05, 5000, 1) RETURNING id", (ctx['allocator_run_id'], ethbtc_id))
+            ethbtc_tw_id = cur.fetchone()[0]
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('1'), price=Decimal('0.05'), suffix='btc_quote', target_weight_id=ethbtc_tw_id, instrument_id=ethbtc_id)
+            assert 'usd' in str(exc.value).lower() or 'quote' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_chronological_guard_rejects_out_of_order(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f_later = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='chron_later', filled_at=base + timedelta(minutes=10))
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.05'), price=Decimal('49000'), suffix='chron_earlier', filled_at=base)
+            assert 'out-of-order' in str(exc.value).lower() or 'replay' in str(exc.value).lower() or 'later' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_chronological_guard_id_tiebreaker(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            same_ts = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f_lower = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='tie_lower', filled_at=same_ts, derive_positions=False)
+            f_higher = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='tie_higher', filled_at=same_ts, derive_positions=False)
+            assert f_higher > f_lower; conn.commit()
+            cur.execute("SELECT positions.process_fill_to_lots(%s)", (f_higher,)); conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT positions.process_fill_to_lots(%s)", (f_lower,))
+            assert 'out-of-order' in str(exc.value).lower() or 'later' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_idempotent_process_fill(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='idem'); conn.commit()
+            cur.execute("SELECT positions.process_fill_to_lots(%s)", (f1,)); conn.commit()
+            cur.execute("SELECT COUNT(*) FROM positions.position_lots WHERE opening_fill_id = %s", (f1,))
+            assert cur.fetchone()[0] == 1
+
+
+def test_0008_compute_snapshot_simple_long(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='snap_a'); conn.commit()
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT quantity, avg_cost_basis, realized_pnl_usd, contributing_fill_count FROM positions.position_snapshots WHERE id = %s", (snap_id,))
+            qty, basis, realized, count = cur.fetchone()
+            assert qty == Decimal('0.1') and basis == Decimal('50000') and realized == Decimal('0') and count == 1
+
+
+def test_0008_compute_snapshot_includes_realized_pnl(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='rp_a', filled_at=base)
+            _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.04'), price=Decimal('51000'), suffix='rp_b', filled_at=base + timedelta(minutes=1)); conn.commit()
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT quantity, realized_pnl_usd FROM positions.position_snapshots WHERE id = %s", (snap_id,))
+            qty, realized = cur.fetchone()
+            assert qty == Decimal('0.06') and realized == Decimal('40')
+
+
+def test_0008_snapshot_as_of_correctness(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            t0, t1, t2 = base, base + timedelta(minutes=5), base + timedelta(minutes=10)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='asof_open', filled_at=t0)
+            _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.04'), price=Decimal('51000'), suffix='asof_close', filled_at=t2); conn.commit()
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], t1, t1))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT quantity, realized_pnl_usd FROM positions.position_snapshots WHERE id = %s", (snap_id,))
+            qty, realized = cur.fetchone()
+            assert qty == Decimal('0.1') and realized == Decimal('0')
+
+
+def test_0008_snapshot_lineage_recorded(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lin_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.04'), price=Decimal('51000'), suffix='lin_b', filled_at=base + timedelta(minutes=1)); conn.commit()
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT array_agg(fill_id ORDER BY fill_id) FROM positions.position_snapshot_fills WHERE snapshot_id = %s", (snap_id,))
+            fill_ids = cur.fetchone()[0]
+            assert sorted(fill_ids) == sorted([f1, f2])
+
+
+def test_0008_snapshot_at_before_cutoff_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base, base + timedelta(hours=1)))
+            assert 'snapshot_at' in str(exc.value).lower() or 'cutoff' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_snapshot_replay_duplicate_blocked(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='replay'); conn.commit()
+            ts = datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], ts, ts)); conn.commit()
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], ts, ts))
+            conn.rollback()
+
+
+def test_0008_environment_isolation_in_snapshot(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='env_shadow', fill_environment='SHADOW', fill_settlement_type='MODELED_FILL'); conn.commit()
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            shadow_snap = cur.fetchone()[0]
+            cur.execute("SELECT quantity FROM positions.position_snapshots WHERE id = %s", (shadow_snap,))
+            assert cur.fetchone()[0] == Decimal('0.1')
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'LIVE', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            live_snap = cur.fetchone()[0]
+            cur.execute("SELECT quantity FROM positions.position_snapshots WHERE id = %s", (live_snap,))
+            assert cur.fetchone()[0] == Decimal('0')
+
+
+def test_0008_same_timestamp_empty_snapshots_unique_per_env(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur); conn.commit()
+            ts = datetime(2026, 5, 4, 12, 0, 0, tzinfo=timezone.utc)
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], ts, ts))
+            shadow_id = cur.fetchone()[0]
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'LIVE', %s, %s, 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], ts, ts))
+            live_id = cur.fetchone()[0]
+            assert shadow_id != live_id
+            cur.execute("SELECT position_environment, quantity FROM positions.position_snapshots WHERE id IN (%s, %s) ORDER BY id", (shadow_id, live_id))
+            rows = cur.fetchall()
+            assert {r[0] for r in rows} == {'SHADOW', 'LIVE'} and all(r[1] == Decimal('0') for r in rows)
+
+
+def test_0008_reconciliation_matches_snapshot(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='rec_match')
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT positions.record_position_reconciliation(%s, 0.1, 'binance_futures', 'venue_balance_001', '{\"asset\":\"BTC\",\"balance\":\"0.1\"}'::jsonb, 0.001, 'wasseem')", (snap_id,))
+            recon_id = cur.fetchone()[0]
+            cur.execute("SELECT drift, drift_within_tolerance FROM positions.position_reconciliations WHERE id = %s", (recon_id,))
+            drift, within = cur.fetchone()
+            assert drift == Decimal('0') and within is True
+
+
+def test_0008_reconciliation_drift_outside_tolerance(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='rec_drift')
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT positions.record_position_reconciliation(%s, 0.05, 'binance_futures', 'venue_balance_002', '{\"asset\":\"BTC\",\"balance\":\"0.05\"}'::jsonb, 0.001, 'wasseem')", (snap_id,))
+            recon_id = cur.fetchone()[0]
+            cur.execute("SELECT drift, drift_within_tolerance FROM positions.position_reconciliations WHERE id = %s", (recon_id,))
+            drift, within = cur.fetchone()
+            assert drift == Decimal('0.05') and within is False
+
+
+def test_0008_reconciliation_append_only(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='rec_imm')
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]
+            cur.execute("SELECT positions.record_position_reconciliation(%s, 0.1, 'binance_futures', NULL, '{}'::jsonb, 0.001, 'wasseem')", (snap_id,))
+            recon_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_reconciliations SET reconciled_by = 'attacker' WHERE id = %s", (recon_id,))
+            conn.rollback()
+
+
+def test_0008_snapshot_append_only(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='snap_imm')
+            cur.execute("SELECT positions.compute_position_snapshot(%s, %s, %s, %s, 'SHADOW', NOW(), NOW(), 'v0.1', 'wasseem')", (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id']))
+            snap_id = cur.fetchone()[0]; conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_snapshots SET realized_pnl_usd = 99999 WHERE id = %s", (snap_id,))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM positions.position_snapshots WHERE id = %s", (snap_id,))
+            conn.rollback()
+
+
+def test_0008_closure_append_only(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='cl_imm_a', filled_at=base)
+            f2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.04'), price=Decimal('51000'), suffix='cl_imm_b', filled_at=base + timedelta(minutes=1)); conn.commit()
+            cur.execute("SELECT id FROM positions.position_lot_closures WHERE closing_fill_id = %s", (f2,)); cl_id = cur.fetchone()[0]
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE positions.position_lot_closures SET realized_pnl_usd = 99999 WHERE id = %s", (cl_id,))
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("DELETE FROM positions.position_lot_closures WHERE id = %s", (cl_id,))
+            conn.rollback()
+
+
+def test_0008_trigger_fires_on_fill_reconciliation(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            cur.execute("SELECT COUNT(*) FROM positions.position_lots"); assert cur.fetchone()[0] == 0
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='trig'); conn.commit()
+            cur.execute("SELECT COUNT(*) FROM positions.position_lots WHERE opening_fill_id = %s", (f1,))
+            assert cur.fetchone()[0] == 1
+
+
+def test_0008_downgrade_clean(fresh_db):
+    _alembic("upgrade", "0008")
+    result = _alembic("downgrade", "0007")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'positions' AND table_type = 'BASE TABLE'")
+            assert cur.fetchall() == []
+            cur.execute("SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'positions'")
+            assert cur.fetchall() == []
+            cur.execute("SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'trading' AND c.relname = 'fills' AND t.tgname = 'fills_reconciled_derive_positions'")
+            assert cur.fetchone() is None
+
+
+def test_0008_residual_lot_quantity_must_match_fill(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f1 = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='residual', filled_at=base, derive_positions=False); conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lots (portfolio_id, strategy_id, account_id, instrument_id, opening_fill_id, side, original_quantity, cost_basis, notional_value_usd, position_environment, opened_at) VALUES (%s, %s, %s, %s, %s, 'long', 0.05, 50000, 2500, 'SHADOW', %s)",
+                    (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], f1, base))
+            assert 'residual' in str(exc.value).lower() or 'original_quantity' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_cumulative_closure_exceeds_fill_quantity_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f_a = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.06'), price=Decimal('50000'), suffix='cum_a', filled_at=base)
+            f_b = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.06'), price=Decimal('50000'), suffix='cum_b', filled_at=base + timedelta(minutes=1))
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f_a,)); lot_a_id = cur.fetchone()[0]
+            f_sell = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.05'), price=Decimal('51000'), suffix='cum_sell', filled_at=base + timedelta(minutes=2), derive_positions=False); conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.04, 51000, 40, 'SHADOW', %s)",
+                (lot_a_id, f_sell, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=2)))
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'off'")
+            cur.execute("SET superhydra.allow_position_lot_update = 'on'")
+            cur.execute("UPDATE positions.position_lots SET closed_quantity = 0.04, updated_at = NOW() WHERE id = %s", (lot_a_id,))
+            cur.execute("SET superhydra.allow_position_lot_update = 'off'"); conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.02, 51000, 20, 'SHADOW', %s)",
+                    (lot_a_id, f_sell, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=2)))
+            assert 'cumulative' in str(exc.value).lower() or 'closing fill quantity' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_lot_cumulative_closure_rows_cannot_exceed_original_quantity(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            base = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            f_open = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='lot_over_open', filled_at=base)
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f_open,)); lot_id = cur.fetchone()[0]
+            f_close_1 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('51000'), suffix='lot_over_close_1', filled_at=base + timedelta(minutes=1), derive_positions=False)
+            f_close_2 = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.1'), price=Decimal('52000'), suffix='lot_over_close_2', filled_at=base + timedelta(minutes=2), derive_positions=False); conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.1, 51000, 100, 'SHADOW', %s)",
+                (lot_id, f_close_1, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=1)))
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.1, 52000, 200, 'SHADOW', %s)",
+                    (lot_id, f_close_2, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], base + timedelta(minutes=2)))
+            assert 'cumulative' in str(exc.value).lower() or 'original quantity' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0008_closure_before_lot_open_rejected(fresh_db):
+    _alembic("upgrade", "0008")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0008(cur)
+            t0 = datetime(2026, 5, 4, 10, 0, 0, tzinfo=timezone.utc)
+            t1 = datetime(2026, 5, 4, 10, 5, 0, tzinfo=timezone.utc)
+            f_sell = _reconciled_fill(cur, ctx, side='sell', quantity=Decimal('0.05'), price=Decimal('49000'), suffix='before_sell', filled_at=t0, derive_positions=False)
+            f_buy = _reconciled_fill(cur, ctx, side='buy', quantity=Decimal('0.1'), price=Decimal('50000'), suffix='before_buy', filled_at=t1)
+            cur.execute("SELECT id FROM positions.position_lots WHERE opening_fill_id = %s", (f_buy,)); long_lot_id = cur.fetchone()[0]; conn.commit()
+            cur.execute("SET superhydra.allow_position_lot_closure_insert = 'on'")
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO positions.position_lot_closures (lot_id, closing_fill_id, portfolio_id, strategy_id, account_id, instrument_id, closed_quantity, closing_price, realized_pnl_usd, position_environment, closed_at) VALUES (%s, %s, %s, %s, %s, %s, 0.05, 49000, -50, 'SHADOW', %s)",
+                    (long_lot_id, f_sell, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], t0))
+            assert 'before lot' in str(exc.value).lower() or 'impossible history' in str(exc.value).lower()
+            conn.rollback()
