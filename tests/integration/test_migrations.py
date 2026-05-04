@@ -4279,3 +4279,1498 @@ def test_0006_downgrade_clean(fresh_db):
                             'borrow_event', 'test', 'downgrade_borrow', 'wasseem')
                 """, (portfolio_id,))
             conn.rollback()
+
+
+# ============================================================
+# Migration 0007 tests: trading_orders (v5.2-final)
+# ============================================================
+
+from datetime import datetime, timezone, date, timedelta
+from decimal import Decimal
+
+
+def _setup_basic_0007(cur):
+    """Helper: full registry chain for trading tests (active 'shadow' promotion)."""
+    cur.execute("""
+        INSERT INTO registry.venues (venue_code, display_name, venue_type, status)
+        VALUES ('binance_futures', 'Binance Futures', 'cex_futures', 'active')
+        RETURNING id
+    """)
+    venue_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status)
+        VALUES ('BTC', 'Bitcoin', 'crypto', 8, 'active'),
+               ('USDT', 'Tether', 'stablecoin', 6, 'active')
+        RETURNING id
+    """)
+    ids = [r[0] for r in cur.fetchall()]
+    btc_id, usdt_id = ids[0], ids[1]
+    cur.execute("""
+        INSERT INTO registry.instruments
+            (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id,
+             instrument_type, status, config)
+        VALUES ('BTCUSDT-PERP-BINANCE', 'BTC USDT Perp', %s, %s, %s,
+                'perp', 'active', '{}'::jsonb)
+        RETURNING id
+    """, (venue_id, btc_id, usdt_id))
+    instrument_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status)
+        VALUES (%s, 'binance_master', 'Master', 'trading', 'active')
+        RETURNING id
+    """, (venue_id,))
+    account_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+        VALUES ('mn_ls_p1', 'MN L/S P1', 'market_neutral_fund', 'research')
+        RETURNING id
+    """)
+    portfolio_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES ('mn_ls_test', 'MN L/S Test', 'research', NOW(), 'docs/h.md')
+        RETURNING id
+    """)
+    strategy_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.promotions
+            (strategy_id, from_phase, to_phase, operator_id, operator_signature,
+             signature_method, gate_evidence_doc_path)
+        VALUES (%s, 'research', 'shadow', 'wasseem', 'sig', 'gpg', 'docs/p.md')
+        RETURNING id
+    """, (strategy_id,))
+    promotion_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.allocator_runs
+            (portfolio_id, objective_version, constraints_version,
+             solve_status, generated_at)
+        VALUES (%s, 'obj_v1', 'cons_v1', 'optimal', NOW())
+        RETURNING id
+    """, (portfolio_id,))
+    allocator_run_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.target_weights
+            (allocator_run_id, instrument_id, target_weight, target_notional_usd, target_quantity)
+        VALUES (%s, %s, 0.05, 5000, 0.1)
+        RETURNING id
+    """, (allocator_run_id, instrument_id))
+    target_weight_id = cur.fetchone()[0]
+    return {
+        'venue_id': venue_id, 'btc_id': btc_id, 'usdt_id': usdt_id,
+        'instrument_id': instrument_id, 'account_id': account_id,
+        'portfolio_id': portfolio_id, 'strategy_id': strategy_id,
+        'promotion_id': promotion_id,
+        'allocator_run_id': allocator_run_id,
+        'target_weight_id': target_weight_id,
+    }
+
+
+def _create_intent(cur, ctx, source_id_suffix='1', execution_environment='SHADOW',
+                    target_quantity=Decimal('0.1'), target_value_usd=Decimal('5000'), side='buy'):
+    cur.execute("""
+        INSERT INTO trading.order_intents
+            (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id,
+             instrument_id, venue_id, venue_namespace,
+             side, target_quantity, target_value_usd, intent_type, urgency,
+             execution_environment, created_via, intended_at, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures',
+                %s, %s, %s, 'open', 'normal', %s, 'allocator', NOW(), 'wasseem')
+        RETURNING id, intent_uuid
+    """, (ctx['allocator_run_id'], ctx['target_weight_id'], ctx['strategy_id'],
+          ctx['portfolio_id'], ctx['account_id'], ctx['instrument_id'], ctx['venue_id'],
+          side, target_quantity, target_value_usd, execution_environment))
+    return cur.fetchone()
+
+
+def _create_reservation(cur, ctx, intent_id, amount=Decimal('5000')):
+    cur.execute("""
+        INSERT INTO trading.order_reservations
+            (intent_id, account_id, asset_id, reservation_type, amount_reserved)
+        VALUES (%s, %s, %s, 'cash', %s)
+        RETURNING id
+    """, (intent_id, ctx['account_id'], ctx['usdt_id'], amount))
+    return cur.fetchone()[0]
+
+
+def _coid(intent_uuid, side):
+    hex_str = str(intent_uuid).replace('-', '')[:16]
+    return f'so_{hex_str}_{side}'
+
+
+def _create_order(cur, ctx, intent_id, intent_uuid, side='buy',
+                   quantity=Decimal('0.1'), price=Decimal('50000'), order_type='limit'):
+    cur.execute("""
+        INSERT INTO trading.orders
+            (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+             client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+        VALUES (%s, %s, %s, %s, 'binance_futures',
+                %s, %s, %s, %s, %s, 'gtc', 'allocator', 'wasseem')
+        RETURNING id, order_uuid
+    """, (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'],
+          _coid(intent_uuid, side), side, order_type, quantity, price))
+    return cur.fetchone()
+
+
+def _create_submit_outbox(cur, order_id, order_uuid):
+    cur.execute("""
+        INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload)
+        VALUES (%s, 'submit', %s, '{}'::jsonb)
+        RETURNING id
+    """, (order_id, f'submit:{order_uuid}'))
+    return cur.fetchone()[0]
+
+
+def _submit_order(cur, ctx, intent_id, intent_uuid, side='buy',
+                   quantity=Decimal('0.1'), price=Decimal('50000')):
+    _create_reservation(cur, ctx, intent_id)
+    order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid,
+                                            side=side, quantity=quantity, price=price)
+    _create_submit_outbox(cur, order_id, order_uuid)
+    cur.execute("""
+        SELECT trading.transition_order_state(%s, 'submitted',
+            'venue accepted', 'oms', 'binance_futures', NULL, 'wasseem')
+    """, (order_id,))
+    return order_id, order_uuid
+
+
+def _ack_order(cur, order_id, venue_order_id='venue_001'):
+    cur.execute("""
+        SELECT trading.record_order_ack(%s, %s, '{"x":1}'::jsonb, 'wasseem')
+    """, (order_id, venue_order_id))
+
+
+def test_0007_creates_all_eight_tables(fresh_db):
+    result = _alembic("upgrade", "0007")
+    assert result.returncode == 0, f"Migration failed: {result.stderr}"
+    expected = {"order_intents", "order_groups", "order_reservations", "orders",
+                "order_state_events", "fills", "cancels", "oms_outbox"}
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'trading' AND table_type = 'BASE TABLE'""")
+            assert {r[0] for r in cur.fetchall()} == expected
+
+
+def test_0007_intent_unpromoted_strategy_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            cur.execute("""UPDATE registry.promotions
+                SET revoked_at = NOW(), revoked_by = 'wasseem',
+                    revocation_signature = 'rev', revocation_signature_method = 'gpg',
+                    revocation_reason = 'test' WHERE id = %s""", (ctx['promotion_id'],))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                _create_intent(cur, ctx)
+            conn.rollback()
+
+
+def test_0007_intent_environment_phase_mismatch_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                _create_intent(cur, ctx, execution_environment='SCALE')
+            conn.rollback()
+
+
+def test_0007_intent_target_weight_must_match_allocator_run(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            cur.execute("""INSERT INTO registry.allocator_runs
+                (portfolio_id, objective_version, constraints_version, solve_status, generated_at)
+                VALUES (%s, 'obj_v2', 'cons_v2', 'optimal', NOW()) RETURNING id""", (ctx['portfolio_id'],))
+            other_run = cur.fetchone()[0]
+            cur.execute("""INSERT INTO registry.target_weights
+                (allocator_run_id, instrument_id, target_weight, target_notional_usd, target_quantity)
+                VALUES (%s, %s, 0.10, 10000, 0.2) RETURNING id""", (other_run, ctx['instrument_id']))
+            other_tw = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.order_intents
+                    (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id,
+                     instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd,
+                     intent_type, urgency, execution_environment, created_via, intended_at, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', 'buy', 0.1, 5000,
+                            'open', 'normal', 'SHADOW', 'allocator', NOW(), 'wasseem')""",
+                    (ctx['allocator_run_id'], other_tw, ctx['strategy_id'], ctx['portfolio_id'],
+                     ctx['account_id'], ctx['instrument_id'], ctx['venue_id']))
+            assert 'allocator_run_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_target_weight_instrument_must_match_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            cur.execute("""INSERT INTO registry.instruments
+                (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id,
+                 instrument_type, status, config)
+                VALUES ('ETHUSDT-PERP-BINANCE-X', 'ETH Perp', %s, %s, %s, 'perp', 'active', '{}'::jsonb)
+                RETURNING id""", (ctx['venue_id'], ctx['btc_id'], ctx['usdt_id']))
+            other_instrument = cur.fetchone()[0]
+            cur.execute("""INSERT INTO registry.target_weights
+                (allocator_run_id, instrument_id, target_weight, target_notional_usd, target_quantity)
+                VALUES (%s, %s, 0.05, 5000, 1.0) RETURNING id""", (ctx['allocator_run_id'], other_instrument))
+            other_tw = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.order_intents
+                    (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id,
+                     instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd,
+                     intent_type, urgency, execution_environment, created_via, intended_at, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', 'buy', 0.1, 5000,
+                            'open', 'normal', 'SHADOW', 'allocator', NOW(), 'wasseem')""",
+                    (ctx['allocator_run_id'], other_tw, ctx['strategy_id'], ctx['portfolio_id'],
+                     ctx['account_id'], ctx['instrument_id'], ctx['venue_id']))
+            assert 'instrument_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_intent_account_must_belong_to_venue(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            cur.execute("""INSERT INTO registry.venues (venue_code, display_name, venue_type, status)
+                VALUES ('okx', 'OKX', 'cex_futures', 'active') RETURNING id""")
+            other_venue = cur.fetchone()[0]
+            cur.execute("""INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status)
+                VALUES (%s, 'okx_master', 'OKX Master', 'trading', 'active') RETURNING id""", (other_venue,))
+            other_account = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.order_intents
+                    (allocator_run_id, target_weight_id, strategy_id, portfolio_id, account_id,
+                     instrument_id, venue_id, venue_namespace, side, target_quantity, target_value_usd,
+                     intent_type, urgency, execution_environment, created_via, intended_at, created_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures', 'buy', 0.1, 5000,
+                            'open', 'normal', 'SHADOW', 'allocator', NOW(), 'wasseem')""",
+                    (ctx['allocator_run_id'], ctx['target_weight_id'], ctx['strategy_id'],
+                     ctx['portfolio_id'], other_account, ctx['instrument_id'], ctx['venue_id']))
+            assert 'venue_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_intent_append_only(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, _ = _create_intent(cur, ctx)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.order_intents SET constraints_metadata = '{}'::jsonb WHERE id = %s", (intent_id,))
+            conn.rollback()
+
+
+def test_0007_order_initial_state_guard(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force,
+                     state, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.1, 50000, 'gtc',
+                            'submitted', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], _coid(intent_uuid, 'buy')))
+            assert 'pending_submit' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_order_account_must_match_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            cur.execute("""INSERT INTO registry.accounts (venue_id, account_code, display_name, account_type, status)
+                VALUES (%s, 'binance_subA', 'Sub A', 'trading', 'active') RETURNING id""", (ctx['venue_id'],))
+            other_account = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, other_account, ctx['instrument_id'], ctx['venue_id'], _coid(intent_uuid, 'buy')))
+            assert 'account_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_order_instrument_must_match_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            cur.execute("""INSERT INTO registry.instruments
+                (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id,
+                 instrument_type, status, config)
+                VALUES ('ETHUSDT-PERP-OIM', 'ETH OIM', %s, %s, %s, 'perp', 'active', '{}'::jsonb)
+                RETURNING id""", (ctx['venue_id'], ctx['btc_id'], ctx['usdt_id']))
+            other_instrument = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], other_instrument, ctx['venue_id'], _coid(intent_uuid, 'buy')))
+            assert 'instrument_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_order_side_must_match_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx, side='buy')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'sell', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], _coid(intent_uuid, 'sell')))
+            assert 'side' in str(exc.value).lower() or 'client_order_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_order_quantity_cannot_exceed_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx, target_quantity=Decimal('0.1'))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'limit', 0.5, 50000, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], _coid(intent_uuid, 'buy')))
+            assert 'exceeds' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_client_order_id_deterministic(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, quantity, price, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', 'wrong_coid', 'buy', 'limit', 0.1, 50000, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id']))
+            conn.rollback()
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            assert order_id is not None
+            conn.commit()
+
+
+def test_0007_order_post_only_requires_limit(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            conn.commit()
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("""INSERT INTO trading.orders
+                    (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+                     client_order_id, side, order_type, post_only, quantity, time_in_force, created_via, created_by)
+                    VALUES (%s, %s, %s, %s, 'binance_futures', %s, 'buy', 'market', TRUE, 0.1, 'gtc', 'allocator', 'wasseem')""",
+                    (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'], _coid(intent_uuid, 'buy')))
+            conn.rollback()
+
+
+def test_0007_one_order_per_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.rollback()
+
+
+def test_0007_direct_state_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.orders SET state = 'submitted' WHERE id = %s", (order_id,))
+            conn.rollback()
+
+
+def test_0007_direct_filled_quantity_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("UPDATE trading.orders SET filled_quantity = 0.1 WHERE id = %s", (order_id,))
+            assert 'fill' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_direct_submitted_at_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.orders SET submitted_at = NOW() WHERE id = %s", (order_id,))
+            conn.rollback()
+
+
+def test_0007_direct_terminal_at_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.orders SET terminal_at = NOW() WHERE id = %s", (order_id,))
+            conn.rollback()
+
+
+def test_0007_direct_venue_order_id_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.orders SET venue_order_id = 'venue_xyz', venue_acknowledged_at = NOW() WHERE id = %s", (order_id,))
+            conn.rollback()
+
+
+def test_0007_direct_rejection_reason_update_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.orders SET rejection_reason = 'bad' WHERE id = %s", (order_id,))
+            conn.rollback()
+
+
+def test_0007_transition_to_submitted_requires_reservation(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'try', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+            assert 'reservation' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_transition_to_submitted_requires_outbox(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'try', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+            assert 'outbox' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_transition_to_submitted_with_abandoned_outbox_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            outbox_id = _create_submit_outbox(cur, order_id, order_uuid)
+            cur.execute("UPDATE trading.oms_outbox SET state = 'in_flight' WHERE id = %s", (outbox_id,))
+            cur.execute("UPDATE trading.oms_outbox SET state = 'abandoned' WHERE id = %s", (outbox_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'submitted', 'try', 'oms', 'binance_futures', NULL, 'wasseem')", (order_id,))
+            assert 'usable' in str(exc.value).lower() or 'pending' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_submit_outbox_requires_reservation(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', %s, '{}'::jsonb)", (order_id, f'submit:{order_uuid}'))
+            assert 'reservation' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_submit_outbox_duplicate_defenses_exist(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            _create_submit_outbox(cur, order_id, order_uuid)
+            conn.commit()
+            cur.execute("SELECT 1 FROM pg_indexes WHERE schemaname = 'trading' AND indexname = 'uniq_outbox_one_submit_per_order'")
+            assert cur.fetchone() is not None
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', %s, '{}'::jsonb)", (order_id, f'submit:{order_uuid}'))
+            conn.rollback()
+
+
+def test_0007_outbox_initial_state_guard(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload, state) VALUES (%s, 'submit', %s, '{}'::jsonb, 'succeeded')", (order_id, f'submit:{order_uuid}'))
+            conn.rollback()
+
+
+def test_0007_outbox_operation_key_format_validates(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'submit', 'submit:wrong_uuid', '{}'::jsonb)", (order_id,))
+            assert 'operation_key' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_outbox_cancel_requires_appropriate_order_state(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'cancel', %s, '{}'::jsonb)", (order_id, f'cancel:{order_uuid}'))
+            assert 'cancel' in str(exc.value).lower() or 'state' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_outbox_amend_requires_working_or_partial(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'amend', %s, '{}'::jsonb)", (order_id, f'amend:{order_uuid}:1'))
+            assert 'amend' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_amend_replace_operation_key_empty_suffix_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'amend', %s, '{}'::jsonb)", (order_id, f'amend:{order_uuid}:'))
+            assert 'non-empty' in str(exc.value).lower() or 'suffix' in str(exc.value).lower()
+            conn.rollback()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'replace', %s, '{}'::jsonb)", (order_id, f'replace:{order_uuid}:'))
+            assert 'non-empty' in str(exc.value).lower() or 'suffix' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_cancel_outbox_accepted_from_cancel_requested(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("SELECT trading.transition_order_state(%s, 'cancel_requested', 'requesting cancel', 'oms', 'local', NULL, 'wasseem')", (order_id,))
+            conn.commit()
+            cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'cancel', %s, '{}'::jsonb) RETURNING id", (order_id, f'cancel:{order_uuid}'))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0007_amend_outbox_accepted_from_working(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'amend', %s, '{}'::jsonb) RETURNING id", (order_id, f'amend:{order_uuid}:1'))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0007_replace_outbox_accepted_from_working(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, order_uuid = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            cur.execute("INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload) VALUES (%s, 'replace', %s, '{}'::jsonb) RETURNING id", (order_id, f'replace:{order_uuid}:1'))
+            assert cur.fetchone()[0] is not None
+            conn.commit()
+
+
+def test_0007_record_order_ack_sets_metadata_and_transitions(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            _ack_order(cur, order_id, 'venue_abc')
+            conn.commit()
+            cur.execute("SELECT state, venue_order_id, venue_acknowledged_at FROM trading.orders WHERE id = %s", (order_id,))
+            state, voi, ack_at = cur.fetchone()
+            assert state == 'working'
+            assert voi == 'venue_abc'
+            assert ack_at is not None
+
+
+def test_0007_record_order_reject_sets_metadata_and_transitions(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            cur.execute("SELECT trading.record_order_reject(%s, 'insufficient margin', '{\"code\":\"E001\"}'::jsonb, 'wasseem')", (order_id,))
+            conn.commit()
+            cur.execute("SELECT state, rejection_reason FROM trading.orders WHERE id = %s", (order_id,))
+            state, reason = cur.fetchone()
+            assert state == 'rejected'
+            assert reason == 'insufficient margin'
+
+
+def test_0007_record_order_failed_submit(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            cur.execute("SELECT trading.record_order_failed_submit(%s, 'venue API timeout', 'wasseem')", (order_id,))
+            conn.commit()
+            cur.execute("SELECT state, submission_error FROM trading.orders WHERE id = %s", (order_id,))
+            state, err = cur.fetchone()
+            assert state == 'failed_submit'
+            assert err == 'venue API timeout'
+
+
+def test_0007_transition_to_filled_rejected_without_fill(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'filled', 'no fill', 'oms', 'binance_futures', NULL, 'attacker')", (order_id,))
+            assert 'fill' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_transition_to_working_rejected_without_ack(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'working', 'no ack', 'oms', 'binance_futures', NULL, 'attacker')", (order_id,))
+            assert 'ack' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_transition_to_canceled_from_pending_submit_allowed(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            cur.execute("SELECT trading.transition_order_state(%s, 'canceled', 'local cancel', 'oms', 'local', NULL, 'wasseem')", (order_id,))
+            conn.commit()
+            cur.execute("SELECT state FROM trading.orders WHERE id = %s", (order_id,))
+            assert cur.fetchone()[0] == 'canceled'
+
+
+def test_0007_transition_to_canceled_from_working_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("SELECT trading.transition_order_state(%s, 'canceled', 'try', 'oms', 'local', NULL, 'attacker')", (order_id,))
+            conn.rollback()
+
+
+def test_0007_cancel_event_for_pending_submit_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.cancels
+                    (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                    VALUES (%s, 'binance_futures', 'cancel_pending_bad', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (order_id,))
+            assert 'pending_submit' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_cancel_event_from_submitted_transitions_to_canceled(fresh_db):
+    """v5.2-final: confirmed cancel can move submitted -> canceled before ack."""
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            cur.execute("""INSERT INTO trading.cancels
+                (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                VALUES (%s, 'binance_futures', 'cancel_submitted_ok', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (order_id,))
+            conn.commit()
+            cur.execute("SELECT state FROM trading.orders WHERE id = %s", (order_id,))
+            assert cur.fetchone()[0] == 'canceled'
+
+
+def test_0007_cancel_venue_namespace_must_match(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.cancels
+                    (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                    VALUES (%s, 'wrong_venue', 'cancel_ns_bad', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (order_id,))
+            assert 'venue_namespace' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_cancel_quantity_exceeds_remaining_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid, quantity=Decimal('0.1'))
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'partial_for_cancel', 'binance_futures', 'buy', 0.04, 50000, 2000,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""INSERT INTO trading.cancels
+                    (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                    VALUES (%s, 'binance_futures', 'cancel_qty_bad', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (order_id,))
+            conn.rollback()
+
+
+def test_0007_cancel_idempotency(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            i1, u1 = _create_intent(cur, ctx, source_id_suffix='1')
+            o1, _ = _submit_order(cur, ctx, i1, u1)
+            _ack_order(cur, o1)
+            cur.execute("""INSERT INTO trading.cancels
+                (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                VALUES (%s, 'binance_futures', 'cancel_idem_1', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (o1,))
+            conn.commit()
+            i2, u2 = _create_intent(cur, ctx, source_id_suffix='2')
+            o2, _ = _submit_order(cur, ctx, i2, u2)
+            _ack_order(cur, o2, 'venue_002')
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""INSERT INTO trading.cancels
+                    (order_id, venue_namespace, source_id, cancel_reason, confirmed_at, quantity_canceled, raw_record)
+                    VALUES (%s, 'binance_futures', 'cancel_idem_1', 'user_requested', NOW(), 0.1, '{}'::jsonb)""", (o2,))
+            conn.rollback()
+
+
+def test_0007_full_fill_transitions_to_filled(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'fill_full', 'binance_futures', 'buy', 0.1, 50000, 5000,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.commit()
+            cur.execute("SELECT state, filled_quantity FROM trading.orders WHERE id = %s", (order_id,))
+            state, filled = cur.fetchone()
+            assert state == 'filled'
+            assert filled == Decimal('0.1')
+
+
+def test_0007_fill_into_submitted_rejected(fresh_db):
+    """v5.2: Phase 1 ack-before-fill assumption."""
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'fill_before_ack', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            assert 'submitted' in str(exc.value).lower() or 'non-fillable' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_fill_instrument_must_match_order(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO registry.instruments
+                (instrument_code, display_name, venue_id, base_asset_id, quote_asset_id,
+                 instrument_type, status, config)
+                VALUES ('ETHUSDT-PERP-BINANCE', 'ETH Perp', %s, %s, %s, 'perp', 'active', '{}'::jsonb)
+                RETURNING id""", (ctx['venue_id'], ctx['btc_id'], ctx['usdt_id']))
+            other_instrument = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'fill_inst_bad', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, other_instrument))
+            assert 'instrument_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_fill_environment_must_match_intent(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'fill_env_bad', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'LIVE', 'CONFIRMED_SETTLED', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0007_overfill_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid, quantity=Decimal('0.1'))
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'overfill_a', 'binance_futures', 'buy', 0.06, 50000, 3000,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'overfill_b', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            assert 'exceeds' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_duplicate_venue_fill_id_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'dup_fill', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'dup_fill', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.rollback()
+
+
+def test_0007_fill_with_pre_set_journal_id_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record,
+                     journal_id, reconciled_at, reconciled_by)
+                    VALUES (%s, %s, 'fill_pre', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb, 1, NOW(), 'attacker')""", (order_id, ctx['instrument_id']))
+            assert 'unreconciled' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_fill_into_filled_terminal_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid, quantity=Decimal('0.1'))
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'fill_term_a', 'binance_futures', 'buy', 0.1, 50000, 5000,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("""INSERT INTO trading.fills
+                    (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                     fill_environment, fill_settlement_type, filled_at, raw_record)
+                    VALUES (%s, %s, 'fill_term_b', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                            'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb)""", (order_id, ctx['instrument_id']))
+            assert 'non-fillable' in str(exc.value).lower() or 'terminal' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_direct_fill_reconciliation_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'rec_fill', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id""", (order_id, ctx['instrument_id']))
+            fill_id = cur.fetchone()[0]
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.fills SET journal_id = 1, reconciled_at = NOW(), reconciled_by = 'wasseem' WHERE id = %s", (fill_id,))
+            conn.rollback()
+
+
+def test_0007_reconcile_fill_success(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'reconcile_ok', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id""", (order_id, ctx['instrument_id']))
+            fill_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_accounts
+                (account_code, account_name, account_type, account_subtype,
+                 portfolio_id, strategy_id, registry_account_id, asset_id)
+                VALUES ('CASH_REC_OK', 'Cash', 'asset', 'cash', %s, %s, %s, %s),
+                       ('POS_REC_OK', 'Pos', 'asset', 'position', %s, %s, %s, %s)
+                ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name
+                RETURNING id""",
+                (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['usdt_id'],
+                 ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['btc_id']))
+            rows = cur.fetchall()
+            cash_acct, pos_acct = rows[0][0], rows[1][0]
+            cur.execute("""INSERT INTO accounting.journals
+                (journal_type, portfolio_id, strategy_id, journal_at,
+                 source_type, source_namespace, source_id, created_by)
+                VALUES ('trade', %s, %s, NOW(), 'fill', 'binance_futures', 'reconcile_ok', 'wasseem')
+                RETURNING id""", (ctx['portfolio_id'], ctx['strategy_id']))
+            journal_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_entries
+                (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 2500), (%s, %s, 'credit', %s, 2500)""",
+                (journal_id, pos_acct, ctx['btc_id'], journal_id, cash_acct, ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+            cur.execute("SELECT trading.reconcile_fill(%s, %s, 'wasseem')", (fill_id, journal_id))
+            conn.commit()
+            cur.execute("SELECT journal_id, reconciled_at, reconciled_by FROM trading.fills WHERE id = %s", (fill_id,))
+            jid, at, by = cur.fetchone()
+            assert jid == journal_id
+            assert at is not None
+            assert by == 'wasseem'
+
+
+def test_0007_reconcile_fill_rejects_portfolio_mismatch(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'reconcile_pmm', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id""", (order_id, ctx['instrument_id']))
+            fill_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO registry.portfolios (portfolio_code, display_name, product_type, status)
+                VALUES ('other_portfolio', 'Other', 'paper', 'research') RETURNING id""")
+            other_portfolio_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_accounts
+                (account_code, account_name, account_type, account_subtype,
+                 portfolio_id, strategy_id, registry_account_id, asset_id)
+                VALUES ('CASH_PMM', 'Cash', 'asset', 'cash', %s, %s, %s, %s),
+                       ('POS_PMM', 'Pos', 'asset', 'position', %s, %s, %s, %s)
+                ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name
+                RETURNING id""",
+                (other_portfolio_id, ctx['strategy_id'], ctx['account_id'], ctx['usdt_id'],
+                 other_portfolio_id, ctx['strategy_id'], ctx['account_id'], ctx['btc_id']))
+            rows = cur.fetchall()
+            cash_acct, pos_acct = rows[0][0], rows[1][0]
+            cur.execute("""INSERT INTO accounting.journals
+                (journal_type, portfolio_id, strategy_id, journal_at,
+                 source_type, source_namespace, source_id, created_by)
+                VALUES ('trade', %s, %s, NOW(), 'fill', 'binance_futures', 'reconcile_pmm', 'wasseem')
+                RETURNING id""", (other_portfolio_id, ctx['strategy_id']))
+            journal_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_entries
+                (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 2500), (%s, %s, 'credit', %s, 2500)""",
+                (journal_id, pos_acct, ctx['btc_id'], journal_id, cash_acct, ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.reconcile_fill(%s, %s, 'wasseem')", (fill_id, journal_id))
+            assert 'portfolio_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_reconcile_fill_rejects_strategy_mismatch(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            cur.execute("""INSERT INTO trading.fills
+                (order_id, instrument_id, venue_fill_id, venue_namespace, side, quantity, price, notional_value,
+                 fill_environment, fill_settlement_type, filled_at, raw_record)
+                VALUES (%s, %s, 'reconcile_smm', 'binance_futures', 'buy', 0.05, 50000, 2500,
+                        'SHADOW', 'MODELED_FILL', NOW(), '{}'::jsonb) RETURNING id""", (order_id, ctx['instrument_id']))
+            fill_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO registry.strategies
+                (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+                VALUES ('other_strat_smm', 'Other SMM', 'research', NOW(), 'docs/h.md') RETURNING id""")
+            other_strategy_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_accounts
+                (account_code, account_name, account_type, account_subtype,
+                 portfolio_id, strategy_id, registry_account_id, asset_id)
+                VALUES ('CASH_SMM', 'Cash', 'asset', 'cash', %s, %s, %s, %s),
+                       ('POS_SMM', 'Pos', 'asset', 'position', %s, %s, %s, %s)
+                ON CONFLICT (account_code) DO UPDATE SET account_name = EXCLUDED.account_name
+                RETURNING id""",
+                (ctx['portfolio_id'], other_strategy_id, ctx['account_id'], ctx['usdt_id'],
+                 ctx['portfolio_id'], other_strategy_id, ctx['account_id'], ctx['btc_id']))
+            rows = cur.fetchall()
+            cash_acct, pos_acct = rows[0][0], rows[1][0]
+            cur.execute("""INSERT INTO accounting.journals
+                (journal_type, portfolio_id, strategy_id, journal_at,
+                 source_type, source_namespace, source_id, created_by)
+                VALUES ('trade', %s, %s, NOW(), 'fill', 'binance_futures', 'reconcile_smm', 'wasseem')
+                RETURNING id""", (ctx['portfolio_id'], other_strategy_id))
+            journal_id = cur.fetchone()[0]
+            cur.execute("""INSERT INTO accounting.ledger_entries
+                (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+                VALUES (%s, %s, 'debit', %s, 2500), (%s, %s, 'credit', %s, 2500)""",
+                (journal_id, pos_acct, ctx['btc_id'], journal_id, cash_acct, ctx['usdt_id']))
+            cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.reconcile_fill(%s, %s, 'wasseem')", (fill_id, journal_id))
+            assert 'strategy_id' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_release_reservation_function_works(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, _ = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id)
+            conn.commit()
+            cur.execute("SELECT trading.release_reservation(%s, 'wasseem', 'no order')", (res_id,))
+            conn.commit()
+            cur.execute("SELECT amount_released, released_at, released_by FROM trading.order_reservations WHERE id = %s", (res_id,))
+            released, at, by = cur.fetchone()
+            assert released == Decimal('5000')
+            assert at is not None
+            assert by == 'wasseem'
+
+
+def test_0007_release_reservation_rejected_while_order_live(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.release_reservation(%s, 'wasseem', 'try')", (res_id,))
+            assert 'non-terminal' in str(exc.value).lower() or 'live' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_release_reservation_allowed_after_canceled(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            cur.execute("SELECT trading.transition_order_state(%s, 'canceled', 'local cancel', 'oms', 'local', NULL, 'wasseem')", (order_id,))
+            conn.commit()
+            cur.execute("SELECT trading.release_reservation(%s, 'wasseem', 'order canceled')", (res_id,))
+            conn.commit()
+            cur.execute("SELECT released_at FROM trading.order_reservations WHERE id = %s", (res_id,))
+            assert cur.fetchone()[0] is not None
+
+
+def test_0007_release_reservation_allowed_when_no_order_exists(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, _ = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id)
+            conn.commit()
+            cur.execute("SELECT trading.release_reservation(%s, 'wasseem', 'risk pre-trade rejected')", (res_id,))
+            conn.commit()
+            cur.execute("SELECT released_at FROM trading.order_reservations WHERE id = %s", (res_id,))
+            assert cur.fetchone()[0] is not None
+
+
+def test_0007_direct_reservation_release_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, _ = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.order_reservations SET amount_released = 5000, released_at = NOW(), released_by = 'attacker', release_reason = 'test' WHERE id = %s", (res_id,))
+            conn.rollback()
+
+
+def test_0007_partial_release_via_session_flag_rejected(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, _ = _create_intent(cur, ctx)
+            res_id = _create_reservation(cur, ctx, intent_id, amount=Decimal('5000'))
+            conn.commit()
+            cur.execute("SELECT set_config('superhydra.allow_reservation_release', 'on', true)")
+            with pytest.raises(psycopg.errors.CheckViolation):
+                cur.execute("UPDATE trading.order_reservations SET amount_released = 1000, released_at = NOW(), released_by = 'wasseem', release_reason = 'test' WHERE id = %s", (res_id,))
+            conn.rollback()
+
+
+def test_0007_record_order_ack_rejected_from_pending_submit(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.record_order_ack(%s, 'venue_x', '{}'::jsonb, 'wasseem')", (order_id,))
+            assert 'submitted' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_record_order_reject_rejected_from_working(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.record_order_reject(%s, 'late', NULL, 'wasseem')", (order_id,))
+            assert 'pending_submit' in str(exc.value).lower() or 'submitted' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_record_order_failed_submit_rejected_from_submitted(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.record_order_failed_submit(%s, 'late err', 'wasseem')", (order_id,))
+            assert 'pending_submit' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_record_order_ack_one_time_set(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _submit_order(cur, ctx, intent_id, intent_uuid)
+            _ack_order(cur, order_id, 'venue_first')
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.record_order_ack(%s, 'venue_second', '{}'::jsonb, 'wasseem')", (order_id,))
+            assert 'submitted' in str(exc.value).lower() or 'stale' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_transition_no_op_raises(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException) as exc:
+                cur.execute("SELECT trading.transition_order_state(%s, 'pending_submit', 'no-op', 'oms', 'test', NULL, 'wasseem')", (order_id,))
+            assert 'already' in str(exc.value).lower()
+            conn.rollback()
+
+
+def test_0007_state_event_direct_insert_blocked(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            order_id, _ = _create_order(cur, ctx, intent_id, intent_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("""INSERT INTO trading.order_state_events
+                    (order_id, old_state, new_state, transition_reason, source_type, source_namespace, created_by)
+                    VALUES (%s, 'pending_submit', 'filled', 'fake', 'attacker', 'attacker', 'attacker')""", (order_id,))
+            conn.rollback()
+
+
+def test_0007_outbox_succeeded_immutable(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            outbox_id = _create_submit_outbox(cur, order_id, order_uuid)
+            cur.execute("UPDATE trading.oms_outbox SET state = 'in_flight' WHERE id = %s", (outbox_id,))
+            cur.execute("UPDATE trading.oms_outbox SET state = 'succeeded' WHERE id = %s", (outbox_id,))
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.oms_outbox SET attempts = 99 WHERE id = %s", (outbox_id,))
+            conn.rollback()
+
+
+def test_0007_outbox_failed_can_retry(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            outbox_id = _create_submit_outbox(cur, order_id, order_uuid)
+            cur.execute("UPDATE trading.oms_outbox SET state = 'in_flight' WHERE id = %s", (outbox_id,))
+            cur.execute("UPDATE trading.oms_outbox SET state = 'failed', last_error = 'venue 503', attempts = 1 WHERE id = %s", (outbox_id,))
+            cur.execute("UPDATE trading.oms_outbox SET state = 'pending' WHERE id = %s", (outbox_id,))
+            conn.commit()
+            cur.execute("SELECT state FROM trading.oms_outbox WHERE id = %s", (outbox_id,))
+            assert cur.fetchone()[0] == 'pending'
+
+
+def test_0007_outbox_payload_immutable(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            intent_id, intent_uuid = _create_intent(cur, ctx)
+            _create_reservation(cur, ctx, intent_id)
+            order_id, order_uuid = _create_order(cur, ctx, intent_id, intent_uuid)
+            outbox_id = _create_submit_outbox(cur, order_id, order_uuid)
+            conn.commit()
+            with pytest.raises(psycopg.errors.RaiseException):
+                cur.execute("UPDATE trading.oms_outbox SET payload = '{\"v\":2}'::jsonb WHERE id = %s", (outbox_id,))
+            conn.rollback()
+
+
+def test_0007_venue_order_id_unique_per_namespace_account(fresh_db):
+    _alembic("upgrade", "0007")
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            ctx = _setup_basic_0007(cur)
+            i1, u1 = _create_intent(cur, ctx, source_id_suffix='vid_1')
+            o1, _ = _submit_order(cur, ctx, i1, u1)
+            _ack_order(cur, o1, 'venue_xyz')
+            conn.commit()
+            i2, u2 = _create_intent(cur, ctx, source_id_suffix='vid_2')
+            o2, _ = _submit_order(cur, ctx, i2, u2)
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                _ack_order(cur, o2, 'venue_xyz')
+            conn.rollback()
+
+
+def test_0007_downgrade_clean(fresh_db):
+    _alembic("upgrade", "0007")
+    result = _alembic("downgrade", "0006")
+    assert result.returncode == 0, f"Downgrade failed: {result.stderr}"
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'trading' AND table_type = 'BASE TABLE'")
+            assert cur.fetchall() == []
+            cur.execute("SELECT proname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'trading'")
+            assert cur.fetchall() == []
