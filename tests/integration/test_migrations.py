@@ -6567,3 +6567,1723 @@ def test_0008_closure_before_lot_open_rejected(fresh_db):
                     (long_lot_id, f_sell, ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'], t0))
             assert 'before lot' in str(exc.value).lower() or 'impossible history' in str(exc.value).lower()
             conn.rollback()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# Migration 0009 tests: risk evaluation layer (round 3d)
+# ════════════════════════════════════════════════════════════════════════
+#
+# Round 3d is a foundation rewrite over round 3c. Helpers re-targeted
+# against the actual 0002–0007 schemas (column names, CHECKs, env ×
+# settlement-type combos). Test bodies and selection unchanged.
+#
+# Key fixes vs 3c:
+#   - registry table column names (portfolio_code, venue_code,
+#     instrument_code, account_code; display_name everywhere required)
+#   - portfolio_strategies composite PK (+ starts_at)
+#   - allocator_runs / target_weights real shape (UUID pk, JSONB
+#     constraints, no created_by)
+#   - mark_price_sets.purpose = 'risk_monitoring'
+#   - valuation_runs.run_type = 'eod_close'
+#   - nav_snapshots: nav_breakdown + computation_metadata required,
+#     nav_settlement_type ∈ allowed enum (use 'MIXED' for tests)
+#   - ledger_accounts / journals / ledger_entries from 0005 (not 0006);
+#     dimensional consistency satisfied
+#   - trading.fills CHECK: LIVE+CONFIRMED_SETTLED only; SHADOW+MODELED_FILL
+#     only. Helper threads from execution_environment.
+#
+# Coverage in round 3d (~45 tests, 56 total — unchanged from 3a/3b/3c):
+#   §1  Schema-shape verification (9 tables, S1 + S2 v5 amendments)
+#   §2  Insert-gate enforcement (3 gates from round 2b)
+#   §3  Cancel outcome matrix — LIVE row coverage (8 fixtures)
+#   §4  Per-dimension fixtures — within / breach / exit-* / staleness (12)
+#   §5  CB action × source_type — focused (8)
+#   §6  cancel_target_unresolvable × CB action (4) — v3-2 + v4-1 + v5
+#   §7  block_new_risk × indeterminate predicate non-unresolvable (2)
+#   §8  Environment mapping (6) — v3-3
+#   §9  Universal-equivalent CB on missing regime (2) — v3-4
+#   §10 Mark INTO STRICT — TOO_MANY_ROWS + NO_DATA_FOUND (2) — v3-1
+#   §11 Replay determinism + non-cancel guard (2)
+#   §12 Idempotency (2)
+
+import uuid as _uuid
+import psycopg.types.json
+
+# ════════════════════════════════════════════════════════════════════════
+# HELPERS (round 3d — schema-correct against 0002–0007)
+# ════════════════════════════════════════════════════════════════════════
+
+def _setup_basic_0009(cur, with_regime=True, regime='NORMAL',
+                      nav_environment='LIVE'):
+    """Bootstrap a complete 0009 test scope against actual 0002–0007 schemas.
+
+    Returns ctx dict consumed by the more specific helpers below.
+    """
+    _alembic("upgrade", "0009")
+
+    suffix = _uuid.uuid4().hex[:8]
+
+    # ─── Registry layer ──────────────────────────────────────────────────
+    cur.execute("""
+        INSERT INTO registry.venues
+            (venue_code, display_name, venue_type, status)
+        VALUES (%s, 'Binance Futures Test', 'cex_futures', 'active')
+        RETURNING id
+    """, (f'venue_{suffix}',))
+    venue_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.assets
+            (symbol, display_name, asset_type, decimals, status)
+        VALUES ('BTC', 'Bitcoin', 'crypto', 8, 'active')
+        RETURNING id
+    """)
+    btc_id = cur.fetchone()[0]
+    cur.execute("""
+        INSERT INTO registry.assets
+            (symbol, display_name, asset_type, decimals, status)
+        VALUES ('USDT', 'Tether USD', 'stablecoin', 6, 'active')
+        RETURNING id
+    """)
+    usdt_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.instruments
+            (instrument_code, display_name, venue_id,
+             base_asset_id, quote_asset_id, instrument_type, status)
+        VALUES (%s, 'BTC/USDT Perp', %s, %s, %s, 'perp', 'active')
+        RETURNING id
+    """, (f'BTCUSDT_PERP_{suffix}', venue_id, btc_id, usdt_id))
+    instrument_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.accounts
+            (venue_id, account_code, display_name, account_type, status)
+        VALUES (%s, %s, 'Main Trading Account', 'trading', 'active')
+        RETURNING id
+    """, (venue_id, f'main_{suffix}'))
+    account_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.portfolios
+            (portfolio_code, display_name, product_type, status)
+        VALUES (%s, 'Test Portfolio 0009', 'internal', 'live')
+        RETURNING id
+    """, (f'pf_{suffix}',))
+    portfolio_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO registry.strategies
+            (name, display_name, current_phase, phase_entered_at, hypothesis_doc_path)
+        VALUES (%s, 'Test Strategy 0009', 'canary', NOW(), '/dev/null/hypothesis')
+        RETURNING id
+    """, (f'strat_{suffix}',))
+    strategy_id = cur.fetchone()[0]
+
+    # portfolio_strategies has composite PK (portfolio_id, strategy_id, starts_at)
+    cur.execute("""
+        INSERT INTO registry.portfolio_strategies
+            (portfolio_id, strategy_id, active_risk_weight,
+             capital_allocation_pct, starts_at)
+        VALUES (%s, %s, 1.0, 1.0, NOW() - INTERVAL '1 day')
+    """, (portfolio_id, strategy_id))
+
+    # registry.promotions: trading.enforce_order_intent_promotion gates
+    # order_intent inserts on the latest non-revoked promotion's to_phase.
+    # We promote to 'scale' so all three execution_environments (SHADOW,
+    # CANARY, SCALE) pass. signature_method='yubikey' is required because
+    # to_phase='scale' is outside the {research, shadow, paused, sunset}
+    # CHECK exception.
+    cur.execute("""
+        INSERT INTO registry.promotions
+            (strategy_id, from_phase, to_phase,
+             operator_id, operator_signature, signature_method,
+             gate_evidence_doc_path)
+        VALUES (%s, 'canary', 'scale',
+                'wasseem', 'test_sig_yubikey', 'yubikey',
+                '/dev/null/gate_evidence')
+    """, (strategy_id,))
+
+    # allocator_runs has UUID pk, JSONB array constraint, no created_by
+    cur.execute("""
+        INSERT INTO registry.allocator_runs
+            (portfolio_id, objective_version, constraints_version,
+             solve_status, generated_at)
+        VALUES (%s, 'test_v1', 'test_v1', 'optimal', NOW())
+        RETURNING id
+    """, (portfolio_id,))
+    allocator_run_id = cur.fetchone()[0]
+
+    # target_weights has UUID pk, reason JSONB object, no created_by
+    cur.execute("""
+        INSERT INTO registry.target_weights
+            (allocator_run_id, instrument_id, target_weight, reason)
+        VALUES (%s, %s, 1.0, '{}'::jsonb)
+        RETURNING id
+    """, (allocator_run_id, instrument_id))
+    target_weight_id = cur.fetchone()[0]
+
+    # ─── Accounting: mark_price_set + a single mark for BTCUSDT ──────────
+    mark_ts = datetime.now(timezone.utc).replace(microsecond=0)
+    cur.execute("""
+        INSERT INTO accounting.mark_price_sets
+            (set_hash, purpose, created_by)
+        VALUES (%s, 'risk_monitoring', 'wasseem')
+        RETURNING id
+    """, (f'mph_{suffix}',))
+    mark_price_set_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.mark_prices
+            (instrument_id, mark_type, price, source, source_namespace,
+             source_id, source_timestamp, confidence)
+        VALUES (%s, 'last', 50000.0, 'venue', 'binance_futures',
+                %s, %s, 1.0)
+        RETURNING id
+    """, (instrument_id, f'tick_{suffix}', mark_ts))
+    mark_price_id = cur.fetchone()[0]
+
+    cur.execute("""
+        INSERT INTO accounting.mark_price_set_items
+            (mark_price_set_id, mark_price_id)
+        VALUES (%s, %s)
+    """, (mark_price_set_id, mark_price_id))
+
+    # ─── Valuation run + NAV snapshot ────────────────────────────────────
+    today_utc = datetime.now(timezone.utc).date()
+    cur.execute("""
+        INSERT INTO accounting.valuation_runs
+            (portfolio_id, run_type, valuation_date, mark_price_set_id,
+             journal_cutoff_at, engine_version, calculation_hash, created_by)
+        VALUES (%s, 'eod_close', %s, %s, NOW(), 'test_v1', %s, 'wasseem')
+        RETURNING id
+    """, (portfolio_id, today_utc, mark_price_set_id, f'calc_{suffix}'))
+    valuation_run_id = cur.fetchone()[0]
+
+    # nav_snapshots: nav_breakdown + computation_metadata required;
+    # nav_settlement_type='MIXED' is the most permissive choice (allows both
+    # nav_realized and nav_unrealized to be zero or nonzero).
+    cur.execute("""
+        INSERT INTO accounting.nav_snapshots
+            (valuation_run_id, portfolio_id, strategy_id, snapshot_date,
+             nav_total, nav_realized, nav_unrealized,
+             nav_breakdown, twr_daily,
+             nav_environment, nav_settlement_type,
+             computation_metadata)
+        VALUES (%s, %s, %s, %s,
+                100000.0, 0, 0,
+                '{}'::jsonb, NULL,
+                %s, 'MIXED',
+                '{}'::jsonb)
+        RETURNING id
+    """, (valuation_run_id, portfolio_id, strategy_id, today_utc, nav_environment))
+    nav_snapshot_id = cur.fetchone()[0]
+
+    # ─── Ledger accounts (0005 schema; required for journal-backed fills)
+    cur.execute("""
+        INSERT INTO accounting.ledger_accounts
+            (account_code, account_name, account_type, account_subtype,
+             portfolio_id, strategy_id, registry_account_id, asset_id)
+        VALUES
+            (%s, 'Cash USDT', 'asset', 'cash',
+             %s, %s, %s, %s),
+            (%s, 'Position BTC', 'asset', 'position',
+             %s, %s, %s, %s)
+        RETURNING id
+    """, (f'cash_{suffix}',
+          portfolio_id, strategy_id, account_id, usdt_id,
+          f'pos_{suffix}',
+          portfolio_id, strategy_id, account_id, btc_id))
+    led_rows = cur.fetchall()
+    cash_ledger_account_id = led_rows[0][0]
+    pos_ledger_account_id  = led_rows[1][0]
+
+    # ─── Risk layer: regime transition (optional) ────────────────────────
+    if with_regime:
+        cur.execute("""
+            SELECT risk.record_regime_transition(
+                %s, NULL, %s, 'LIVE', NOW(), %s, '{}'::jsonb, 'wasseem'
+            )
+        """, (portfolio_id, regime, f'init_regime_{suffix}'))
+
+    return {
+        'portfolio_id':       portfolio_id,
+        'strategy_id':        strategy_id,
+        'account_id':         account_id,
+        'instrument_id':      instrument_id,
+        'venue_id':           venue_id,
+        'btc_id':             btc_id,
+        'usdt_id':            usdt_id,
+        'allocator_run_id':   allocator_run_id,
+        'target_weight_id':   target_weight_id,
+        'mark_price_set_id':  mark_price_set_id,
+        'mark_price_id':      mark_price_id,
+        'mark_source_ts':     mark_ts,
+        'valuation_run_id':   valuation_run_id,
+        'nav_snapshot_id':    nav_snapshot_id,
+        'today_utc':          today_utc,
+        'cash_ledger_account_id': cash_ledger_account_id,
+        'pos_ledger_account_id':  pos_ledger_account_id,
+    }
+
+
+def _fill_env_for(execution_environment):
+    """Map order's execution_environment → (fill_environment, fill_settlement_type).
+
+    Honors the trading.fills CHECK:
+      LIVE   → CONFIRMED_SETTLED
+      SHADOW → MODELED_FILL
+      REPLAY/BACKTEST → SIMULATED_FILL or MODELED_FILL
+    """
+    if execution_environment == 'SHADOW':
+        return ('SHADOW', 'MODELED_FILL')
+    if execution_environment in ('CANARY', 'SCALE'):
+        return ('LIVE', 'CONFIRMED_SETTLED')
+    raise ValueError(f"_fill_env_for: unsupported execution_environment={execution_environment!r}")
+
+
+def _r3d_create_order(cur, ctx, side='buy', quantity=1.0, price=50000.0,
+                  execution_environment='CANARY', state='pending_submit',
+                  filled_quantity=None, suffix=None):
+    """State-aware order factory walking the legitimate 0007 FSM path.
+
+    Supported states: pending_submit, submitted, working,
+      partially_filled, filled, cancel_requested, canceled,
+      rejected, expired, failed_submit, stale_needs_reconciliation.
+
+    state='unknown' is intentionally rejected at the helper layer (raises
+    ValueError) because the 0007 FSM does not whitelist working → unknown
+    directly. Bucket D coverage routes through stale_needs_reconciliation,
+    which shares the same P14 D1 handling and produces the identical
+    result_reason='insufficient_inputs:target_state_indeterminate'.
+
+    Returns (intent_id, order_id).
+    """
+    if suffix is None:
+        suffix = _uuid.uuid4().hex[:8]
+    fill_env, fill_settlement = _fill_env_for(execution_environment)
+
+    # ─── Pre-submit: intent + reservation + order ────────────────────────
+    cur.execute("""
+        INSERT INTO trading.order_intents
+            (allocator_run_id, target_weight_id, strategy_id, portfolio_id,
+             account_id, instrument_id, venue_id, venue_namespace,
+             side, target_quantity, target_value_usd, intent_type, urgency,
+             execution_environment, created_via, intended_at, created_by)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, 'binance_futures',
+                %s, %s, %s, 'open', 'normal',
+                %s, 'allocator', NOW(), 'wasseem')
+        RETURNING id, intent_uuid
+    """, (ctx['allocator_run_id'], ctx['target_weight_id'],
+          ctx['strategy_id'], ctx['portfolio_id'],
+          ctx['account_id'], ctx['instrument_id'], ctx['venue_id'],
+          side, quantity, quantity * price, execution_environment))
+    intent_id, intent_uuid = cur.fetchone()
+
+    cur.execute("""
+        INSERT INTO trading.order_reservations
+            (intent_id, account_id, asset_id, reservation_type, amount_reserved)
+        VALUES (%s, %s, %s, 'cash', %s)
+    """, (intent_id, ctx['account_id'], ctx['usdt_id'], quantity * price))
+
+    # Deterministic COID (0007 format trigger)
+    hex_str = str(intent_uuid).replace('-', '')[:16]
+    coid = f"so_{hex_str}_{side}"
+
+    cur.execute("""
+        INSERT INTO trading.orders
+            (intent_id, account_id, instrument_id, venue_id, venue_namespace,
+             client_order_id, side, order_type, quantity, price,
+             time_in_force, created_via, created_by)
+        VALUES (%s, %s, %s, %s, 'binance_futures',
+                %s, %s, 'limit', %s, %s, 'gtc', 'allocator', 'wasseem')
+        RETURNING id, order_uuid
+    """, (intent_id, ctx['account_id'], ctx['instrument_id'], ctx['venue_id'],
+          coid, side, quantity, price))
+    order_id, order_uuid = cur.fetchone()
+
+    if state == 'pending_submit':
+        return intent_id, order_id
+
+    if state == 'failed_submit':
+        cur.execute("""
+            SELECT trading.record_order_failed_submit(
+                %s, 'submission error', 'wasseem')
+        """, (order_id,))
+        return intent_id, order_id
+
+    # Submit: outbox + transition_order_state('submitted')
+    cur.execute("""
+        INSERT INTO trading.oms_outbox (order_id, operation, operation_key, payload)
+        VALUES (%s, 'submit', %s, '{}'::jsonb)
+    """, (order_id, f'submit:{order_uuid}'))
+    cur.execute("""
+        SELECT trading.transition_order_state(
+            %s, 'submitted', 'venue accepted',
+            'oms', 'binance_futures', NULL, 'wasseem')
+    """, (order_id,))
+
+    if state == 'submitted':
+        return intent_id, order_id
+
+    if state == 'rejected':
+        cur.execute("""
+            SELECT trading.record_order_reject(
+                %s, 'venue rejected', '{}'::jsonb, 'wasseem')
+        """, (order_id,))
+        return intent_id, order_id
+
+    # Ack → working
+    cur.execute("""
+        SELECT trading.record_order_ack(
+            %s, %s, '{}'::jsonb, 'wasseem')
+    """, (order_id, f'venue_{suffix}'))
+
+    if state == 'working':
+        return intent_id, order_id
+
+    if state == 'partially_filled':
+        partial_qty = filled_quantity if filled_quantity is not None else quantity / 2.0
+        if partial_qty <= 0 or partial_qty >= quantity:
+            raise ValueError(
+                f"_r3d_create_order(state='partially_filled'): filled_quantity "
+                f"must be in (0, {quantity}); got {partial_qty}")
+        _create_reconciled_fill(cur, ctx, order_id, side, partial_qty, price,
+                                 suffix, fill_env, fill_settlement)
+        return intent_id, order_id
+
+    if state == 'filled':
+        _create_reconciled_fill(cur, ctx, order_id, side, quantity, price,
+                                 suffix, fill_env, fill_settlement)
+        cur.execute("SELECT state FROM trading.orders WHERE id = %s", (order_id,))
+        observed = cur.fetchone()[0]
+        if observed != 'filled':
+            raise AssertionError(
+                f"_r3d_create_order(state='filled'): reconcile_fill of full "
+                f"quantity={quantity} did not land order_id={order_id} in "
+                f"'filled'; observed state={observed!r}. This indicates "
+                f"either drift in trading.reconcile_fill's state-ownership "
+                f"contract or a wrong test setup assumption.")
+        return intent_id, order_id
+
+    if state == 'cancel_requested':
+        cur.execute("""
+            SELECT trading.transition_order_state(
+                %s, 'cancel_requested', 'user requested cancel',
+                'oms', 'binance_futures', NULL, 'wasseem')
+        """, (order_id,))
+        return intent_id, order_id
+
+    if state == 'canceled':
+        # Owned by the cancels-event path — insert into trading.cancels;
+        # process_cancel_update_order trigger transitions to 'canceled'.
+        cur.execute("""
+            INSERT INTO trading.cancels
+                (order_id, venue_namespace, source_id,
+                 cancel_reason, confirmed_at,
+                 quantity_canceled, raw_record)
+            VALUES (%s, 'binance_futures', %s,
+                    'user_requested', NOW(),
+                    %s, '{}'::jsonb)
+        """, (order_id, f'cancel_{suffix}', quantity))
+        return intent_id, order_id
+
+    if state == 'expired':
+        cur.execute("""
+            SELECT trading.transition_order_state(
+                %s, 'expired', 'time-in-force expired',
+                'oms', 'binance_futures', NULL, 'wasseem')
+        """, (order_id,))
+        return intent_id, order_id
+
+    if state == 'stale_needs_reconciliation':
+        cur.execute("""
+            SELECT trading.transition_order_state(
+                %s, 'stale_needs_reconciliation',
+                'no venue update within window',
+                'oms', 'binance_futures', NULL, 'wasseem')
+        """, (order_id,))
+        return intent_id, order_id
+
+    if state == 'unknown':
+        raise ValueError(
+            "_r3d_create_order: state='unknown' is not reachable directly from "
+            "'working' under the 0007 FSM. For Bucket D coverage use "
+            "state='stale_needs_reconciliation' — both states share P14 D1 "
+            "handling and result_reason='insufficient_inputs:target_state_"
+            "indeterminate'.")
+
+    raise ValueError(f"_r3d_create_order: unsupported state={state!r}")
+
+
+def _create_reconciled_fill(cur, ctx, order_id, side, quantity, price,
+                            suffix, fill_environment='LIVE',
+                            fill_settlement_type='CONFIRMED_SETTLED'):
+    """Insert fill + accounting journal + post + reconcile.
+
+    Threads fill_environment + fill_settlement_type from caller (caller is
+    _r3d_create_order, which derives from execution_environment via _fill_env_for).
+    Returns fill_id.
+    """
+    notional = quantity * price
+    fill_identity = f'fill_{suffix}'
+
+    cur.execute("""
+        INSERT INTO trading.fills
+            (order_id, instrument_id, venue_fill_id, venue_namespace,
+             side, quantity, price, notional_value,
+             fill_environment, fill_settlement_type, filled_at, raw_record)
+        VALUES (%s, %s, %s, 'binance_futures',
+                %s, %s, %s, %s,
+                %s, %s, NOW(), '{}'::jsonb)
+        RETURNING id
+    """, (order_id, ctx['instrument_id'], fill_identity,
+          side, quantity, price, notional,
+          fill_environment, fill_settlement_type))
+    fill_id = cur.fetchone()[0]
+
+    # journals: portfolio_id NOT NULL; source_type='fill' is allowed;
+    # source_id matches venue_fill_id for reconcile_fill identity check.
+    cur.execute("""
+        INSERT INTO accounting.journals
+            (journal_type, portfolio_id, strategy_id, journal_at,
+             source_type, source_namespace, source_id, created_by)
+        VALUES ('trade', %s, %s, NOW(),
+                'fill', 'binance_futures', %s, 'wasseem')
+        RETURNING id
+    """, (ctx['portfolio_id'], ctx['strategy_id'], fill_identity))
+    journal_id = cur.fetchone()[0]
+
+    # ledger_entries: UUID pk auto, asset_id NOT NULL, amount_usd NOT NULL.
+    # Dimension validation requires:
+    #   account.portfolio_id matches journal.portfolio_id  ✓
+    #   account.strategy_id matches journal.strategy_id    ✓
+    #   account.asset_id matches entry.asset_id            ✓
+    # cash account has asset_id=USDT; pos account has asset_id=BTC.
+    # Debits = credits → balanced (post_journal requirement).
+    cur.execute("""
+        INSERT INTO accounting.ledger_entries
+            (journal_id, ledger_account_id, debit_credit, asset_id, amount_usd)
+        VALUES (%s, %s, 'debit',  %s, %s),
+               (%s, %s, 'credit', %s, %s)
+    """, (journal_id, ctx['pos_ledger_account_id'],  ctx['btc_id'],  notional,
+          journal_id, ctx['cash_ledger_account_id'], ctx['usdt_id'], notional))
+
+    cur.execute("SELECT accounting.post_journal(%s, 'wasseem')", (journal_id,))
+    cur.execute("SELECT trading.reconcile_fill(%s, %s, 'wasseem')",
+                (fill_id, journal_id))
+    return fill_id
+
+
+def _set_position(cur, ctx, signed_qty, price=50000.0):
+    """Establish a current position by creating a filled order of size signed_qty."""
+    if signed_qty == 0:
+        return None
+    side = 'buy' if signed_qty > 0 else 'sell'
+    _, order_id = _r3d_create_order(cur, ctx,
+                                 side=side, quantity=abs(signed_qty),
+                                 price=price, state='filled',
+                                 execution_environment='CANARY')
+    return order_id
+
+
+def _create_limit(cur, ctx, dimension, scope, value, blocking=True,
+                  effective_at=None, idempotency_key=None,
+                  risk_environment='LIVE',
+                  account_id_override=None, instrument_id_override=None,
+                  strategy_id_override='default'):
+    """Wrap risk.upsert_limit. Returns (limit_id, limit_version_id)."""
+    if effective_at is None:
+        effective_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    if idempotency_key is None:
+        idempotency_key = f'lim_{dimension}_{scope}_{datetime.now(timezone.utc).timestamp()}'
+
+    strategy = ctx['strategy_id'] if strategy_id_override == 'default' else strategy_id_override
+    account = ctx['account_id'] if account_id_override is None else account_id_override
+    instrument = ctx['instrument_id'] if instrument_id_override is None else instrument_id_override
+
+    if scope == 'portfolio':
+        strategy = None
+        account = None
+        instrument = None
+    elif scope == 'strategy':
+        account = None
+        instrument = None
+
+    cur.execute("""
+        SELECT * FROM risk.upsert_limit(
+            %s, %s, %s, %s, %s, %s, %s,
+            %s::numeric, %s, NULL, %s, %s, '{}'::jsonb, 'wasseem'
+        )
+    """, (ctx['portfolio_id'], strategy, account, instrument,
+          dimension, scope, risk_environment,
+          value, blocking, effective_at, idempotency_key))
+    return cur.fetchone()
+
+
+def _create_cb(cur, ctx, name, action, applies_in_regimes,
+               throttle_params=None, risk_environment='LIVE'):
+    """Wrap risk.upsert_circuit_breaker. Returns (cb_id, cb_version_id)."""
+    effective_at = datetime.now(timezone.utc) - timedelta(seconds=10)
+    cur.execute("""
+        SELECT * FROM risk.upsert_circuit_breaker(
+            %s, %s, %s, %s, %s, %s::jsonb, %s::text[],
+            %s, %s, '{}'::jsonb, 'wasseem'
+        )
+    """, (ctx['portfolio_id'], None, name, risk_environment,
+          action,
+          psycopg.types.json.Jsonb(throttle_params) if throttle_params else None,
+          applies_in_regimes,
+          effective_at, f'cb_init_{name}'))
+    return cur.fetchone()
+
+
+def _trip_cb(cur, cb_id):
+    """Trip a CB from armed → tripped via risk.set_circuit_breaker_state."""
+    cur.execute("""
+        SELECT risk.set_circuit_breaker_state(
+            %s, 'tripped', NOW(), NULL, 'test_trip',
+            '{}'::jsonb, %s, 'wasseem'
+        )
+    """, (cb_id, f'trip_{cb_id}_{datetime.now(timezone.utc).timestamp()}'))
+    return cur.fetchone()[0]
+
+
+def _evaluate_cancel(cur, ctx, target_order_id,
+                     risk_environment='LIVE',
+                     mark_inputs=True, drawdown_inputs=False,
+                     idempotency_key=None):
+    """Convenience: invoke risk.evaluate_action for a cancel."""
+    if idempotency_key is None:
+        idempotency_key = f'eval_cancel_{target_order_id}_{datetime.now(timezone.utc).timestamp()}'
+    as_of = datetime.now(timezone.utc)
+    fc_at = as_of  # include all fills up to evaluation moment
+
+    mark_set = ctx['mark_price_set_id'] if mark_inputs else None
+    mark_ts  = ctx['mark_source_ts']    if mark_inputs else None
+    mark_typ = 'last'                    if mark_inputs else None
+
+    anchor   = ctx['valuation_run_id']  if drawdown_inputs else None
+    nav_id   = ctx['nav_snapshot_id']   if drawdown_inputs else None
+    nav_st   = 'MIXED'                   if drawdown_inputs else None
+
+    cur.execute("""
+        SELECT risk.evaluate_action(
+            'cancel', %s, %s, 'wasseem',
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            NULL, NULL,
+            %s,
+            %s, %s, %s,
+            %s, %s, %s,
+            '{}'::jsonb
+        )
+    """, (
+        f'src_cancel_{target_order_id}',
+        idempotency_key,
+        ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'],
+        as_of, fc_at, risk_environment,
+        target_order_id,
+        mark_set, mark_ts, mark_typ,
+        anchor, nav_id, nav_st,
+    ))
+    return cur.fetchone()[0]
+
+
+def _evaluate_intent(cur, ctx, source_id, intended_position_after,
+                     risk_environment='LIVE', mark_inputs=True,
+                     drawdown_inputs=False, idempotency_key=None,
+                     intended_notional_after_usd=None):
+    """Convenience: invoke risk.evaluate_action for a non-cancel (intent)."""
+    if idempotency_key is None:
+        idempotency_key = f'eval_intent_{source_id}_{datetime.now(timezone.utc).timestamp()}'
+    if intended_notional_after_usd is None and intended_position_after is not None:
+        intended_notional_after_usd = abs(intended_position_after) * 50000.0
+    as_of = datetime.now(timezone.utc)
+    fc_at = as_of  # include all fills up to evaluation moment
+
+    mark_set = ctx['mark_price_set_id'] if mark_inputs else None
+    mark_ts  = ctx['mark_source_ts']    if mark_inputs else None
+    mark_typ = 'last'                    if mark_inputs else None
+
+    anchor   = ctx['valuation_run_id']  if drawdown_inputs else None
+    nav_id   = ctx['nav_snapshot_id']   if drawdown_inputs else None
+    nav_st   = 'MIXED'                   if drawdown_inputs else None
+
+    cur.execute("""
+        SELECT risk.evaluate_action(
+            'intent', %s, %s, 'wasseem',
+            %s, %s, %s, %s,
+            %s, %s, %s,
+            %s::numeric, %s::numeric,
+            NULL,
+            %s, %s, %s,
+            %s, %s, %s,
+            '{}'::jsonb
+        )
+    """, (
+        source_id, idempotency_key,
+        ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'],
+        as_of, fc_at, risk_environment,
+        intended_position_after, intended_notional_after_usd,
+        mark_set, mark_ts, mark_typ,
+        anchor, nav_id, nav_st,
+    ))
+    return cur.fetchone()[0]
+
+
+def _verdict(cur, eval_id):
+    """Return (verdict_raw, verdict_effective, predicate, cb_reason, cancel_target)."""
+    cur.execute("""
+        SELECT verdict_raw, verdict_effective, is_genuinely_risk_reducing,
+               circuit_breaker_result_reason, cancel_target_order_id
+        FROM risk.evaluations WHERE id = %s
+    """, (eval_id,))
+    return cur.fetchone()
+
+
+def _limit_results(cur, eval_id):
+    """Return list of (dimension, result_reason, severity, blocking, observed)."""
+    cur.execute("""
+        SELECT l.dimension, elr.result_reason, elr.severity_bucket,
+               elr.blocking, elr.observed_value
+        FROM risk.evaluation_limit_results elr
+        JOIN risk.limit_versions lv ON lv.id = elr.limit_version_id
+        JOIN risk.limits l ON l.id = lv.limit_id
+        WHERE elr.evaluation_id = %s
+        ORDER BY l.id
+    """, (eval_id,))
+    return cur.fetchall()
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §1  SCHEMA-SHAPE TESTS — verify v5 schema amendments landed
+# ════════════════════════════════════════════════════════════════════════
+
+def test_0009_creates_9_risk_tables(fresh_db):
+    _alembic("upgrade", "0009")
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT table_name FROM information_schema.tables
+            WHERE table_schema = 'risk' AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+        """)
+        actual = {r[0] for r in cur.fetchall()}
+    expected = {
+        'limits', 'limit_versions', 'regime_transitions',
+        'evaluations', 'evaluation_inputs', 'evaluation_limit_results',
+        'circuit_breakers', 'circuit_breaker_versions', 'circuit_breaker_states',
+    }
+    assert actual == expected, f"missing/extra: {actual ^ expected}"
+
+
+def test_s1_result_reason_check_admits_cancel_target_unresolvable(fresh_db):
+    """S1: evaluation_limit_results.result_reason CHECK admits the 10th value."""
+    _alembic("upgrade", "0009")
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("""
+            SELECT pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conrelid = 'risk.evaluation_limit_results'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%insufficient_inputs:cancel_target_unresolvable%'
+        """)
+        rows = cur.fetchall()
+    assert len(rows) == 1, "S1 amendment not present on result_reason CHECK"
+
+
+def test_s2_cancel_target_consistency_admits_degraded_and_hard_stop(fresh_db):
+    """S2 v5: cancel + NULL target permitted iff verdict='degraded' or cb_hard_stop:applied."""
+    _alembic("upgrade", "0009")
+    with _connect() as conn, conn.cursor() as cur:
+        # Tightened sentinel: the cb_result_reason enum CHECK also contains
+        # the literal 'cb_hard_stop:applied' (it's one of the allowed values),
+        # so a loose LIKE match returns 2 constraints. The S2 cancel-target-
+        # consistency CHECK is the unique one that ALSO references both
+        # source_type and cancel_target_order_id IS NULL.
+        cur.execute("""
+            SELECT pg_get_constraintdef(oid)
+            FROM pg_constraint
+            WHERE conrelid = 'risk.evaluations'::regclass
+              AND contype = 'c'
+              AND pg_get_constraintdef(oid) LIKE '%cb_hard_stop:applied%'
+              AND pg_get_constraintdef(oid) LIKE '%source_type%'
+              AND pg_get_constraintdef(oid) LIKE '%cancel_target_order_id IS NULL%'
+        """)
+        rows = cur.fetchall()
+    assert len(rows) == 1, "S2 v5 narrowed CHECK not present"
+    defn = rows[0][0]
+    assert 'verdict_raw' in defn and 'degraded' in defn
+    assert 'circuit_breaker_result_reason' in defn
+
+
+def test_s2_rejects_cancel_null_target_with_blocked_only_no_hard_stop(fresh_db):
+    """Negative S2: cancel + NULL target + verdict='blocked' + non-hard-stop CB → reject."""
+    _alembic("upgrade", "0009")
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        # Try direct INSERT bypassing the gate to verify the CHECK itself fires.
+        cur.execute("SET LOCAL risk.allow_evaluations_insert = 'on'")
+        with pytest.raises(psycopg.errors.CheckViolation):
+            cur.execute("""
+                INSERT INTO risk.evaluations (
+                    portfolio_id, source_type, source_id, cancel_target_order_id,
+                    as_of_at, fill_cutoff_at, risk_environment,
+                    verdict_raw, verdict_effective,
+                    circuit_breaker_result_reason,
+                    idempotency_key, created_by
+                ) VALUES (
+                    %s, 'cancel', 'src_neg', NULL,
+                    NOW(), NOW(), 'LIVE',
+                    'blocked', 'blocked',
+                    'cb_block_new_risk:applied',
+                    'neg_idemp', 'wasseem'
+                )
+            """, (ctx['portfolio_id'],))
+
+
+def test_circuit_breaker_initial_state_armed(fresh_db):
+    """Round 2a R5 invariant: upsert_circuit_breaker auto-creates 'armed' state."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'test_cb', 'warn_only',
+                               ['CRISIS','RECOVERY','NORMAL','GREED'])
+        cur.execute("""
+            SELECT state FROM risk.circuit_breaker_states
+            WHERE circuit_breaker_id = %s
+            ORDER BY state_transitioned_at DESC, id DESC LIMIT 1
+        """, (cb_id,))
+        assert cur.fetchone()[0] == 'armed'
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §2  INSERT-GATE ENFORCEMENT
+# ════════════════════════════════════════════════════════════════════════
+
+def test_evaluations_direct_insert_rejected(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        with pytest.raises(psycopg.errors.RaiseException) as excinfo:
+            cur.execute("""
+                INSERT INTO risk.evaluations
+                    (portfolio_id, source_type, source_id, as_of_at, fill_cutoff_at,
+                     risk_environment, verdict_raw, verdict_effective,
+                     idempotency_key, created_by)
+                VALUES (%s, 'intent', 's', NOW(), NOW(), 'LIVE',
+                        'allowed', 'allowed', 'k', 'w')
+            """, (ctx['portfolio_id'],))
+        assert 'evaluate_action' in str(excinfo.value)
+
+
+def test_evaluation_inputs_direct_insert_rejected(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        _setup_basic_0009(cur)
+        with pytest.raises(psycopg.errors.RaiseException):
+            cur.execute("""
+                INSERT INTO risk.evaluation_inputs
+                    (evaluation_id, input_kind, position_snapshot_id)
+                VALUES (1, 'position_snapshot', 1)
+            """)
+
+
+def test_evaluation_limit_results_direct_insert_rejected(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        _setup_basic_0009(cur)
+        with pytest.raises(psycopg.errors.RaiseException):
+            cur.execute("""
+                INSERT INTO risk.evaluation_limit_results
+                    (evaluation_id, limit_version_id,
+                     result_reason, severity_bucket, blocking)
+                VALUES (1, 1, 'evaluated:within_limits', 'within_limits', false)
+            """)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §3  CANCEL OUTCOME MATRIX — LIVE row coverage (8 fixtures)
+# Source: design v1.15 lines 261-282 final outcome matrix.
+# ════════════════════════════════════════════════════════════════════════
+
+def test_cancel_bucket_a_within_limits_live(fresh_db):
+    """Row 5: working order, position within limit → allowed/within_limits."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        # Sell 2 working — canceling it leaves position at 5.0 (within 10).
+        _, target = _r3d_create_order(cur, ctx, side='sell', quantity=2.0,
+                                  state='working', execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, ct = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed' and v_eff == 'allowed'
+    assert ct is not None
+    assert any(r[1] == 'evaluated:within_limits' and not r[3] for r in rows)
+
+
+def test_cancel_bucket_a_target_reducing_breaching_blocks_live(fresh_db):
+    """Row 1: working order whose cancel would leave position breaching → blocked."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, "max_position_quantity", "instrument", 10.0)
+        # Position 15 (already over limit), pending sell 5. Canceling
+        # = future position 15 stays vs 10 if filled. Cancel ADDS risk.
+        _set_position(cur, ctx, signed_qty=15.0)
+        _, target = _r3d_create_order(cur, ctx, side="sell", quantity=5.0,
+                                  state="working", execution_environment="CANARY")
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == "blocked" and v_eff == "blocked"
+    assert any(r[1] == "evaluated:limit_breached" and r[3] for r in rows)
+
+def test_cancel_bucket_a_target_adding_breaching_exit_reducing(fresh_db):
+    """Row 2: working buy order on already-breached position → cancel is risk-reducing."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=15.0)  # already breached
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=5.0,
+                                  state='working', execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, pred, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed' and v_eff == 'allowed'
+    assert pred is True
+    assert any(r[1] == 'evaluated:exit:reducing' and not r[3] for r in rows)
+
+
+def test_cancel_bucket_b_terminal_no_effect_live(fresh_db):
+    """Row 6: target order in 'filled' state → cancel_no_effect, allowed."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=3.0,
+                                  state='filled', filled_quantity=3.0,
+                                  execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed' and v_eff == 'allowed'
+    assert any(r[1] == 'evaluated:cancel_no_effect' for r in rows)
+
+
+def test_cancel_bucket_b_canceled_state_no_effect(fresh_db):
+    """Row 6 variant: target already 'canceled' → cancel_no_effect."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=3.0,
+                                  state='canceled', execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[1] == 'evaluated:cancel_no_effect' for r in rows)
+
+
+def test_cancel_bucket_d_stale_needs_reconciliation_live(fresh_db):
+    """Row 8 (D): stale_needs_reconciliation → degraded → blocked in LIVE."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=3.0,
+                                  state='stale_needs_reconciliation',
+                                  execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'degraded' and v_eff == 'blocked'
+    assert any(r[1] == 'insufficient_inputs:target_state_indeterminate' for r in rows)
+
+
+def test_cancel_bucket_d_unknown_state_p23_d1(fresh_db):
+    """P23 D1 routing — Bucket D states map to insufficient_inputs:target_state_indeterminate.
+
+    3c note: the original spec calls for testing state='unknown'. The
+    0007 FSM does not whitelist working → unknown directly, so the
+    helper now redirects to 'stale_needs_reconciliation', which is
+    Bucket D's other member and routes through the IDENTICAL P14 D1
+    handling — same result_reason, same severity, same blocking
+    semantics. The assertion below is unchanged and still proves the
+    Bucket D contract. When 0007 grows a legitimate operator-driven
+    path into 'unknown' (e.g. an admin override function), this test
+    can be split.
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=3.0,
+                                  state='stale_needs_reconciliation',
+                                  execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[1] == 'insufficient_inputs:target_state_indeterminate' for r in rows)
+
+
+def test_cancel_bucket_d_non_live_allowed(fresh_db):
+    """Row 8 non-LIVE: degraded → allowed in SHADOW."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='SHADOW')
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=3.0,
+                                  state='stale_needs_reconciliation',
+                                  execution_environment='SHADOW')
+        eval_id = _evaluate_cancel(cur, ctx, target,
+                                   risk_environment='SHADOW')
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, _ = _verdict(cur, eval_id)
+    assert v_raw == 'degraded' and v_eff == 'allowed'
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §4  PER-DIMENSION FIXTURES (12 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_max_position_quantity_within(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=3.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_within', 5.0)
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[1] == 'evaluated:within_limits' for r in rows)
+
+
+def test_max_position_quantity_breach_blocking(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      blocking=True)
+        _set_position(cur, ctx, signed_qty=5.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_breach', 15.0)  # 15 > 10
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert any(r[1] == 'evaluated:limit_breached' and r[3] for r in rows)
+
+
+def test_max_position_quantity_exit_reducing(fresh_db):
+    """Position breaching, action reduces it (still over limit) → exit:reducing, allowed."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=20.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_exit_red', 15.0)  # 15 still > 10 but reducing
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, pred, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed' and pred is True
+    assert any(r[1] == 'evaluated:exit:reducing' and not r[3] for r in rows)
+
+
+def test_max_position_quantity_exit_complete(fresh_db):
+    """Position breaching, action goes to 0 → exit:complete, allowed."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=20.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_exit_comp', 0.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed'
+    assert any(r[1] == 'evaluated:exit:complete' and not r[3] for r in rows)
+
+
+def test_max_position_quantity_exit_flip(fresh_db):
+    """Long 20, proposed -15 (sign flip into breach on opposite side) → blocked."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=20.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_flip', -15.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert any(r[1] == 'evaluated:exit:flip' and r[3] for r in rows)
+
+
+def test_max_notional_usd_within(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_notional_usd', 'instrument', 1_000_000.0)
+        _set_position(cur, ctx, signed_qty=2.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_not_within', 5.0)  # 5 × 50000 = 250k < 1M
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[0] == 'max_notional_usd' and r[1] == 'evaluated:within_limits' for r in rows)
+
+
+def test_max_notional_usd_breach(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_notional_usd', 'instrument', 100_000.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_not_breach', 5.0)  # 250k > 100k
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[0] == 'max_notional_usd' and r[1] == 'evaluated:limit_breached' and r[3] for r in rows)
+
+
+def test_max_drawdown_usd_within(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_drawdown_usd', 'portfolio', 50_000.0)
+        # Default NAV = 100000 in setup; build an anchor at NAV = 110000 so
+        # current drawdown = 10000 (within 50000 limit).
+        cur.execute("""
+            INSERT INTO accounting.valuation_runs
+                (portfolio_id, run_type, valuation_date, mark_price_set_id,
+                 journal_cutoff_at, engine_version, calculation_hash, created_by)
+            VALUES (%s, 'eod_close', %s - INTERVAL '7 days', %s, NOW(), 'test', 'h', 'wasseem')
+            RETURNING id
+        """, (ctx['portfolio_id'], ctx['today_utc'], ctx['mark_price_set_id']))
+        anchor_run = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO accounting.nav_snapshots
+                (valuation_run_id, portfolio_id, strategy_id, snapshot_date,
+                 nav_total, nav_realized, nav_unrealized,
+                 nav_breakdown, computation_metadata,
+                 nav_environment, nav_settlement_type)
+            VALUES (%s, %s, %s, %s - INTERVAL '7 days', 110000, 0, 0,
+                    '{}'::jsonb, '{}'::jsonb, 'LIVE', 'MIXED')
+        """, (anchor_run, ctx['portfolio_id'], ctx['strategy_id'], ctx['today_utc']))
+        ctx_for_eval = dict(ctx, valuation_run_id=anchor_run)
+        eval_id = _evaluate_intent(cur, ctx_for_eval, 'src_dd_within', 1.0,
+                                    drawdown_inputs=True)
+    with _connect() as conn, conn.cursor() as cur:
+        rows = _limit_results(cur, eval_id)
+    assert any(r[0] == 'max_drawdown_usd' and r[1] == 'evaluated:within_limits' for r in rows)
+
+
+def test_max_drawdown_usd_breach_blocking(fresh_db):
+    """B2 fix verification: drawdown breach with non-reducing action → limit_breached, blocking."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_drawdown_usd', 'portfolio', 5_000.0)
+        # Anchor NAV = 200000, current = 100000 → drawdown = 100000 > 5000.
+        cur.execute("""
+            INSERT INTO accounting.valuation_runs
+                (portfolio_id, run_type, valuation_date, mark_price_set_id,
+                 journal_cutoff_at, engine_version, calculation_hash, created_by)
+            VALUES (%s, 'eod_close', %s - INTERVAL '7 days', %s, NOW(), 'test', 'h', 'wasseem')
+            RETURNING id
+        """, (ctx['portfolio_id'], ctx['today_utc'], ctx['mark_price_set_id']))
+        anchor_run = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO accounting.nav_snapshots
+                (valuation_run_id, portfolio_id, strategy_id, snapshot_date,
+                 nav_total, nav_realized, nav_unrealized,
+                 nav_breakdown, computation_metadata,
+                 nav_environment, nav_settlement_type)
+            VALUES (%s, %s, %s, %s - INTERVAL '7 days', 200000, 0, 0,
+                    '{}'::jsonb, '{}'::jsonb, 'LIVE', 'MIXED')
+        """, (anchor_run, ctx['portfolio_id'], ctx['strategy_id'], ctx['today_utc']))
+        ctx_for_eval = dict(ctx, valuation_run_id=anchor_run)
+        # Non-reducing action: position 5 → 10 (adding)
+        _set_position(cur, ctx, signed_qty=5.0)
+        eval_id = _evaluate_intent(cur, ctx_for_eval, 'src_dd_breach', 10.0,
+                                    drawdown_inputs=True)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert any(r[0] == 'max_drawdown_usd' and r[1] == 'evaluated:limit_breached' and r[3] for r in rows)
+
+
+def test_max_drawdown_usd_exit_reducing_b2_fix(fresh_db):
+    """B2 fix critical: drawdown breach + risk-reducing action → exit:reducing, NOT blocking."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_drawdown_usd', 'portfolio', 5_000.0)
+        cur.execute("""
+            INSERT INTO accounting.valuation_runs
+                (portfolio_id, run_type, valuation_date, mark_price_set_id,
+                 journal_cutoff_at, engine_version, calculation_hash, created_by)
+            VALUES (%s, 'eod_close', %s - INTERVAL '7 days', %s, NOW(), 'test', 'h', 'wasseem')
+            RETURNING id
+        """, (ctx['portfolio_id'], ctx['today_utc'], ctx['mark_price_set_id']))
+        anchor_run = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO accounting.nav_snapshots
+                (valuation_run_id, portfolio_id, strategy_id, snapshot_date,
+                 nav_total, nav_realized, nav_unrealized,
+                 nav_breakdown, computation_metadata,
+                 nav_environment, nav_settlement_type)
+            VALUES (%s, %s, %s, %s - INTERVAL '7 days', 200000, 0, 0,
+                    '{}'::jsonb, '{}'::jsonb, 'LIVE', 'MIXED')
+        """, (anchor_run, ctx['portfolio_id'], ctx['strategy_id'], ctx['today_utc']))
+        ctx_for_eval = dict(ctx, valuation_run_id=anchor_run)
+        # Reducing action: position 10 → 3
+        _set_position(cur, ctx, signed_qty=10.0)
+        eval_id = _evaluate_intent(cur, ctx_for_eval, 'src_dd_redu', 3.0,
+                                    drawdown_inputs=True)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, pred, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'allowed' and v_eff == 'allowed' and pred is True
+    assert any(r[0] == 'max_drawdown_usd' and r[1] == 'evaluated:exit:reducing'
+               and not r[3] for r in rows)
+
+
+def test_max_drawdown_stale_nav_live_blocked(fresh_db):
+    """v3 staleness: NAV older than bound in LIVE → insufficient_inputs:stale, degraded → blocked."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        # Limit configured with default 36h staleness bound (P20 default).
+        _create_limit(cur, ctx, 'max_drawdown_usd', 'portfolio', 5_000.0)
+        # Anchor 7d ago, latest NAV 5 days old (older than 36h).
+        old_date = ctx['today_utc'] - timedelta(days=5)
+        cur.execute("""
+            INSERT INTO accounting.valuation_runs
+                (portfolio_id, run_type, valuation_date, mark_price_set_id,
+                 journal_cutoff_at, engine_version, calculation_hash, created_by)
+            VALUES (%s, 'eod_close', %s, %s, NOW(), 'test', 'h', 'wasseem')
+            RETURNING id
+        """, (ctx['portfolio_id'], old_date, ctx['mark_price_set_id']))
+        old_run = cur.fetchone()[0]
+        cur.execute("""
+            INSERT INTO accounting.nav_snapshots
+                (valuation_run_id, portfolio_id, strategy_id, snapshot_date,
+                 nav_total, nav_realized, nav_unrealized,
+                 nav_breakdown, computation_metadata,
+                 nav_environment, nav_settlement_type)
+            VALUES (%s, %s, %s, %s, 95000, 0, 0,
+                    '{}'::jsonb, '{}'::jsonb, 'LIVE', 'MIXED') RETURNING id
+        """, (old_run, ctx['portfolio_id'], ctx['strategy_id'], old_date))
+        old_nav_id = cur.fetchone()[0]
+        ctx_for_eval = dict(ctx, valuation_run_id=old_run, nav_snapshot_id=old_nav_id)
+        eval_id = _evaluate_intent(cur, ctx_for_eval, 'src_stale', 1.0,
+                                    drawdown_inputs=True)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, _, _ = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'degraded' and v_eff == 'blocked'
+    assert any(r[1] == 'insufficient_inputs:stale' for r in rows)
+
+
+def test_max_notional_missing_mark_insufficient(fresh_db):
+    """v3-1 NO_DATA_FOUND graceful: notional with no matching mark → insufficient_inputs:missing."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_notional_usd', 'instrument', 100_000.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        # Pass mark_inputs but with a wrong source_timestamp → no rows.
+        wrong_ts = ctx['mark_source_ts'] - timedelta(hours=99)
+        cur.execute("""
+            SELECT risk.evaluate_action(
+                'intent', 'src_no_mark', 'idemp_no_mark', 'wasseem',
+                %s, %s, %s, %s,
+                NOW(), NOW() - INTERVAL '1 second', 'LIVE',
+                3.0, 150000.0,
+                NULL,
+                %s, %s, 'last',
+                NULL, NULL, NULL,
+                '{}'::jsonb
+            )
+        """, (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'],
+              ctx['mark_price_set_id'], wrong_ts))
+        eval_id = cur.fetchone()[0]
+        rows = _limit_results(cur, eval_id)
+    assert any(r[0] == 'max_notional_usd' and r[1] == 'insufficient_inputs:missing' for r in rows)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §5  CB ACTION × SOURCE_TYPE — focused (8 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_cb_warn_only_intent_allowed(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'warn_cb', 'warn_only',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_warn_intent', 2.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'allowed'
+    assert cb == 'cb_warn_only:applied'
+
+
+def test_cb_hard_stop_intent_blocked(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'hs_cb', 'hard_stop',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_hs_intent', 2.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert cb == 'cb_hard_stop:applied'
+
+
+def test_cb_block_new_risk_non_reducing_intent_blocked(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'bnr_cb', 'block_new_risk',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_bnr_add', 5.0)  # adding
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert cb == 'cb_block_new_risk:applied'
+
+
+def test_cb_block_new_risk_reducer_exempted(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'bnr_cb', 'block_new_risk',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=10.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_bnr_red', 3.0)  # reducing
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'allowed'
+    assert cb == 'cb_block_new_risk:risk_reducer_exempted'
+
+
+def test_cb_throttle_cancel_exempted_broader(fresh_db):
+    """P5 broader-exempt: cancel paths bypass throttle regardless of predicate."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'thr_cb', 'throttle',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              throttle_params={'max_per_minute': 5})
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=2.0,
+                                  state='working', execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        _, _, _, cb, _ = _verdict(cur, eval_id)
+    assert cb == 'cb_throttle:cancel_exempted'
+
+
+def test_cb_throttle_intent_applied(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'thr_cb', 'throttle',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              throttle_params={'max_per_minute': 5})
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_thr_int', 5.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'allowed'
+    assert cb == 'cb_throttle:applied'
+
+
+def test_cb_throttle_risk_reducer_exempted_intent(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'thr_cb', 'throttle',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              throttle_params={'max_per_minute': 5})
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=10.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_thr_red', 3.0)
+    with _connect() as conn, conn.cursor() as cur:
+        _, _, _, cb, _ = _verdict(cur, eval_id)
+    assert cb == 'cb_throttle:risk_reducer_exempted'
+
+
+def test_cb_armed_not_tripped_no_application(fresh_db):
+    """CB in 'armed' state (not tripped) should NOT contribute to verdict."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'armed_cb', 'hard_stop',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        # NOT tripping it.
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_armed', 2.0)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'allowed'
+    assert cb is None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §6  cancel_target_unresolvable × CB ACTION (4 tests) — v3-2 + v4-1 + v5
+# ════════════════════════════════════════════════════════════════════════
+
+def test_unresolvable_cancel_no_cb_degrades_live(fresh_db):
+    """v3-2 baseline: missing target, no CB → degraded → blocked in LIVE."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_cancel(cur, ctx, target_order_id=999_999_999)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, cb, ct = _verdict(cur, eval_id)
+        rows = _limit_results(cur, eval_id)
+    assert v_raw == 'degraded' and v_eff == 'blocked'
+    assert ct is None  # cancel_target_order_id forced NULL per v3-2
+    assert any(r[1] == 'insufficient_inputs:cancel_target_unresolvable' for r in rows)
+
+
+def test_unresolvable_cancel_hard_stop_blocks_via_s2_v5(fresh_db):
+    """v5 critical: hard_stop blocks on unresolvable; S2 admits via cb_hard_stop:applied clause."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'hs_unr', 'hard_stop',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        eval_id = _evaluate_cancel(cur, ctx, target_order_id=999_999_999)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, cb, ct = _verdict(cur, eval_id)
+    assert v_raw == 'blocked' and v_eff == 'blocked'
+    assert cb == 'cb_hard_stop:applied'
+    assert ct is None  # S2 OR-branch via cb_hard_stop:applied keeps row valid
+
+
+def test_unresolvable_cancel_block_new_risk_degrades_v4(fresh_db):
+    """v4-1(a) critical: block_new_risk on indeterminate predicate → degraded, not blocked."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'bnr_unr', 'block_new_risk',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        eval_id = _evaluate_cancel(cur, ctx, target_order_id=999_999_999)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, cb, ct = _verdict(cur, eval_id)
+    # LIVE: degraded → blocked. cb_reason should be cb_missing (not cb_block_new_risk:applied).
+    assert v_raw == 'degraded' and v_eff == 'blocked'
+    assert cb == 'insufficient_inputs:cb_missing'
+    assert ct is None  # S2 OR-branch via verdict_raw='degraded'
+
+
+def test_unresolvable_cancel_throttle_cancel_exempted(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'thr_unr', 'throttle',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              throttle_params={'max_per_minute': 1})
+        _trip_cb(cur, cb_id)
+        eval_id = _evaluate_cancel(cur, ctx, target_order_id=999_999_999)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    # Throttle cancel-exempts; per-limit rows still emit cancel_target_unresolvable
+    # → any_degraded=true → degraded path.
+    assert v_raw == 'degraded'
+    assert cb == 'cb_throttle:cancel_exempted'
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §7  block_new_risk × indeterminate predicate (non-unresolvable cases) — v4-1(a)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_block_new_risk_bucket_d_indeterminate_live_degrades(fresh_db):
+    """v4-1(a) broader scope: Bucket D + block_new_risk → degraded (not applied)."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'bnr_d', 'block_new_risk',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'])
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='stale_needs_reconciliation',
+                                  execution_environment='CANARY')
+        eval_id = _evaluate_cancel(cur, ctx, target)
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'degraded'
+    assert cb == 'insufficient_inputs:cb_missing'
+
+
+def test_block_new_risk_bucket_d_indeterminate_shadow_allows(fresh_db):
+    """v4-1(a) non-LIVE: same scenario in SHADOW → degraded → allowed."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cb_id, _ = _create_cb(cur, ctx, 'bnr_d_sh', 'block_new_risk',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              risk_environment='SHADOW')
+        _trip_cb(cur, cb_id)
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='stale_needs_reconciliation',
+                                  execution_environment='SHADOW')
+        eval_id = _evaluate_cancel(cur, ctx, target, risk_environment='SHADOW')
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, v_eff, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'degraded' and v_eff == 'allowed'
+    assert cb == 'insufficient_inputs:cb_missing'
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §8  ENVIRONMENT MAPPING — v3-3 (6 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_env_mapping_shadow_to_shadow_passes(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='SHADOW')
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='SHADOW')
+        eval_id = _evaluate_cancel(cur, ctx, target, risk_environment='SHADOW')
+        # No exception → pass
+
+
+def test_env_mapping_live_to_canary_passes(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='CANARY')
+        _evaluate_cancel(cur, ctx, target, risk_environment='LIVE')
+
+
+def test_env_mapping_live_to_scale_passes(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='SCALE')
+        _evaluate_cancel(cur, ctx, target, risk_environment='LIVE')
+
+
+def test_env_mapping_live_to_shadow_raises(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='SHADOW')
+        with pytest.raises(psycopg.errors.RaiseException) as ei:
+            _evaluate_cancel(cur, ctx, target, risk_environment='LIVE')
+        assert 'execution_environment' in str(ei.value)
+
+
+def test_env_mapping_shadow_to_canary_raises(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='SHADOW')
+        _set_position(cur, ctx, signed_qty=1.0)
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='CANARY')
+        with pytest.raises(psycopg.errors.RaiseException):
+            _evaluate_cancel(cur, ctx, target, risk_environment='SHADOW')
+
+
+def test_env_mapping_replay_permissive(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='REPLAY')
+        _set_position(cur, ctx, signed_qty=1.0)
+        # REPLAY accepts any execution_environment; pick CANARY arbitrarily.
+        _, target = _r3d_create_order(cur, ctx, side='buy', quantity=1.0,
+                                  state='working', execution_environment='CANARY')
+        _evaluate_cancel(cur, ctx, target, risk_environment='REPLAY')
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §9  UNIVERSAL-EQUIVALENT CB ON MISSING REGIME — v3-4 (2 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_universal_cb_fires_with_missing_regime(fresh_db):
+    """v3-4: CB whose applies_in_regimes contains all 4 regimes fires when v_regime IS NULL.
+    Use SHADOW environment so missing-regime ≠ LIVE-degraded path; we want
+    the verdict to be CB-blocked, not regime-missing-degraded.
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur, with_regime=False)
+        cb_id, _ = _create_cb(cur, ctx, 'univ_cb', 'hard_stop',
+                              ['CRISIS','RECOVERY','NORMAL','GREED'],
+                              risk_environment='SHADOW')
+        _trip_cb(cur, cb_id)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='SHADOW')
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_univ', 2.0,
+                                    risk_environment='SHADOW')
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    assert v_raw == 'blocked'
+    assert cb == 'cb_hard_stop:applied'
+
+
+def test_scoped_cb_skips_with_missing_regime(fresh_db):
+    """v3-4: CB with subset (3-of-4 regimes) skips when v_regime IS NULL."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur, with_regime=False)
+        cb_id, _ = _create_cb(cur, ctx, 'scoped_cb', 'hard_stop',
+                              ['CRISIS','RECOVERY','NORMAL'],  # missing GREED
+                              risk_environment='SHADOW')
+        _trip_cb(cur, cb_id)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0,
+                      risk_environment='SHADOW')
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_scoped', 2.0,
+                                    risk_environment='SHADOW')
+    with _connect() as conn, conn.cursor() as cur:
+        v_raw, _, _, cb, _ = _verdict(cur, eval_id)
+    # Without regime, scoped CB skips → no CB application → allowed.
+    assert v_raw == 'allowed'
+    assert cb is None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §10 MARK INTO STRICT — v3-1 (2 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_mark_too_many_rows_raises(fresh_db):
+    """v3-1: duplicate marks for same (set, instrument, type, ts) → TOO_MANY_ROWS RAISE."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        # Helper's mark_price_set is sealed by accounting.valuation_runs FK
+        # via enforce_mark_price_set_not_used. Create a fresh unsealed set
+        # and link two marks to it (varying `source` to bypass the
+        # uniq_mark_prices_full unique constraint, which keys on
+        # (instrument_id, mark_type, source_namespace, source, source_timestamp)).
+        # The evaluator's STRICT lookup is on (set_id, instrument_id, mark_type,
+        # source_timestamp) — both marks match and trip TOO_MANY_ROWS.
+        cur.execute("""
+            INSERT INTO accounting.mark_price_sets
+                (set_hash, purpose, created_by)
+            VALUES (%s, 'risk_monitoring', 'wasseem')
+            RETURNING id
+        """, (f'mph_dup_{_uuid.uuid4().hex[:8]}',))
+        new_set_id = cur.fetchone()[0]
+
+        for source_val, hash_val in (('venue_a', 'h1_dup'), ('venue_b', 'h2_dup')):
+            cur.execute("""
+                INSERT INTO accounting.mark_prices
+                    (instrument_id, mark_type, price, source_timestamp,
+                     source, source_namespace, source_id, confidence, raw_record_hash)
+                VALUES (%s, 'last', 50000.0, %s,
+                        %s, 'binance_futures', %s, 1.0, %s)
+                RETURNING id
+            """, (ctx['instrument_id'], ctx['mark_source_ts'],
+                  source_val, f'tick_{source_val}', hash_val))
+            mark_id = cur.fetchone()[0]
+            cur.execute("""
+                INSERT INTO accounting.mark_price_set_items
+                    (mark_price_set_id, mark_price_id)
+                VALUES (%s, %s)
+            """, (new_set_id, mark_id))
+
+        # Override the set used by the evaluator
+        ctx = dict(ctx, mark_price_set_id=new_set_id)
+
+        _create_limit(cur, ctx, 'max_notional_usd', 'instrument', 1_000_000.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        with pytest.raises(psycopg.errors.RaiseException) as ei:
+            _evaluate_intent(cur, ctx, 'src_dup_mark', 2.0)
+        assert 'mark resolution ambiguous' in str(ei.value)
+
+
+
+def test_mark_no_data_found_graceful(fresh_db):
+    """v3-1: mark not present for the (set, instrument, type, ts) tuple → notional tagged missing."""
+    # Already covered by test_max_notional_missing_mark_insufficient.
+    # This test variant uses an unknown mark_type.
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_notional_usd', 'instrument', 100_000.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        cur.execute("""
+            SELECT risk.evaluate_action(
+                'intent', 'src_unk_type', 'idemp_unk', 'wasseem',
+                %s, %s, %s, %s,
+                NOW(), NOW() - INTERVAL '1 second', 'LIVE',
+                3.0, 150000.0,
+                NULL,
+                %s, %s, 'unknown_mark_type',
+                NULL, NULL, NULL,
+                '{}'::jsonb
+            )
+        """, (ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'], ctx['instrument_id'],
+              ctx['mark_price_set_id'], ctx['mark_source_ts']))
+        eval_id = cur.fetchone()[0]
+        rows = _limit_results(cur, eval_id)
+    assert any(r[0] == 'max_notional_usd' and r[1] == 'insufficient_inputs:missing' for r in rows)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §11 REPLAY DETERMINISM + NON-CANCEL GUARD (2 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_replay_cancel_matches_persisted(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=5.0)
+        _, target = _r3d_create_order(cur, ctx, side='sell', quantity=2.0,
+                                  state='working', execution_environment='CANARY')
+        original = _evaluate_cancel(cur, ctx, target)
+
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM risk.replay_evaluation(%s)", (original,))
+        row = cur.fetchone()
+    # Columns: evaluation_id, persisted_v_raw, persisted_v_eff, replayed_v_raw,
+    # replayed_v_eff, persisted_pred, replayed_pred, persisted_cb, replayed_cb,
+    # match, metadata
+    assert row[1] == row[3] and row[2] == row[4], "verdict mismatch on replay"
+    assert row[9] is True, "verdict_match flag"
+
+
+def test_replay_non_cancel_raises_explicit(fresh_db):
+    """R1 guard: non-cancel replay raises with clear message."""
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        eval_id = _evaluate_intent(cur, ctx, 'src_intent_replay', 2.0)
+        with pytest.raises(psycopg.errors.RaiseException) as ei:
+            cur.execute("SELECT * FROM risk.replay_evaluation(%s)", (eval_id,))
+        assert 'non-cancel replay not supported' in str(ei.value)
+
+
+# ════════════════════════════════════════════════════════════════════════
+# §12 IDEMPOTENCY (2 tests)
+# ════════════════════════════════════════════════════════════════════════
+
+def test_idempotent_same_key_returns_same_id(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        first  = _evaluate_intent(cur, ctx, 'src_idemp', 2.0,
+                                  idempotency_key='IDEMP_KEY_A')
+        second = _evaluate_intent(cur, ctx, 'src_idemp', 2.0,
+                                  idempotency_key='IDEMP_KEY_A')
+    assert first == second
+
+
+def test_different_idempotency_key_creates_new(fresh_db):
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        _create_limit(cur, ctx, 'max_position_quantity', 'instrument', 10.0)
+        _set_position(cur, ctx, signed_qty=1.0)
+        first  = _evaluate_intent(cur, ctx, 'src_idemp_2', 2.0,
+                                  idempotency_key='IDEMP_KEY_B1')
+        second = _evaluate_intent(cur, ctx, 'src_idemp_2', 2.0,
+                                  idempotency_key='IDEMP_KEY_B2')
+    assert first != second
