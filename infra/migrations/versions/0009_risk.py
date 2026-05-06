@@ -1671,7 +1671,15 @@ def upgrade() -> None:
             p_latest_nav_snapshot_id  BIGINT,
             p_nav_settlement_type     TEXT,
             -- Audit
-            p_eval_metadata           JSONB
+            p_eval_metadata           JSONB,
+            -- Replay-only (round 4): when non-NULL, evaluate_action skips
+            -- compute_position_snapshot and reuses the supplied snapshot
+            -- row directly. The supplied snapshot's identity tuple
+            -- (portfolio, strategy, account, instrument, environment) must
+            -- match the call's parameters; mismatch raises. This preserves
+            -- exact-input replay (no time mutation, no recomputation drift)
+            -- while remaining additive for non-replay callers.
+            p_existing_position_snapshot_id BIGINT DEFAULT NULL
         ) RETURNS BIGINT
         LANGUAGE plpgsql AS $$
         DECLARE
@@ -1967,27 +1975,62 @@ def upgrade() -> None:
                                     AND p_account_id IS NOT NULL);
 
             IF v_position_required THEN
-                v_position_snapshot_id := positions.compute_position_snapshot(
-                    p_portfolio_id      := p_portfolio_id,
-                    p_strategy_id       := p_strategy_id,
-                    p_account_id        := p_account_id,
-                    p_instrument_id     := p_instrument_id,
-                    p_position_environment := p_risk_environment,
-                    p_snapshot_at       := p_as_of_at,
-                    p_fill_cutoff_at    := p_fill_cutoff_at,
-                    p_computation_version := 'risk_eval_v1',
-                    p_created_by        := p_created_by,
-                    p_metadata          := jsonb_build_object(
-                                              'caller', 'risk.evaluate_action',
-                                              'source_type', p_source_type,
-                                              'source_id', p_source_id
-                                          )
-                );
+                IF p_existing_position_snapshot_id IS NOT NULL THEN
+                    -- Replay path (round 4): reuse the lineage-recorded
+                    -- snapshot without recomputation. Identity check below
+                    -- ensures the supplied snapshot belongs to this call's
+                    -- scope — replay must not silently rebind to a foreign
+                    -- snapshot. The fill_cutoff_at and snapshot_at fields
+                    -- are not re-validated here because the snapshot was
+                    -- already validated when originally computed; what
+                    -- matters for replay is that we use the exact same
+                    -- snapshot bytes the original evaluation used.
+                    SELECT ps.quantity, ps.avg_cost_basis
+                      INTO v_current_position_qty, v_current_avg_cost_basis
+                    FROM positions.position_snapshots ps
+                    WHERE ps.id                   = p_existing_position_snapshot_id
+                      AND ps.portfolio_id         = p_portfolio_id
+                      AND ps.strategy_id          = p_strategy_id
+                      AND ps.account_id           = p_account_id
+                      AND ps.instrument_id        = p_instrument_id
+                      AND ps.position_environment = p_risk_environment;
+                    IF NOT FOUND THEN
+                        RAISE EXCEPTION
+                          'risk.evaluate_action: p_existing_position_snapshot_id=% '
+                          'either does not exist or does not match the call''s scope '
+                          '(portfolio=%, strategy=%, account=%, instrument=%, env=%)',
+                          p_existing_position_snapshot_id,
+                          p_portfolio_id, p_strategy_id, p_account_id,
+                          p_instrument_id, p_risk_environment;
+                    END IF;
+                    v_position_snapshot_id := p_existing_position_snapshot_id;
+                ELSE
+                    -- Normal path: compute a fresh snapshot. The 0008
+                    -- contract throws on duplicate identity-key inserts;
+                    -- callers that intend idempotency must pass through
+                    -- the replay path above.
+                    v_position_snapshot_id := positions.compute_position_snapshot(
+                        p_portfolio_id      := p_portfolio_id,
+                        p_strategy_id       := p_strategy_id,
+                        p_account_id        := p_account_id,
+                        p_instrument_id     := p_instrument_id,
+                        p_position_environment := p_risk_environment,
+                        p_snapshot_at       := p_as_of_at,
+                        p_fill_cutoff_at    := p_fill_cutoff_at,
+                        p_computation_version := 'risk_eval_v1',
+                        p_created_by        := p_created_by,
+                        p_metadata          := jsonb_build_object(
+                                                  'caller', 'risk.evaluate_action',
+                                                  'source_type', p_source_type,
+                                                  'source_id', p_source_id
+                                              )
+                    );
 
-                SELECT ps.quantity, ps.avg_cost_basis
-                  INTO v_current_position_qty, v_current_avg_cost_basis
-                FROM positions.position_snapshots ps
-                WHERE ps.id = v_position_snapshot_id;
+                    SELECT ps.quantity, ps.avg_cost_basis
+                      INTO v_current_position_qty, v_current_avg_cost_basis
+                    FROM positions.position_snapshots ps
+                    WHERE ps.id = v_position_snapshot_id;
+                END IF;
 
                 IF p_source_type = 'cancel' THEN
                     -- Cancel removes the order's expected fill contribution.
@@ -2800,7 +2843,7 @@ def upgrade() -> None:
                     p_strategy_id             := v_eval.strategy_id,
                     p_account_id              := v_account_id,
                     p_instrument_id           := v_instrument_id,
-                    p_as_of_at                := v_eval.as_of_at + INTERVAL '1 microsecond',
+                    p_as_of_at                := v_eval.as_of_at,
                     p_fill_cutoff_at          := v_eval.fill_cutoff_at,
                     p_risk_environment        := v_eval.risk_environment,
                     p_intended_position_after := NULL,
@@ -2814,7 +2857,8 @@ def upgrade() -> None:
                     p_nav_settlement_type     := v_replay_nav_settlement_type,
                     p_eval_metadata           := jsonb_build_object(
                                                     'replay_of_evaluation_id', p_evaluation_id
-                                                 )
+                                                 ),
+                    p_existing_position_snapshot_id := v_position_snapshot_id
                 );
 
                 SELECT
