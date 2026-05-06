@@ -13,10 +13,11 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 
 ### Sleeve A (build-to-trade)
 - **Engine A1 — Funding-rate capture:** Phase P0 (research & build).
-  - Day 1 scaffolding (`0e7b377`): package skeleton + canonical FundingRate dataclass + cost-model config schema + PaperAdapter contract. 63 unit tests.
-  - Day 2-3 (`8e60933`): Binance funding-rate fetcher with injectable HTTP transport, throttle, retry, fail-loud parsing. No new deps (stdlib urllib). 23 unit tests.
-  - Cumulative A1 unit tests: 86 passing.
-  - Day 4-5 next: signal generator (expected next-period funding) with reproducibility test + cost-model calibration framework.
+  - Day 1 (`0e7b377`): package skeleton + canonical FundingRate dataclass + cost-model config schema + PaperAdapter contract. 63 unit tests.
+  - Day 2-3 (`8e60933`): Binance funding-rate fetcher with injectable HTTP transport, throttle, retry, fail-loud parsing. No new deps. 23 unit tests.
+  - Day 4-5 (`fdb5450`): pure-function expected-next-period funding model (mean - discount_k * stdev, Decimal arithmetic, no look-ahead) and net-edge signal evaluator (LONG_PERP_SHORT_SPOT / SHORT_PERP_LONG_SPOT / FLAT). Reproducibility byte-equality test passes. 39 unit tests.
+  - Cumulative A1 unit tests: 125 passing.
+  - Day 6-7 next: sizer with fixed per-instrument caps emitting OrderIntent.
 - **Engine A2 — Basis:** Not started. Engages after A1 clears canary.
 - **Engine A3 — Cash-and-carry:** Deferred.
 
