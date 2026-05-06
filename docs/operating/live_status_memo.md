@@ -12,7 +12,7 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 - Reviewer signoff: round 4 structural contract closed; remaining items classified as round 4.5 coverage hardening, not blockers to merge unless reviewer requests them beforehand.
 
 ### Sleeve A (build-to-trade)
-- **Engine A1 — Funding-rate capture:** Phase P0 (research & build). Day 1 scaffolding scheduled.
+- **Engine A1 — Funding-rate capture:** Phase P0 (research & build). Day 1 scaffolding committed (`0e7b377`). Package skeleton + canonical FundingRate dataclass + cost-model config schema + PaperAdapter contract. 63 unit tests passing. Day 2-3 next: Binance funding-rate fetcher.
 - **Engine A2 — Basis:** Not started. Engages after A1 clears canary.
 - **Engine A3 — Cash-and-carry:** Deferred.
 
