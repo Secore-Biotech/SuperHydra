@@ -12,12 +12,14 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 - Reviewer signoff: round 4 structural contract closed; remaining items classified as round 4.5 coverage hardening, not blockers to merge unless reviewer requests them beforehand.
 
 ### Sleeve A (build-to-trade)
-- **Engine A1 — Funding-rate capture:** Phase P0 (research & build).
+- **Engine A1 — Funding-rate capture:** Phase P0 (research & build). End of week 1 milestone hit: signal+sizer pipeline unit-tested end-to-end.
   - Day 1 (`0e7b377`): package skeleton + canonical FundingRate dataclass + cost-model config schema + PaperAdapter contract. 63 unit tests.
   - Day 2-3 (`8e60933`): Binance funding-rate fetcher with injectable HTTP transport, throttle, retry, fail-loud parsing. No new deps. 23 unit tests.
   - Day 4-5 (`fdb5450`): pure-function expected-next-period funding model (mean - discount_k * stdev, Decimal arithmetic, no look-ahead) and net-edge signal evaluator (LONG_PERP_SHORT_SPOT / SHORT_PERP_LONG_SPOT / FLAT). Reproducibility byte-equality test passes. 39 unit tests.
-  - Cumulative A1 unit tests: 125 passing.
-  - Day 6-7 next: sizer with fixed per-instrument caps emitting OrderIntent.
+  - Day 6-7 (`6ea6fa5`): SizingConfig with content-hashed per-instrument caps, OrderIntent with enforced two-leg hedge invariants, position-aware sizer (open/flip/close/no-trade) with min-quantity suppression. Full lineage threading: cost_model_hash + sizing_config_hash on every intent. 65 unit tests.
+  - **Cumulative A1 unit tests: 190 passing.**
+  - Pure-function pipeline working end-to-end as a unit-tested chain: `list[FundingRate]` → `ExpectedFunding` → `SignalEvaluation` → `OrderIntent | None`. Same inputs → byte-equal outputs at every step.
+  - Day 8 next: vertical smoke test — wire one synthetic OrderIntent through 0007 OMS → 0009 risk → PaperAdapter → 0005 journal → 0008 position snapshot. Recon step first to read the existing OMS code-path shape.
 - **Engine A2 — Basis:** Not started. Engages after A1 clears canary.
 - **Engine A3 — Cash-and-carry:** Deferred.
 
