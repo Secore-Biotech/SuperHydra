@@ -724,3 +724,251 @@ class TestEndToEndPure:
         debits = sum(e.amount_usd for e in d.entries if e.debit_credit == "debit")
         credits = sum(e.amount_usd for e in d.entries if e.debit_credit == "credit")
         assert debits == credits == Decimal("1000.50")
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Day 14a: build_funding_journal unit tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+from execution.ledger.fill_journal_writer import (  # noqa: E402
+    FundingEventRecord,
+    build_funding_journal,
+    compute_funding_journal_source_hash,
+)
+
+
+def _funding_event(**overrides) -> FundingEventRecord:
+    base = dict(
+        venue_namespace="venue_test",
+        venue_funding_id="BTCUSDT-2026-01-08T08-00",
+        portfolio_id=1,
+        strategy_id=1,
+        account_id=1,
+        instrument_id=10,
+        instrument_code="BTCUSDT",
+        quote_asset_symbol="USDT",
+        funding_rate=Decimal("0.0001"),
+        position_size=Decimal("-0.01"),
+        amount_usd=Decimal("0.95"),
+        direction="received",
+        funded_at=datetime(2026, 1, 8, 8, 0, 0, tzinfo=UTC),
+        funding_environment="SHADOW",
+    )
+    base.update(overrides)
+    return FundingEventRecord(**base)
+
+
+class TestFundingEventRecordValidation:
+    def test_valid_constructs(self):
+        e = _funding_event()
+        assert e.amount_usd == Decimal("0.95")
+        assert e.direction == "received"
+
+    def test_empty_venue_namespace_rejected(self):
+        with pytest.raises(ValueError, match="venue_namespace must be non-empty"):
+            _funding_event(venue_namespace="")
+
+    def test_empty_venue_funding_id_rejected(self):
+        with pytest.raises(ValueError, match="venue_funding_id must be non-empty"):
+            _funding_event(venue_funding_id="   ")
+
+    def test_empty_instrument_code_rejected(self):
+        with pytest.raises(ValueError, match="instrument_code must be non-empty"):
+            _funding_event(instrument_code="")
+
+    def test_empty_quote_asset_rejected(self):
+        with pytest.raises(ValueError, match="quote_asset_symbol must be non-empty"):
+            _funding_event(quote_asset_symbol="")
+
+    def test_zero_amount_rejected(self):
+        with pytest.raises(ValueError, match="amount_usd must be > 0"):
+            _funding_event(amount_usd=Decimal("0"))
+
+    def test_negative_amount_rejected(self):
+        with pytest.raises(ValueError, match="amount_usd must be > 0"):
+            _funding_event(amount_usd=Decimal("-5"))
+
+    def test_invalid_direction_rejected(self):
+        with pytest.raises(ValueError, match="direction must be"):
+            _funding_event(direction="settled")
+
+    def test_invalid_environment_rejected(self):
+        with pytest.raises(ValueError, match="funding_environment must be"):
+            _funding_event(funding_environment="PRODUCTION")
+
+    def test_naive_datetime_rejected(self):
+        with pytest.raises(ValueError, match="must be tz-aware"):
+            _funding_event(funded_at=datetime(2026, 1, 8, 8, 0, 0))
+
+    def test_non_utc_tz_rejected(self):
+        from datetime import timezone
+        with pytest.raises(ValueError, match="must be UTC"):
+            _funding_event(funded_at=datetime(2026, 1, 8, 8, 0, 0,
+                                              tzinfo=timezone(timedelta(hours=2))))
+
+    def test_negative_position_size_allowed(self):
+        e = _funding_event(position_size=Decimal("-0.5"))
+        assert e.position_size == Decimal("-0.5")
+
+    def test_negative_funding_rate_allowed(self):
+        e = _funding_event(funding_rate=Decimal("-0.0002"))
+        assert e.funding_rate == Decimal("-0.0002")
+
+
+class TestFundingSourceHash:
+    def test_deterministic(self):
+        e = _funding_event()
+        assert (compute_funding_journal_source_hash(e)
+                == compute_funding_journal_source_hash(e))
+
+    def test_changes_with_amount(self):
+        e1 = _funding_event(amount_usd=Decimal("0.95"))
+        e2 = _funding_event(amount_usd=Decimal("0.96"))
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_direction(self):
+        e1 = _funding_event(direction="received")
+        e2 = _funding_event(direction="paid")
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_funding_rate(self):
+        e1 = _funding_event(funding_rate=Decimal("0.0001"))
+        e2 = _funding_event(funding_rate=Decimal("0.0002"))
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_position_size(self):
+        e1 = _funding_event(position_size=Decimal("-0.01"))
+        e2 = _funding_event(position_size=Decimal("-0.02"))
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_venue_funding_id(self):
+        e1 = _funding_event(venue_funding_id="BTCUSDT-2026-01-08T08-00")
+        e2 = _funding_event(venue_funding_id="BTCUSDT-2026-01-08T16-00")
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_venue_namespace(self):
+        e1 = _funding_event(venue_namespace="venue_a")
+        e2 = _funding_event(venue_namespace="venue_b")
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_instrument_id(self):
+        e1 = _funding_event(instrument_id=10)
+        e2 = _funding_event(instrument_id=11)
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+    def test_changes_with_environment(self):
+        e1 = _funding_event(funding_environment="SHADOW")
+        e2 = _funding_event(funding_environment="LIVE")
+        assert (compute_funding_journal_source_hash(e1)
+                != compute_funding_journal_source_hash(e2))
+
+
+class TestBuildFundingJournalReceived:
+    def test_creates_two_entries(self):
+        d = build_funding_journal(_funding_event(direction="received"),
+                                  created_by="t")
+        assert len(d.entries) == 2
+
+    def test_balanced(self):
+        d = build_funding_journal(_funding_event(direction="received",
+                                                 amount_usd=Decimal("1.23")),
+                                  created_by="t")
+        debits = sum(e.amount_usd for e in d.entries if e.debit_credit == "debit")
+        credits = sum(e.amount_usd for e in d.entries if e.debit_credit == "credit")
+        assert debits == credits == Decimal("1.23")
+
+    def test_dr_cash_cr_funding_income(self):
+        d = build_funding_journal(_funding_event(direction="received"),
+                                  created_by="t")
+        debit_codes = [e.ledger_account_code for e in d.entries if e.debit_credit == "debit"]
+        credit_codes = [e.ledger_account_code for e in d.entries if e.debit_credit == "credit"]
+        assert debit_codes == ["v1:cash:p1:s1:a1:USDT"]
+        assert credit_codes == ["v1:funding_income:p1:s1:BTCUSDT"]
+
+
+class TestBuildFundingJournalPaid:
+    def test_creates_two_entries(self):
+        d = build_funding_journal(_funding_event(direction="paid"),
+                                  created_by="t")
+        assert len(d.entries) == 2
+
+    def test_balanced(self):
+        d = build_funding_journal(_funding_event(direction="paid",
+                                                 amount_usd=Decimal("0.42")),
+                                  created_by="t")
+        debits = sum(e.amount_usd for e in d.entries if e.debit_credit == "debit")
+        credits = sum(e.amount_usd for e in d.entries if e.debit_credit == "credit")
+        assert debits == credits == Decimal("0.42")
+
+    def test_dr_funding_expense_cr_cash(self):
+        d = build_funding_journal(_funding_event(direction="paid"),
+                                  created_by="t")
+        debit_codes = [e.ledger_account_code for e in d.entries if e.debit_credit == "debit"]
+        credit_codes = [e.ledger_account_code for e in d.entries if e.debit_credit == "credit"]
+        assert debit_codes == ["v1:funding_expense:p1:s1:BTCUSDT"]
+        assert credit_codes == ["v1:cash:p1:s1:a1:USDT"]
+
+
+class TestBuildFundingJournalInvariants:
+    def test_journal_type_is_funding(self):
+        d = build_funding_journal(_funding_event(), created_by="t")
+        assert d.journal_type == "funding"
+
+    def test_source_type_is_funding_event(self):
+        d = build_funding_journal(_funding_event(), created_by="t")
+        assert d.source_type == "funding_event"
+
+    def test_source_namespace_is_venue_namespace(self):
+        d = build_funding_journal(_funding_event(venue_namespace="venue_xyz"),
+                                  created_by="t")
+        assert d.source_namespace == "venue_xyz"
+
+    def test_source_id_is_venue_funding_id(self):
+        d = build_funding_journal(_funding_event(venue_funding_id="event_42"),
+                                  created_by="t")
+        assert d.source_id == "event_42"
+
+    def test_journal_at_matches_funded_at(self):
+        ts = datetime(2026, 2, 14, 16, 0, 0, tzinfo=UTC)
+        d = build_funding_journal(_funding_event(funded_at=ts), created_by="t")
+        assert d.journal_at == ts
+
+    def test_portfolio_strategy_propagated(self):
+        d = build_funding_journal(_funding_event(portfolio_id=7, strategy_id=8),
+                                  created_by="t")
+        assert d.portfolio_id == 7
+        assert d.strategy_id == 8
+
+    def test_empty_created_by_rejected(self):
+        with pytest.raises(ValueError, match="created_by must be non-empty"):
+            build_funding_journal(_funding_event(), created_by="")
+
+    def test_source_hash_is_idempotency_digest(self):
+        e = _funding_event()
+        d = build_funding_journal(e, created_by="t")
+        assert d.source_hash == compute_funding_journal_source_hash(e)
+
+
+class TestBuildFundingJournalReproducibility:
+    def test_same_event_same_journal(self):
+        e = _funding_event()
+        d1 = build_funding_journal(e, created_by="t")
+        d2 = build_funding_journal(e, created_by="t")
+        assert d1.source_hash == d2.source_hash
+        assert [(x.ledger_account_code, x.debit_credit, x.amount_usd) for x in d1.entries] \
+            == [(x.ledger_account_code, x.debit_credit, x.amount_usd) for x in d2.entries]
+
+    def test_different_created_by_does_not_change_entries(self):
+        e = _funding_event()
+        d1 = build_funding_journal(e, created_by="alice")
+        d2 = build_funding_journal(e, created_by="bob")
+        assert [(x.ledger_account_code, x.debit_credit, x.amount_usd) for x in d1.entries] \
+            == [(x.ledger_account_code, x.debit_credit, x.amount_usd) for x in d2.entries]

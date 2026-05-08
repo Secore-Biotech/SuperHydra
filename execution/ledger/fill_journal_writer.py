@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Literal
 
@@ -741,3 +741,237 @@ def write_and_post_journal(
     return (new_id, True)
 
 # === END DAY 11 APPEND ===
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Day 14: funding events
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Funding events are periodic accruals from a venue's perpetual funding
+# mechanism. Each event has:
+#   - a venue identity (venue_namespace, venue_funding_id) used as journal
+#     source_id by accounting.enforce_event_journal_link
+#   - a direction: 'received' (we got paid by the funding mechanism) or
+#     'paid' (we paid the funding mechanism)
+#   - an absolute USD amount; the sign is captured by direction
+#   - position_size / funding_rate retained as audit metadata
+#
+# Two ledger entries per event (no fee leg, no margin leg):
+#
+#   direction='received'  →  DR cash             CR funding_income
+#   direction='paid'      →  DR funding_expense  CR cash
+#
+# The accounting.funding_payments event row is INSERT-ed by the DB writer
+# (Day 14b, separate function) AFTER the journal is posted. The trigger
+# accounting.enforce_event_journal_link verifies the journal link.
+
+
+@dataclass(frozen=True)
+class FundingEventRecord:
+    """Subset of accounting.funding_payments columns needed to build the
+    journal. Fields are schema-aligned: source_namespace=venue_namespace,
+    source_id=venue_funding_id, etc.
+
+    Sign conventions:
+      - position_size is signed (+long, -short) — audit only, does not
+        affect journal direction
+      - funding_rate is signed (per-venue convention) — audit only
+      - amount_usd is absolute and positive — direction carries the sign
+      - direction is 'received' or 'paid', exhaustive
+    """
+    venue_namespace: str
+    venue_funding_id: str         # e.g. "BTCUSDT-2026-01-08T08:00:00Z"
+    portfolio_id: int
+    strategy_id: int
+    account_id: int
+    instrument_id: int
+    instrument_code: str          # e.g. "BTCUSDT" — used for funding_income/_expense account
+    quote_asset_symbol: str       # e.g. "USDT" — the asset that moves on the cash leg
+    funding_rate: Decimal         # signed; audit metadata
+    position_size: Decimal        # signed; audit metadata
+    amount_usd: Decimal           # ABSOLUTE; > 0
+    direction: str                # 'received' or 'paid'
+    funded_at: datetime           # tz-aware UTC
+    funding_environment: str      # 'LIVE' / 'SHADOW' / 'REPLAY' / 'BACKTEST'
+
+    def __post_init__(self) -> None:
+        if not self.venue_namespace.strip():
+            raise ValueError("FundingEventRecord.venue_namespace must be non-empty")
+        if not self.venue_funding_id.strip():
+            raise ValueError("FundingEventRecord.venue_funding_id must be non-empty")
+        if not self.instrument_code.strip():
+            raise ValueError("FundingEventRecord.instrument_code must be non-empty")
+        if not self.quote_asset_symbol.strip():
+            raise ValueError("FundingEventRecord.quote_asset_symbol must be non-empty")
+        if self.amount_usd <= 0:
+            raise ValueError(
+                f"FundingEventRecord.amount_usd must be > 0 (use direction to "
+                f"convey sign), got {self.amount_usd}"
+            )
+        if self.direction not in ("received", "paid"):
+            raise ValueError(
+                f"FundingEventRecord.direction must be 'received' or 'paid', "
+                f"got {self.direction!r}"
+            )
+        if self.funding_environment not in ("LIVE", "SHADOW", "REPLAY", "BACKTEST"):
+            raise ValueError(
+                f"FundingEventRecord.funding_environment must be one of "
+                f"LIVE/SHADOW/REPLAY/BACKTEST, got {self.funding_environment!r}"
+            )
+        if self.funded_at.tzinfo is None:
+            raise ValueError("FundingEventRecord.funded_at must be tz-aware")
+        if self.funded_at.utcoffset() != timedelta(0):
+            raise ValueError(
+                f"FundingEventRecord.funded_at must be UTC, "
+                f"got offset {self.funded_at.utcoffset()}"
+            )
+
+
+def compute_funding_journal_source_hash(event: FundingEventRecord) -> str:
+    """SHA-256 over the funding event's identity + amount fields.
+
+    Used as JournalDraft.source_hash. Re-running the writer with the same
+    event yields the same hash; any change to amount, rate, position size,
+    direction, instrument, environment, venue identity, or funded_at
+    produces a different hash. Two events with the same venue_namespace +
+    venue_funding_id but different amounts will be detected as a
+    source_hash mismatch by write_and_post_journal.
+    """
+    h = hashlib.sha256()
+    h.update(event.venue_namespace.encode("ascii"))
+    h.update(b"|")
+    h.update(event.venue_funding_id.encode("ascii"))
+    h.update(b"|")
+    h.update(event.direction.encode("ascii"))
+    h.update(b"|")
+    h.update(format(event.amount_usd, "f").encode("ascii"))
+    h.update(b"|")
+    h.update(format(event.funding_rate, "f").encode("ascii"))
+    h.update(b"|")
+    h.update(format(event.position_size, "f").encode("ascii"))
+    h.update(b"|")
+    h.update(str(event.instrument_id).encode("ascii"))
+    h.update(b"|")
+    h.update(event.funding_environment.encode("ascii"))
+    h.update(b"|")
+    h.update(event.funded_at.isoformat().encode("ascii"))
+    return h.hexdigest()
+
+
+def _build_funding_received_entries(event: FundingEventRecord) -> list[LedgerEntryDraft]:
+    """direction='received': DR cash, CR funding_income."""
+    cash_acct = cash_account_code(
+        event.portfolio_id, event.strategy_id,
+        event.account_id, event.quote_asset_symbol,
+    )
+    income_acct = funding_income_account_code(
+        event.portfolio_id, event.strategy_id, event.instrument_code,
+    )
+    memo = (
+        f"funding received {event.instrument_code} "
+        f"@ rate={event.funding_rate} on size={event.position_size}"
+    )
+    return [
+        LedgerEntryDraft(
+            debit_credit="debit",
+            ledger_account_code=cash_acct,
+            asset_symbol=event.quote_asset_symbol,
+            instrument_code=None,
+            quantity=event.amount_usd,
+            amount_usd=event.amount_usd,
+            memo=memo,
+        ),
+        LedgerEntryDraft(
+            debit_credit="credit",
+            ledger_account_code=income_acct,
+            asset_symbol=event.quote_asset_symbol,
+            instrument_code=event.instrument_code,
+            quantity=None,
+            amount_usd=event.amount_usd,
+            memo=memo,
+        ),
+    ]
+
+
+def _build_funding_paid_entries(event: FundingEventRecord) -> list[LedgerEntryDraft]:
+    """direction='paid': DR funding_expense, CR cash."""
+    cash_acct = cash_account_code(
+        event.portfolio_id, event.strategy_id,
+        event.account_id, event.quote_asset_symbol,
+    )
+    expense_acct = funding_expense_account_code(
+        event.portfolio_id, event.strategy_id, event.instrument_code,
+    )
+    memo = (
+        f"funding paid {event.instrument_code} "
+        f"@ rate={event.funding_rate} on size={event.position_size}"
+    )
+    return [
+        LedgerEntryDraft(
+            debit_credit="debit",
+            ledger_account_code=expense_acct,
+            asset_symbol=event.quote_asset_symbol,
+            instrument_code=event.instrument_code,
+            quantity=None,
+            amount_usd=event.amount_usd,
+            memo=memo,
+        ),
+        LedgerEntryDraft(
+            debit_credit="credit",
+            ledger_account_code=cash_acct,
+            asset_symbol=event.quote_asset_symbol,
+            instrument_code=None,
+            quantity=event.amount_usd,
+            amount_usd=event.amount_usd,
+            memo=memo,
+        ),
+    ]
+
+
+def build_funding_journal(
+    event: FundingEventRecord, *, created_by: str
+) -> JournalDraft:
+    """Construct a balanced JournalDraft from a single funding event.
+
+    The returned draft has:
+      - journal_type='funding'
+      - source_type='funding_event'  (matches accounting.funding_payments default)
+      - source_namespace=event.venue_namespace
+      - source_id=event.venue_funding_id
+      - source_hash=compute_funding_journal_source_hash(event)
+      - exactly two LedgerEntryDraft rows (cash + income/expense), summing to zero
+
+    The DB writer (Day 14b) is responsible for posting the journal AND
+    inserting the corresponding accounting.funding_payments row, both in
+    the same transaction.
+    """
+    if not created_by.strip():
+        raise ValueError("created_by must be non-empty")
+
+    if event.direction == "received":
+        entries = _build_funding_received_entries(event)
+    elif event.direction == "paid":
+        entries = _build_funding_paid_entries(event)
+    else:
+        # __post_init__ guards this; defensive.
+        raise ValueError(
+            f"unsupported funding direction: {event.direction!r}"
+        )
+
+    return JournalDraft(
+        schema_version=JOURNAL_DRAFT_SCHEMA_VERSION,
+        journal_type="funding",
+        journal_at=event.funded_at,
+        portfolio_id=event.portfolio_id,
+        strategy_id=event.strategy_id,
+        source_type="funding_event",
+        source_namespace=event.venue_namespace,
+        source_id=event.venue_funding_id,
+        source_hash=compute_funding_journal_source_hash(event),
+        description=(
+            f"funding {event.direction} {event.venue_namespace}:{event.venue_funding_id} "
+            f"{event.amount_usd} USD ({event.funding_environment})"
+        ),
+        created_by=created_by,
+        entries=entries,
+    )
