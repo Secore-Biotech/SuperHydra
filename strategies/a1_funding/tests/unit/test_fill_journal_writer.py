@@ -35,7 +35,8 @@ UTC = timezone.utc
 
 def _spot_fill(**overrides) -> FillRecord:
     base = dict(
-        fill_uuid="01900000-0000-7000-8000-000000000001",
+        venue_namespace="venue_test",
+        venue_fill_id="venue_fill_001",
         fill_content_hash="a" * 64,
         portfolio_id=1, strategy_id=1, account_id=1,
         instrument_id=10, instrument_code="BTCUSDT-SPOT",
@@ -363,9 +364,15 @@ class TestSourceHash:
         assert (compute_fill_journal_source_hash(f1)
                 == compute_fill_journal_source_hash(f2))
 
-    def test_changes_with_fill_uuid(self):
-        f1 = _spot_fill(fill_uuid="01900000-0000-7000-8000-000000000001")
-        f2 = _spot_fill(fill_uuid="01900000-0000-7000-8000-000000000002")
+    def test_changes_with_venue_fill_id(self):
+        f1 = _spot_fill(venue_fill_id="venue_fill_001")
+        f2 = _spot_fill(venue_fill_id="venue_fill_002")
+        assert (compute_fill_journal_source_hash(f1)
+                != compute_fill_journal_source_hash(f2))
+
+    def test_changes_with_venue_namespace(self):
+        f1 = _spot_fill(venue_namespace="venue_a")
+        f2 = _spot_fill(venue_namespace="venue_b")
         assert (compute_fill_journal_source_hash(f1)
                 != compute_fill_journal_source_hash(f2))
 
@@ -557,10 +564,15 @@ class TestBuildTradeJournalInvariants:
         d = build_trade_journal(f, created_by="t")
         assert d.journal_at == ts
 
-    def test_source_id_is_fill_uuid(self):
-        f = _spot_fill(fill_uuid="01900000-0000-7000-8000-000000000099")
+    def test_source_id_is_venue_fill_id(self):
+        f = _spot_fill(venue_fill_id="venue_fill_zz99")
         d = build_trade_journal(f, created_by="t")
-        assert d.source_id == "01900000-0000-7000-8000-000000000099"
+        assert d.source_id == "venue_fill_zz99"
+
+    def test_source_namespace_is_venue_namespace(self):
+        f = _spot_fill(venue_namespace="venue_xyz")
+        d = build_trade_journal(f, created_by="t")
+        assert d.source_namespace == "venue_xyz"
 
     def test_source_hash_is_idempotency_digest(self):
         f = _spot_fill()
@@ -645,7 +657,8 @@ class TestEndToEndPure:
         # Simulate the spot leg of an A1 short-perp/long-spot pair.
         # 0.01 BTC bought spot at $100k, $0.50 fee.
         f = FillRecord(
-            fill_uuid="01900000-0000-7000-8000-000000000spot",
+            venue_namespace="venue_test",
+            venue_fill_id="venue_fill_spot_realistic",
             fill_content_hash="b" * 64,
             portfolio_id=1, strategy_id=1, account_id=1,
             instrument_id=11, instrument_code="BTCUSDT-SPOT",
@@ -677,7 +690,8 @@ class TestEndToEndPure:
     def test_perp_short_realistic(self):
         # Perp short leg of an A1 pair.
         f = FillRecord(
-            fill_uuid="01900000-0000-7000-8000-000000000perp",
+            venue_namespace="venue_test",
+            venue_fill_id="venue_fill_perp_realistic",
             fill_content_hash="c" * 64,
             portfolio_id=1, strategy_id=1, account_id=1,
             instrument_id=10, instrument_code="BTCUSDT",

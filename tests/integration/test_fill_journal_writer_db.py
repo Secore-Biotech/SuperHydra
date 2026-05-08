@@ -97,11 +97,13 @@ def _create_btc_spot_instrument(cur, ctx) -> int:
     return cur.fetchone()[0]
 
 
-def _make_spot_fill(ctx, *, fill_uuid: str = "01900000-0000-7000-8000-000000000001",
+def _make_spot_fill(ctx, *, venue_fill_id: str = "venue_fill_spot_001",
                    content_hash: str = "a" * 64,
+                   venue_namespace: str = "venue_test",
                    side: str = "buy") -> FillRecord:
     return FillRecord(
-        fill_uuid=fill_uuid,
+        venue_namespace=venue_namespace,
+        venue_fill_id=venue_fill_id,
         fill_content_hash=content_hash,
         portfolio_id=ctx["portfolio_id"],
         strategy_id=ctx["strategy_id"],
@@ -118,11 +120,13 @@ def _make_spot_fill(ctx, *, fill_uuid: str = "01900000-0000-7000-8000-0000000000
     )
 
 
-def _make_perp_fill(ctx, *, fill_uuid: str = "01900000-0000-7000-8000-000000000002",
+def _make_perp_fill(ctx, *, venue_fill_id: str = "venue_fill_perp_001",
                    content_hash: str = "b" * 64,
+                   venue_namespace: str = "venue_test",
                    side: str = "sell") -> FillRecord:
     return FillRecord(
-        fill_uuid=fill_uuid,
+        venue_namespace=venue_namespace,
+        venue_fill_id=venue_fill_id,
         fill_content_hash=content_hash,
         portfolio_id=ctx["portfolio_id"],
         strategy_id=ctx["strategy_id"],
@@ -328,7 +332,8 @@ def test_write_and_post_journal_spot_zero_fee(fresh_db):
         asset_id, instrument_id = _make_resolvers(cur)
 
         fill = FillRecord(
-            fill_uuid="01900000-0000-7000-8000-zerofeebuild",
+            venue_namespace="venue_test",
+            venue_fill_id="venue_fill_zerofee",
             fill_content_hash="z" * 64,
             portfolio_id=ctx["portfolio_id"], strategy_id=ctx["strategy_id"],
             account_id=ctx["account_id"], instrument_id=ctx["instrument_id"],
@@ -472,7 +477,7 @@ def test_write_and_post_journal_source_hash_mismatch_raises(fresh_db):
         asset_id, instrument_id = _make_resolvers(cur)
 
         fill1 = _make_spot_fill(
-            ctx, content_hash="aaaa" * 16, fill_uuid="01900000-0000-7000-8000-deadbeefdead"
+            ctx, content_hash="aaaa" * 16, venue_fill_id="venue_fill_collision"
         )
         draft1 = build_trade_journal(fill1, created_by="day11_test")
         write_and_post_journal(
@@ -483,9 +488,9 @@ def test_write_and_post_journal_source_hash_mismatch_raises(fresh_db):
         )
         conn.commit()
 
-        # Same fill_uuid, different content_hash → different source_hash
+        # Same venue identity, different content_hash → different source_hash
         fill2 = _make_spot_fill(
-            ctx, content_hash="bbbb" * 16, fill_uuid="01900000-0000-7000-8000-deadbeefdead"
+            ctx, content_hash="bbbb" * 16, venue_fill_id="venue_fill_collision"
         )
         draft2 = build_trade_journal(fill2, created_by="day11_test")
 
@@ -575,10 +580,10 @@ def test_write_and_post_journal_distinct_fills_distinct_journals(fresh_db):
         asset_id, instrument_id = _make_resolvers(cur)
 
         fill_a = _make_spot_fill(
-            ctx, fill_uuid="01900000-0000-7000-8000-aaaaaaaaaaaa", content_hash="aaaa" * 16
+            ctx, venue_fill_id="venue_fill_distinct_a", content_hash="aaaa" * 16
         )
         fill_b = _make_perp_fill(
-            ctx, fill_uuid="01900000-0000-7000-8000-bbbbbbbbbbbb", content_hash="bbbb" * 16
+            ctx, venue_fill_id="venue_fill_distinct_b", content_hash="bbbb" * 16
         )
 
         draft_a = build_trade_journal(fill_a, created_by="t")

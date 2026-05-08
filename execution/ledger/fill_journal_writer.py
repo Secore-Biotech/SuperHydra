@@ -78,8 +78,14 @@ class FillRecord:
     """Subset of ``trading.fills`` columns that ``build_trade_journal``
     needs. Constructed by callers from either a real DB row or a synthetic
     test fixture. All money is Decimal — float would silently corrupt the
-    balance check."""
-    fill_uuid: str
+    balance check.
+
+    Venue identity (venue_namespace + venue_fill_id) is the join key the
+    accounting layer uses to reconcile a fill against its journal — see
+    trading.enforce_fill_reconciliation. Internal fill ids are not used
+    for reconciliation."""
+    venue_namespace: str
+    venue_fill_id: str
     fill_content_hash: str  # idempotency input
     portfolio_id: int
     strategy_id: int
@@ -97,6 +103,10 @@ class FillRecord:
     filled_at: datetime  # UTC
 
     def __post_init__(self) -> None:
+        if not self.venue_namespace.strip():
+            raise ValueError("FillRecord.venue_namespace must be non-empty")
+        if not self.venue_fill_id.strip():
+            raise ValueError("FillRecord.venue_fill_id must be non-empty")
         if self.quantity <= 0:
             raise ValueError(f"FillRecord.quantity must be > 0, got {self.quantity}")
         if self.price <= 0:
@@ -270,7 +280,9 @@ def compute_fill_journal_source_hash(fill: FillRecord) -> str:
     rewritten under our feet, and the previously-posted journal is now
     stale. The writer raises rather than emits a second journal."""
     h = hashlib.sha256()
-    h.update(fill.fill_uuid.encode("ascii"))
+    h.update(fill.venue_namespace.encode("ascii"))
+    h.update(b"|")
+    h.update(fill.venue_fill_id.encode("ascii"))
     h.update(b"|")
     h.update(fill.fill_content_hash.encode("ascii"))
     h.update(b"|")
@@ -479,11 +491,11 @@ def build_trade_journal(fill: FillRecord, *, created_by: str) -> JournalDraft:
         strategy_id=fill.strategy_id,
         journal_at=fill.filled_at,
         source_type="fill",
-        source_namespace="global",
-        source_id=fill.fill_uuid,
+        source_namespace=fill.venue_namespace,
+        source_id=fill.venue_fill_id,
         source_hash=compute_fill_journal_source_hash(fill),
         description=(
-            f"trade fill {fill.fill_uuid} "
+            f"trade fill {fill.venue_namespace}:{fill.venue_fill_id} "
             f"({fill.instrument_type} {fill.side} "
             f"{fill.quantity} {fill.instrument_code} @ {fill.price})"
         ),
