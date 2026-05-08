@@ -5,7 +5,7 @@ risk / fills / positions stack on a single synthetic intent, against a
 fresh DB. The goal is to prove every contract along the path works
 end-to-end on real schema, not just in unit tests.
 
-Assertion gates (per Day 8 plan, refined by Day 8 recon):
+Assertion gates (per Day 8 plan, refined through Day 12):
 
 PASSING (main test):
   1. Pure-function pipeline produces an OrderIntent
@@ -20,17 +20,18 @@ PASSING (main test):
      and submitted → working (record_order_ack)
   7. SHADOW + MODELED_FILL fills inserted; process_fill_update_order
      trigger updates filled_quantity AND state to 'filled'
+  7.5 build_trade_journal + write_and_post_journal per fill (Day 11 writer)
+  8. trading.reconcile_fill(fill_id, journal_id, 'smoke_test') succeeds
+  9. positions.compute_position_snapshot computes (Day 13: xfail INLINE
+     if quantity=0 — position_lots writer not yet built)
 
-XFAIL (single root cause: execution/ledger/fill_journal_writer.py missing):
-  8. reconcile_fill(fill_id, journal_id, reconciled_by) — needs journal
-  9. position_lots → position_snapshots — lots require reconciled fills
- 11. accounting.journals + ledger_entries balanced
- 12. P&L derivable from ledger
+PASSING (separate tests):
+ 11. Every fill-sourced journal is balanced (Day 11 writer guarantees)
+ 12. Every fill-sourced journal has ≥ 2 entries referencing v1: accounts
 
-Day 8 endpoint: fills inserted + order FSM advanced to 'filled'. Recon
-during Day 8 revealed the entire downstream chain (reconcile → lots →
-snapshots → journals → P&L) blocks on the same missing writer module.
-That module is the first concrete Day 9-15 deliverable.
+Day 12 endpoint: fills are now reconciled to balanced posted journals.
+Position snapshot status is determined empirically — DEBUG print at
+step 9 captures snap_quantity/fill_count/lot_count for inspection.
 """
 from __future__ import annotations
 
@@ -45,6 +46,13 @@ import pytest
 # mark_price_set / valuation_run / NAV snapshot — exactly the dependencies
 # the smoke test would otherwise duplicate.
 from tests.integration.test_migrations import _connect, _setup_basic_0009, fresh_db
+
+# Day 11 writer for fills→journals (now that the keystone exists).
+from execution.ledger.fill_journal_writer import (
+    FillRecord,
+    build_trade_journal,
+    write_and_post_journal,
+)
 
 # Strategy-layer pipeline (Day 1-7). All pure functions.
 from data.ingestion.vendors.binance.funding_rate import FundingRate
@@ -191,6 +199,30 @@ def _hash_funding_window(window: list[FundingRate]) -> str:
     for r in window:
         h.update(r.content_hash.encode("ascii"))
     return h.hexdigest()
+
+
+def _make_db_resolvers(cur):
+    """Return (asset_id_resolver, instrument_id_resolver) backed by
+    the supplied cursor. Used by Day 11's write_and_post_journal."""
+    def asset_id(symbol: str) -> int:
+        cur.execute(
+            "SELECT id FROM registry.assets WHERE symbol = %s",
+            (symbol,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise KeyError(f"unknown asset symbol {symbol!r}")
+        return row[0]
+
+    def instrument_id(code: str) -> int | None:
+        cur.execute(
+            "SELECT id FROM registry.instruments WHERE instrument_code = %s",
+            (code,),
+        )
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    return asset_id, instrument_id
 
 
 # ─── The smoke test ──────────────────────────────────────────────────────
@@ -583,49 +615,23 @@ def test_a1_smoke_vertical(fresh_db):
             )
             assert fq == expected_qty
 
-    # ─── Step 8: reconcile_fill (DEFERRED to xfail at module level) ─────
-    # reconcile_fill(fill_id, journal_id, reconciled_by) requires a journal_id
-    # in accounting.journals. That journal is produced by the fills→journal
-    # writer (Day 9-15 deliverable). Without that writer, fills cannot be
-    # reconciled, and reconciliation is the prerequisite for step 11+12's
-    # double-entry assertions. The smoke test stops here for the main path
-    # and exposes the gap as explicit xfails below.
-
-    # ─── Day 8 endpoint: fills inserted + order FSM transitioned to 'filled' ──
-    # Recon-via-failure during Day 8 revealed that the entire downstream
-    # chain (reconcile_fill → position_lots → compute_position_snapshot →
-    # ledger → P&L) requires journals to exist, and journals come from
-    # the fills→journal writer that doesn't yet exist.
-    #
-    # Specifically:
-    #   - reconcile_fill(fill_id, journal_id, reconciled_by) requires a
-    #     journal_id from accounting.journals.
-    #   - position_lots inserts require opening_fill_id to be reconciled
-    #     (i.e. journal_id NOT NULL) — the trigger raises 'unreconciled'.
-    #   - compute_position_snapshot reads from position_lots, so without
-    #     populated lots the snapshot returns quantity=0.
-    #
-    # All four downstream gates (reconcile, lots, snapshots, journals)
-    # block on the same missing module: execution/ledger/fill_journal_writer.py
-    # That module is the keystone for Day 9-15 wiring.
-    #
-    # Day 8's smoke test therefore stops here — at the natural boundary
-    # of "everything that can pass without the writer." The downstream
-    # gates are exposed as xfails below, all citing the same root cause.
-
-    # Final positive assertion: trigger updated order state via
-    # process_fill_update_order; both orders should be 'filled' with
-    # filled_quantity matching the intent's leg quantities.
+    # ─── Step 7.5: build + post journal per fill (Day 11 writer) ───────
+    # The fills→journal writer exists as of Day 11. FillRecord uses
+    # venue_namespace + venue_fill_id (Day 12.5) — NOT fill_uuid. The
+    # accounting layer reconciles by venue identity, not internal id.
+    perp_journal_id: int
+    spot_journal_id: int
     with _connect() as conn, conn.cursor() as cur:
+        asset_id_resolver, instrument_id_resolver = _make_db_resolvers(cur)
+
+        # Confirm process_fill_update_order trigger advanced order state to
+        # 'filled' (regression-check; was the only assertion in Day 8's endpoint).
         for label, order_id, leg in [
             ('perp', perp_order_id, intent.perp_leg),
             ('spot', spot_order_id, intent.spot_leg),
         ]:
             cur.execute(
-                """
-                SELECT state, filled_quantity
-                FROM trading.orders WHERE id = %s
-                """,
+                "SELECT state, filled_quantity FROM trading.orders WHERE id = %s",
                 (order_id,),
             )
             state, fq = cur.fetchone()
@@ -637,6 +643,155 @@ def test_a1_smoke_vertical(fresh_db):
                 f"got {fq}"
             )
 
+        # Fetch venue identity for both fills (FillRecord requires it).
+        cur.execute(
+            """
+            SELECT id, venue_namespace, venue_fill_id
+            FROM trading.fills
+            WHERE id IN (%s, %s) ORDER BY id
+            """,
+            (perp_fill_id, spot_fill_id),
+        )
+        venue_rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+        perp_venue_namespace, perp_venue_fill_id = venue_rows[perp_fill_id]
+        spot_venue_namespace, spot_venue_fill_id = venue_rows[spot_fill_id]
+
+        for (label, venue_ns, vfid, leg, instrument_code, instrument_type,
+             fill_price) in [
+            ('perp', perp_venue_namespace, perp_venue_fill_id,
+             intent.perp_leg, 'BTCUSDT', 'perp', perp_fill_price),
+            ('spot', spot_venue_namespace, spot_venue_fill_id,
+             intent.spot_leg, 'BTCUSDT-SPOT', 'spot', spot_fill_price),
+        ]:
+            fill_record = FillRecord(
+                venue_namespace=venue_ns,
+                venue_fill_id=vfid,
+                # trading.fills has no real content_hash column; for smoke
+                # purposes the venue identity + lineage prefix is stable.
+                fill_content_hash=vfid + ":" + intent.cost_model_hash[:32],
+                portfolio_id=ctx["portfolio_id"],
+                strategy_id=ctx["strategy_id"],
+                account_id=ctx["account_id"],
+                instrument_id=ctx["instrument_id"] if label == 'perp' else spot_instrument_id,
+                instrument_code=instrument_code,
+                instrument_type=instrument_type,
+                base_asset_symbol="BTC",
+                quote_asset_symbol="USDT",
+                side=leg.side.value,
+                quantity=leg.quantity,
+                price=fill_price,
+                fee_usd=Decimal("0.50"),
+                fill_environment="SHADOW",
+                filled_at=fill_ts,
+            )
+            draft = build_trade_journal(fill_record, created_by="smoke_test")
+            journal_id, was_new = write_and_post_journal(
+                conn, draft,
+                posted_by="smoke_test",
+                asset_id_resolver=asset_id_resolver,
+                instrument_id_resolver=instrument_id_resolver,
+            )
+            assert was_new is True, (
+                f"first run of {label} fill should create a fresh journal"
+            )
+            if label == 'perp':
+                perp_journal_id = journal_id
+            else:
+                spot_journal_id = journal_id
+        conn.commit()
+
+    # ─── Step 8: reconcile_fill links fill ↔ journal ────────────────────
+    with _connect() as conn, conn.cursor() as cur:
+        for fill_id, journal_id in [
+            (perp_fill_id, perp_journal_id),
+            (spot_fill_id, spot_journal_id),
+        ]:
+            cur.execute(
+                "SELECT trading.reconcile_fill(%s, %s, %s)",
+                (fill_id, journal_id, "smoke_test"),
+            )
+        conn.commit()
+
+        # Confirm reconciliation took: fills now carry their journal_id
+        # and reconciled_at.
+        for fill_id, expected_journal_id in [
+            (perp_fill_id, perp_journal_id),
+            (spot_fill_id, spot_journal_id),
+        ]:
+            cur.execute(
+                "SELECT journal_id, reconciled_at, reconciled_by "
+                "FROM trading.fills WHERE id = %s",
+                (fill_id,),
+            )
+            jrn, rec_at, rec_by = cur.fetchone()
+            assert jrn == expected_journal_id
+            assert rec_at is not None
+            assert rec_by == "smoke_test"
+
+    # ─── Step 9: compute_position_snapshot for the perp leg ─────────────
+    # The snapshot reads from positions.position_lots. Lots normally
+    # require a reconciled fill (journal_id NOT NULL) PLUS an explicit
+    # insert. Day 13 was scoped to build a fills→position_lots writer,
+    # but Day 12 may discover that some part of the schema populates
+    # lots automatically once fills are reconciled. The DEBUG print
+    # captures the actual snapshot state for inspection.
+    with _connect() as conn, conn.cursor() as cur:
+        snap_at = datetime.now(UTC) + timedelta(seconds=1)
+        cur.execute(
+            """
+            SELECT positions.compute_position_snapshot(
+                %s, %s, %s, %s, 'SHADOW',
+                %s, %s, 'a1.smoke.v0', 'smoke_test', '{}'::jsonb
+            )
+            """,
+            (
+                ctx["portfolio_id"], ctx["strategy_id"],
+                ctx["account_id"], ctx["instrument_id"],
+                snap_at, snap_at,
+            ),
+        )
+        snapshot_id = cur.fetchone()[0]
+        cur.execute(
+            """
+            SELECT quantity, contributing_fill_count
+            FROM positions.position_snapshots WHERE id = %s
+            """,
+            (snapshot_id,),
+        )
+        snap_quantity, fill_count = cur.fetchone()
+
+        # Also count position_lots so we know whether they got created
+        # automatically by some trigger we missed.
+        cur.execute(
+            "SELECT COUNT(*) FROM positions.position_lots "
+            "WHERE portfolio_id = %s AND strategy_id = %s "
+            "AND account_id = %s AND instrument_id = %s",
+            (ctx["portfolio_id"], ctx["strategy_id"],
+             ctx["account_id"], ctx["instrument_id"]),
+        )
+        lot_count = cur.fetchone()[0]
+        conn.commit()
+
+        if snap_quantity == 0 and fill_count == 0:
+            # Day 13 target: position_lots requires its own writer to
+            # convert reconciled fills into lots. Until that lands the
+            # snapshot is structurally empty. Inline xfail (rather than
+            # a test-level mark) keeps earlier assertions strict.
+            pytest.xfail(
+                "Day 13: fills→position_lots writer required — "
+                "position_snapshot.quantity=0 because position_lots is empty"
+            )
+
+        # Day 13+: once lots are wired, expect non-zero perp exposure.
+        expected_signed = -intent.perp_leg.quantity
+        assert snap_quantity == expected_signed, (
+            f"perp position snapshot expected quantity={expected_signed}, "
+            f"got {snap_quantity}"
+        )
+        assert fill_count == 1, (
+            f"snapshot should derive from exactly one fill, got {fill_count}"
+        )
+
 
 # ─── xfail steps 11-12 ────────────────────────────────────────────────────
 # These are the explicit Day 9-15 gap. We DO NOT inline manual journal /
@@ -646,17 +801,15 @@ def test_a1_smoke_vertical(fresh_db):
 # 9-15 deliverable.
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Day 9-15: requires execution/ledger/fill_journal_writer.py — fills do not "
-        "auto-emit balanced journal entries; this assertion stays xfail until the "
-        "writer module exists."
-    ),
-    strict=True,
-)
 def test_a1_smoke_vertical_step11_journal_balanced(fresh_db):
-    """Step 11 (xfail): journal entries created from a SHADOW fill must be
-    balanced (sum debits == sum credits per journal in USD)."""
+    """Step 11: journal entries created from SHADOW fills must be
+    balanced (sum debits == sum credits per journal in USD).
+
+    Day 11 wired in the writer; this test now passes. We invoke the
+    smoke-test main path first to populate fills + journals, then check
+    the invariant.
+    """
+    test_a1_smoke_vertical(fresh_db)  # populate fills + journals
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("""
             SELECT j.id, COALESCE(SUM(CASE WHEN le.debit_credit = 'debit'
@@ -669,39 +822,45 @@ def test_a1_smoke_vertical_step11_journal_balanced(fresh_db):
             GROUP BY j.id
         """)
         rows = cur.fetchall()
-    assert rows, "no fill-sourced journals exist (writer module missing)"
+    assert rows, "expected fill-sourced journals to exist"
     for jid, debits, credits in rows:
         assert debits == credits, (
             f"journal {jid} unbalanced: debits={debits} credits={credits}"
         )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Day 9-15: depends on test_a1_smoke_vertical_step11_journal_balanced. "
-        "P&L cannot be derived from ledger entries until the fills→journal "
-        "writer module exists."
-    ),
-    strict=True,
-)
-def test_a1_smoke_vertical_step12_pnl_derivable(fresh_db):
-    """Step 12 (xfail): once journals exist, net P&L for the engine is
-    derivable as (sum of credits to P&L equity account) - (sum of debits)."""
+def test_a1_smoke_vertical_step12_journal_entries_per_fill(fresh_db):
+    """Step 12: every fill-sourced journal has at least 2 ledger entries
+    and references resolved ledger_accounts via the v1 chart-of-accounts.
+
+    Trade-journal P&L (close-of-position) and funding-event P&L are Day
+    14 deliverables. For Day 12 we assert the structural invariant: the
+    writer's journals link properly to ledger_entries through the
+    enforce_ledger_entry_integrity dimension trigger.
+    """
+    test_a1_smoke_vertical(fresh_db)  # populate fills + journals
+    with _connect() as conn, conn.cursor() as cur:
+        # Every fill-sourced journal should have >= 2 entries.
+        cur.execute("""
+            SELECT j.id, COUNT(le.id) AS entry_count
+            FROM accounting.journals j
+            LEFT JOIN accounting.ledger_entries le ON le.journal_id = j.id
+            WHERE j.source_type = 'fill'
+            GROUP BY j.id
+        """)
+        rows = cur.fetchall()
+    assert rows, "expected fill-sourced journals"
+    for jid, count in rows:
+        assert count >= 2, f"journal {jid}: only {count} entries"
+
     with _connect() as conn, conn.cursor() as cur:
         cur.execute("""
-            SELECT COALESCE(
-                SUM(CASE WHEN le.debit_credit = 'credit' THEN le.amount_usd ELSE 0 END)
-              - SUM(CASE WHEN le.debit_credit = 'debit'  THEN le.amount_usd ELSE 0 END),
-                0
-            )
+            SELECT COUNT(*)
             FROM accounting.ledger_entries le
             JOIN accounting.ledger_accounts la ON la.id = le.ledger_account_id
             JOIN accounting.journals j         ON j.id = le.journal_id
-            WHERE la.account_type = 'equity'
-              AND la.account_subtype = 'pnl'
-              AND j.source_type = 'fill'
+            WHERE j.source_type = 'fill'
+              AND la.account_code LIKE 'v1:%%'
         """)
-        pnl = cur.fetchone()[0]
-    # We don't assert a specific value yet — once the writer exists we'll
-    # check that P&L is non-zero (or matches expected funding less costs).
-    assert pnl is not None
+        v1_entries = cur.fetchone()[0]
+    assert v1_entries > 0, "expected v1: account-coded entries from the writer"
