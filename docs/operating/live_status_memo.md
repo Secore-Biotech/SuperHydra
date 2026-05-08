@@ -4,22 +4,27 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 
 ---
 
-## Week of 2026-05-06
+## Current state — 2026-05-08
 
 ### Migration foundation
 - **0009 (risk evaluation)** — Round 4 closed. Commit `0f8b7b5`. 319/319 tests passing. Alembic round-trip clean.
-- Reviewer's round-3 blocker (replay `+1µs` hack) closed via lineage-stored snapshot reuse with identity check. 0008 contract preserved.
-- Reviewer signoff: round 4 structural contract closed; remaining items classified as round 4.5 coverage hardening.
+- Reviewer signoff received. Round 4.5 coverage hardening tracked as carry-forward debt; non-blocking.
 
 ### Sleeve A (build-to-trade)
-- **Engine A1 — Funding-rate capture:** Phase P0 (research & build).
-  - Day 1 (`0e7b377`): package skeleton + canonical FundingRate dataclass + cost-model config schema + PaperAdapter contract. 63 unit tests.
-  - Day 2-3 (`8e60933`): Binance funding-rate fetcher with injectable HTTP transport, throttle, retry, fail-loud parsing. No new deps. 23 unit tests.
-  - Day 4-5 (`fdb5450`): pure-function expected-next-period funding model (Decimal arithmetic, no look-ahead) and net-edge signal evaluator. Reproducibility byte-equality. 39 unit tests.
-  - Day 6-7 (`6ea6fa5`): SizingConfig + OrderIntent (two-leg hedge invariants) + position-aware sizer. End of week 1: signal+sizer pipeline unit-tested end-to-end. 65 unit tests.
-  - Day 8 (`ef45eaf`): vertical smoke test driving Day 1-7 pipeline through 0007 OMS / 0009 risk / 0008 positions on a fresh DB. **1 passed + 2 xfail.** Smoke test passes through fill insertion + order FSM advance to 'filled'. Reconcile, position_lots, snapshots, journals, and P&L all xfail strictly on the same root cause: missing `execution/ledger/fill_journal_writer.py`. That module is the keystone for Day 9-15 wiring.
-  - **Cumulative A1 unit tests: 190 passing. Smoke test: 1 passed + 2 xfail (strict). Full migration suite: 319 passing.**
-  - Day 9-15 next: build `execution/ledger/fill_journal_writer.py` — emits balanced journal entries from a SHADOW fill, allowing reconcile_fill to succeed and lifting the entire xfail block.
+- **Engine A1 — Funding-rate capture:** Phase P0.
+  - Day 1 (`0e7b377`): package skeleton + FundingRate + cost-model schema + PaperAdapter contract.
+  - Day 2-3 (`8e60933`): Binance funding-rate fetcher.
+  - Day 4-5 (`fdb5450`): expected-funding model + signal evaluator.
+  - Day 6-7 (`6ea6fa5`): SizingConfig + OrderIntent + sizer. End of week 1 milestone.
+  - Day 8 (`ef45eaf`): vertical smoke test through 0007/0008/0009. **1 passed + 2 strict xfail.** Recon revealed entire downstream chain (reconcile_fill, position_lots, snapshots, journals, P&L) blocks on a single missing module: `execution/ledger/fill_journal_writer.py`.
+  - Day 9 (`e8ea7fc`): pure-function `fill_journal_writer` with spot/perp dispatch and v1 chart-of-accounts naming. 72 unit tests covering helpers, validation, balance enforcement, hash determinism, byte-equality reproducibility. **No DB; pure functions only.** Day 10-11 wires it to Postgres.
+  - **Cumulative: 240 unit tests passing + 1 smoke passed + 2 strict xfail. Full migration suite: 319 passing.**
+  - Day 10 next: chart-of-accounts seeder (`execution/ledger/chart_of_accounts.py`) — creates the ledger_accounts that the writer references on first use of each (portfolio, strategy, account, asset/instrument) tuple.
+  - Day 11: DB-side `write_and_post_journal` + integration tests proving idempotency.
+  - Day 12: wire writer into smoke test step 8, lift xfail on reconcile_fill.
+  - Day 13: discover whether fills→position_lots also needs a writer; if so, build it.
+  - Day 14: funding-event journals (`build_funding_journal`).
+  - Day 15: lift remaining xfails on smoke test steps 11-12.
 - **Engine A2 — Basis:** Not started.
 - **Engine A3 — Cash-and-carry:** Deferred.
 
@@ -39,7 +44,8 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 - None.
 
 ### Next gate status
-- A1 P0 → P1 gate: paper run reproducible end-to-end on production code path. Day 8 smoke test exposed `fill_journal_writer.py` as the single missing module; Day 9-15 work is now scoped against that target.
+- A1 P0 → P1 gate: paper run reproducible end-to-end on production code path.
+- Day 9 closed the structural gap on journal construction. Day 10-11 closes the DB wiring. Day 12 unblocks reconciliation in the smoke test. After that, the path to a 60-day paper run is mechanical.
 
 ### Carry-forward debt
 **0009 Round 4.5 — Replay/Risk Matrix Hardening** (non-blocking, post-signoff). Priority order:
@@ -49,8 +55,6 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 4. Bucket D + cb_hard_stop combined
 5. Cancel matrix × non-LIVE envs
 6. Per-dimension exhaustive
-
-**Day 8 reveal — fills→journal writer.** Single missing module blocks reconcile_fill, position_lots, position_snapshots, balanced journals, and P&L derivability. First Day 9-15 deliverable.
 
 ### Capital deployed
 - $0. Program in P0 across all engines.
