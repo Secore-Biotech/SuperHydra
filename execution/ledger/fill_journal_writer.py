@@ -490,3 +490,242 @@ def build_trade_journal(fill: FillRecord, *, created_by: str) -> JournalDraft:
         created_by=created_by,
         entries=entries,
     )
+
+
+# === BEGIN DAY 11 APPEND ===
+
+import psycopg
+from execution.ledger.chart_of_accounts import (
+    AssetIdResolver,
+    InstrumentIdResolver,
+    resolve_account_id,
+    spec_for_account_code,
+)
+
+
+# ─── DB-side writer (Day 11) ──────────────────────────────────────────────
+
+
+class JournalSourceHashMismatchError(Exception):
+    """A journal exists for the same (source_type, source_namespace,
+    source_id, journal_type) tuple, but its source_hash differs from
+    the incoming draft. Indicates the source fill was rewritten — an
+    integrity failure per roadmap §12.
+
+    The exception message includes both hashes and the journal id so
+    the operator can investigate. The writer does NOT log, does NOT
+    auto-resolve; it raises and lets the caller decide.
+    """
+
+
+def _insert_journal_or_load_existing(
+    conn,
+    draft: "JournalDraft",
+    *,
+    posted_by: str,
+) -> tuple[int, bool, str]:
+    """Insert the journal row, or — if the (source_type, source_namespace,
+    source_id, journal_type) tuple already exists — load the existing row.
+
+    Returns (journal_id, was_newly_created, current_status).
+
+    Raises ``JournalSourceHashMismatchError`` if an existing journal is
+    found whose source_hash differs from draft.source_hash. That's an
+    integrity failure: the same source identity now has different content.
+
+    Caller owns the transaction. On error, caller must rollback.
+    """
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                """
+                INSERT INTO accounting.journals (
+                    journal_type, status, portfolio_id, strategy_id, journal_at,
+                    source_type, source_namespace, source_id, source_hash,
+                    description, created_by
+                ) VALUES (
+                    %s, 'draft', %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s
+                )
+                RETURNING id
+                """,
+                (
+                    draft.journal_type,
+                    draft.portfolio_id, draft.strategy_id, draft.journal_at,
+                    draft.source_type, draft.source_namespace, draft.source_id,
+                    draft.source_hash,
+                    draft.description, draft.created_by,
+                ),
+            )
+            new_id = cur.fetchone()[0]
+            return (new_id, True, "draft")
+        except psycopg.errors.UniqueViolation:
+            # uniq_journal_source caught it. Caller's transaction is now
+            # poisoned (per psycopg semantics). They MUST rollback before
+            # retrying — that's the Day 11 contract.
+            raise
+
+    # unreachable
+    raise RuntimeError("unreachable")
+
+
+def _load_existing_journal(
+    conn,
+    draft: "JournalDraft",
+) -> tuple[int, str, str] | None:
+    """Look up an existing journal by the uniq_journal_source key.
+    Returns (id, status, source_hash) or None if not found."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, status, source_hash
+            FROM accounting.journals
+            WHERE source_type = %s
+              AND source_namespace = %s
+              AND source_id = %s
+              AND journal_type = %s
+            """,
+            (
+                draft.source_type, draft.source_namespace,
+                draft.source_id, draft.journal_type,
+            ),
+        )
+        row = cur.fetchone()
+        return row  # type: ignore[return-value]
+
+
+def _insert_entries(
+    conn,
+    journal_id: int,
+    draft: "JournalDraft",
+    *,
+    asset_id_resolver: "AssetIdResolver",
+    instrument_id_resolver: "InstrumentIdResolver",
+) -> None:
+    """Insert the ledger_entries rows for a draft journal.
+    Resolves each entry's account_code → ledger_account_id via the
+    chart-of-accounts upsert. Resolves asset_symbol → asset_id and
+    instrument_code → instrument_id via the supplied resolvers.
+
+    Caller owns the transaction.
+    """
+    with conn.cursor() as cur:
+        for entry in draft.entries:
+            spec = spec_for_account_code(
+                entry.ledger_account_code,
+                asset_id_resolver=asset_id_resolver,
+                instrument_id_resolver=instrument_id_resolver,
+            )
+            ledger_account_id = resolve_account_id(conn, spec)
+
+            # Each entry carries its own asset_id / instrument_id which
+            # may overlap with the account's dimensions but the trigger
+            # cross-checks them. Resolve from entry, not from spec.
+            entry_asset_id = asset_id_resolver(entry.asset_symbol)
+            entry_instrument_id = (
+                instrument_id_resolver(entry.instrument_code)
+                if entry.instrument_code is not None
+                else None
+            )
+
+            cur.execute(
+                """
+                INSERT INTO accounting.ledger_entries (
+                    journal_id, ledger_account_id, debit_credit,
+                    asset_id, instrument_id, quantity, amount_usd, memo
+                ) VALUES (
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    journal_id, ledger_account_id, entry.debit_credit,
+                    entry_asset_id, entry_instrument_id,
+                    entry.quantity, entry.amount_usd, entry.memo,
+                ),
+            )
+
+
+def _post_or_resume(
+    conn,
+    journal_id: int,
+    *,
+    posted_by: str,
+) -> None:
+    """Call accounting.post_journal — either to post a freshly-inserted
+    journal or to drive a leftover draft to posted state."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT accounting.post_journal(%s, %s)",
+            (journal_id, posted_by),
+        )
+
+
+def write_and_post_journal(
+    conn,
+    draft: "JournalDraft",
+    *,
+    posted_by: str,
+    asset_id_resolver: "AssetIdResolver",
+    instrument_id_resolver: "InstrumentIdResolver",
+) -> tuple[int, bool]:
+    """Persist a balanced journal draft to the accounting schema and
+    post it. Returns (journal_id, was_newly_created).
+
+    Behaviour matrix on (source_type, source_namespace, source_id,
+    journal_type):
+
+      * No existing journal → insert + entries + post. Returns (id, True).
+      * Existing journal, source_hash matches, status='draft'  →
+        DO NOT re-insert entries (would duplicate). Just post. Returns
+        (id, False). This is the crash-recovery path: the caller MUST
+        have rolled back the failing transaction first; we treat the
+        existing draft as a successful prior insert that crashed before
+        post.
+      * Existing journal, source_hash matches, status='posted' →
+        nothing to do. Returns (id, False). Idempotent re-run.
+      * Existing journal, source_hash differs → raise
+        JournalSourceHashMismatchError.
+
+    Caller owns the transaction (Day 11 §Q3 rule A). On error, caller
+    must rollback.
+    """
+    if not posted_by.strip():
+        raise ValueError("posted_by must be non-empty")
+
+    # Fast path: lookup first. If exists, we either return immediately
+    # (matching hash) or raise (mismatch). If not found, we insert fresh.
+    existing = _load_existing_journal(conn, draft)
+    if existing is not None:
+        existing_id, existing_status, existing_hash = existing
+        if existing_hash != draft.source_hash:
+            raise JournalSourceHashMismatchError(
+                f"journal_id={existing_id} "
+                f"source_type={draft.source_type!r} "
+                f"source_namespace={draft.source_namespace!r} "
+                f"source_id={draft.source_id!r} "
+                f"journal_type={draft.journal_type!r} "
+                f"existing_source_hash={existing_hash!r} "
+                f"incoming_source_hash={draft.source_hash!r}"
+            )
+        # Hash matches. If still draft, drive it to posted (recovery).
+        # If already posted, nothing to do.
+        if existing_status == "draft":
+            _post_or_resume(conn, existing_id, posted_by=posted_by)
+        # 'posted' → no-op
+        return (existing_id, False)
+
+    # No existing journal. Insert fresh, then entries, then post.
+    new_id, was_new, _ = _insert_journal_or_load_existing(
+        conn, draft, posted_by=posted_by,
+    )
+    _insert_entries(
+        conn, new_id, draft,
+        asset_id_resolver=asset_id_resolver,
+        instrument_id_resolver=instrument_id_resolver,
+    )
+    _post_or_resume(conn, new_id, posted_by=posted_by)
+    return (new_id, True)
+
+# === END DAY 11 APPEND ===

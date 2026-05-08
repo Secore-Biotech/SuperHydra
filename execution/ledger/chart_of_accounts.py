@@ -327,3 +327,104 @@ def spec_for_account_code(
         asset_id=asset_id,
         instrument_id=instrument_id,
     )
+
+
+# === BEGIN DAY 11 APPEND ===
+
+# ─── DB-side resolver (Day 11) ────────────────────────────────────────────
+
+
+class AccountCodeCollisionError(Exception):
+    """An existing ledger_accounts row was found by account_code but its
+    other dimensions (portfolio, strategy, asset, instrument) differ
+    from the spec we tried to insert. This is an integrity failure —
+    the account-code naming convention is supposed to make collisions
+    impossible. If this raises, the convention is broken or someone
+    inserted by hand.
+    """
+
+
+def resolve_account_id(conn, spec: AccountSpec) -> int:
+    """Insert-or-fetch a row in accounting.ledger_accounts keyed on
+    spec.account_code. Returns the row id.
+
+    Idempotent: calling twice with the same spec returns the same id.
+    The UNIQUE constraint on account_code makes the SQL pattern safe
+    even under concurrent calls.
+
+    Caller owns the transaction. This function does NOT BEGIN/COMMIT;
+    on error, the caller's transaction is poisoned and must be rolled
+    back per Day 11 §Q3.
+
+    Raises:
+      AccountCodeCollisionError: if a row with the same account_code
+        exists but its dimensions don't match `spec`. This indicates
+        the account code naming convention is no longer injective.
+    """
+    with conn.cursor() as cur:
+        # INSERT ... ON CONFLICT DO NOTHING returns no row when there
+        # was a conflict, so we always SELECT after to get the id.
+        cur.execute(
+            """
+            INSERT INTO accounting.ledger_accounts (
+                account_code, account_name, account_type, account_subtype,
+                portfolio_id, strategy_id, registry_account_id,
+                asset_id, instrument_id
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            ON CONFLICT (account_code) DO NOTHING
+            """,
+            (
+                spec.account_code, spec.account_name,
+                spec.account_type, spec.account_subtype,
+                spec.portfolio_id, spec.strategy_id, spec.registry_account_id,
+                spec.asset_id, spec.instrument_id,
+            ),
+        )
+        cur.execute(
+            """
+            SELECT id, account_type, account_subtype,
+                   portfolio_id, strategy_id, registry_account_id,
+                   asset_id, instrument_id
+            FROM accounting.ledger_accounts
+            WHERE account_code = %s
+            """,
+            (spec.account_code,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # Should be impossible — INSERT either created the row or
+            # the row already existed. Defensive guard.
+            raise RuntimeError(
+                f"resolve_account_id: account_code {spec.account_code!r} "
+                f"vanished between INSERT and SELECT"
+            )
+        (existing_id, ex_type, ex_subtype,
+         ex_portfolio, ex_strategy, ex_account,
+         ex_asset, ex_instrument) = row
+
+        # Verify dimensions match. account_code is supposed to be a
+        # bijection with (type, subtype, portfolio, strategy, account,
+        # asset, instrument). If not, the convention is broken.
+        if (ex_type != spec.account_type
+                or ex_subtype != spec.account_subtype
+                or ex_portfolio != spec.portfolio_id
+                or ex_strategy != spec.strategy_id
+                or ex_account != spec.registry_account_id
+                or ex_asset != spec.asset_id
+                or ex_instrument != spec.instrument_id):
+            raise AccountCodeCollisionError(
+                f"account_code {spec.account_code!r} resolved to id={existing_id} "
+                f"but dimensions differ: "
+                f"existing=(type={ex_type}, subtype={ex_subtype}, "
+                f"portfolio={ex_portfolio}, strategy={ex_strategy}, "
+                f"account={ex_account}, asset={ex_asset}, instrument={ex_instrument}) "
+                f"requested=(type={spec.account_type}, subtype={spec.account_subtype}, "
+                f"portfolio={spec.portfolio_id}, strategy={spec.strategy_id}, "
+                f"account={spec.registry_account_id}, asset={spec.asset_id}, "
+                f"instrument={spec.instrument_id})"
+            )
+        return existing_id
+
+# === END DAY 11 APPEND ===
