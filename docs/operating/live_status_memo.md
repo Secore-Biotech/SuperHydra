@@ -15,12 +15,13 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
   - Day 1 (`0e7b377`): package skeleton + FundingRate + cost-model schema + PaperAdapter contract.
   - Day 2-3 (`8e60933`): Binance funding-rate fetcher.
   - Day 4-5 (`fdb5450`): expected-funding model + signal evaluator.
-  - Day 6-7 (`6ea6fa5`): SizingConfig + OrderIntent + sizer. End of week 1 milestone.
-  - Day 8 (`ef45eaf`): vertical smoke test through 0007/0008/0009. **1 passed + 2 strict xfail.** Recon revealed entire downstream chain (reconcile_fill, position_lots, snapshots, journals, P&L) blocks on a single missing module: `execution/ledger/fill_journal_writer.py`.
-  - Day 9 (`e8ea7fc`): pure-function `fill_journal_writer` with spot/perp dispatch and v1 chart-of-accounts naming. 72 unit tests covering helpers, validation, balance enforcement, hash determinism, byte-equality reproducibility. **No DB; pure functions only.** Day 10-11 wires it to Postgres.
-  - **Cumulative: 240 unit tests passing + 1 smoke passed + 2 strict xfail. Full migration suite: 319 passing.**
-  - Day 10 next: chart-of-accounts seeder (`execution/ledger/chart_of_accounts.py`) — creates the ledger_accounts that the writer references on first use of each (portfolio, strategy, account, asset/instrument) tuple.
-  - Day 11: DB-side `write_and_post_journal` + integration tests proving idempotency.
+  - Day 6-7 (`6ea6fa5`): SizingConfig + OrderIntent + sizer. End of week 1.
+  - Day 8 (`ef45eaf`): vertical smoke test through 0007/0008/0009. **1 passed + 2 strict xfail.** Recon revealed the entire downstream chain (reconcile_fill, position_lots, snapshots, journals, P&L) blocks on `execution/ledger/fill_journal_writer.py`.
+  - Day 9 (`e8ea7fc`): pure-function `fill_journal_writer` with spot/perp dispatch and v1 chart-of-accounts naming. 72 unit tests.
+  - Day 10 (`41bc333`): pure-function `chart_of_accounts` parser inverting v1 codes into typed AccountSpec. Strict version-gating (no silent v2 fallback). Resolver-callable design keeps it DB-independent. 54 unit tests.
+  - **Cumulative: 294 unit tests passing + 1 smoke passed + 2 strict xfail. Full migration suite: 319 passing.**
+  - The pure-function half of the Day 9-15 keystone is complete: Day 9 builds balanced JournalDrafts from fills; Day 10 inverts account codes back to AccountSpecs. Day 11-12 wires both to Postgres.
+  - Day 11 next: DB-side `resolve_account_id` (UPSERT into accounting.ledger_accounts) + `write_and_post_journal` (insert + post_journal). Integration tests prove idempotency on (source_type, source_id, source_hash).
   - Day 12: wire writer into smoke test step 8, lift xfail on reconcile_fill.
   - Day 13: discover whether fills→position_lots also needs a writer; if so, build it.
   - Day 14: funding-event journals (`build_funding_journal`).
@@ -38,14 +39,14 @@ This memo refreshes weekly per roadmap §11. The roadmap holds principles and ga
 - None.
 
 ### Paper-vs-live drift
-- N/A — no engines in paper or canary.
+- N/A.
 
 ### Unresolved risk exceptions
 - None.
 
 ### Next gate status
 - A1 P0 → P1 gate: paper run reproducible end-to-end on production code path.
-- Day 9 closed the structural gap on journal construction. Day 10-11 closes the DB wiring. Day 12 unblocks reconciliation in the smoke test. After that, the path to a 60-day paper run is mechanical.
+- Days 9-10 complete the structural pure-function design. Day 11 closes the DB-write gap. Day 12 unblocks reconciliation in the smoke test. After that, the path to a 60-day paper run is mechanical wiring.
 
 ### Carry-forward debt
 **0009 Round 4.5 — Replay/Risk Matrix Hardening** (non-blocking, post-signoff). Priority order:
