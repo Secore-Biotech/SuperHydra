@@ -58,6 +58,12 @@ from execution.ledger.fill_journal_writer import (
     write_and_post_journal,
 )
 
+# Day 15b.1: extracted OMS submit path
+from strategies.a1_funding.runner.oms_submit import (
+    SubmissionResult,
+    submit_intent_through_oms,
+)
+
 # Strategy-layer pipeline (Day 1-7). All pure functions.
 from data.ingestion.vendors.binance.funding_rate import FundingRate
 from core.config.cost_model import conservative_default_v0 as cost_default
@@ -283,353 +289,43 @@ def test_a1_smoke_vertical(fresh_db):
         assert intent.perp_leg.quantity == intent.spot_leg.quantity
         assert intent.perp_leg.side != intent.spot_leg.side
 
-        # ─── Step 2: allocator_run + target_weights with lineage ────────
+        # ─── Steps 2-7: OMS submit path (extracted to oms_submit helper) ───
         funding_window_hash = _hash_funding_window(funding_window)
-        run_id = _allocator_run_with_lineage(
-            cur, ctx,
-            signal_eval=signal_eval,
-            cost_model_hash=intent.cost_model_hash,
-            sizing_config_hash=intent.sizing_config_hash,
-            funding_window_hash=funding_window_hash,
-        )
-
-        # Target weight per leg.
-        perp_tw_id = _target_weight(
-            cur, run_id, ctx["instrument_id"],
-            target_weight=Decimal("-1") if intent.perp_leg.side.value == "sell"
-                                        else Decimal("1"),
-            target_quantity=intent.perp_leg.quantity,
-            target_notional_usd=intent.perp_leg.quantity * Decimal("100000"),
-        )
-        spot_tw_id = _target_weight(
-            cur, run_id, spot_instrument_id,
-            target_weight=Decimal("1") if intent.spot_leg.side.value == "buy"
-                                       else Decimal("-1"),
-            target_quantity=intent.spot_leg.quantity,
-            target_notional_usd=intent.spot_leg.quantity * Decimal("100000"),
-        )
-
-        # Sanity: solve_metadata is queryable, lineage is preserved.
-        cur.execute(
-            "SELECT solve_metadata FROM registry.allocator_runs WHERE id = %s",
-            (run_id,),
-        )
-        sm = cur.fetchone()[0]
-        assert sm["cost_model_hash"] == intent.cost_model_hash
-        assert sm["sizing_config_hash"] == intent.sizing_config_hash
-        assert sm["signal_decision"] == intent.signal_decision
-
-        conn.commit()
-
-    # ─── Step 3: trading.order_intents inserts (one per leg) ────────────
-    with _connect() as conn, conn.cursor() as cur:
-        # Fetch venue_namespace from venue (lineage trigger inspects it).
         cur.execute(
             "SELECT venue_code FROM registry.venues WHERE id = %s",
             (ctx["venue_id"],),
         )
         venue_namespace = cur.fetchone()[0]
 
-        # Perp leg intent
-        cur.execute(
-            """
-            INSERT INTO trading.order_intents (
-                allocator_run_id, target_weight_id,
-                strategy_id, portfolio_id, account_id,
-                instrument_id, venue_id, venue_namespace,
-                side, target_quantity, target_value_usd,
-                intent_type, urgency, execution_environment, created_via,
-                constraints_metadata, intended_at, created_by
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s,
-                'open', 'normal', 'SHADOW', 'strategy',
-                '{"post_only": false}'::jsonb, NOW(), 'smoke_test'
-            )
-            RETURNING id, intent_uuid
-            """,
-            (
-                run_id, perp_tw_id,
-                ctx["strategy_id"], ctx["portfolio_id"], ctx["account_id"],
-                ctx["instrument_id"], ctx["venue_id"], venue_namespace,
-                intent.perp_leg.side.value, intent.perp_leg.quantity,
-                intent.perp_leg.quantity * Decimal("100000"),
-            ),
+        perp_fill_price = Decimal("100000")
+        spot_fill_price = Decimal("100000")
+        fill_ts = datetime.now(UTC)
+
+        sub = submit_intent_through_oms(
+            conn,
+            intent,
+            ctx=ctx,
+            spot_instrument_id=spot_instrument_id,
+            venue_namespace=venue_namespace,
+            funding_window_hash=funding_window_hash,
+            signal_eval=signal_eval,
+            fill_price_perp=perp_fill_price,
+            fill_price_spot=spot_fill_price,
+            fill_ts=fill_ts,
+            created_by="smoke_test",
         )
-        perp_intent_id, perp_intent_uuid = cur.fetchone()
-
-        # Spot leg intent
-        cur.execute(
-            """
-            INSERT INTO trading.order_intents (
-                allocator_run_id, target_weight_id,
-                strategy_id, portfolio_id, account_id,
-                instrument_id, venue_id, venue_namespace,
-                side, target_quantity, target_value_usd,
-                intent_type, urgency, execution_environment, created_via,
-                constraints_metadata, intended_at, created_by
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s,
-                'open', 'normal', 'SHADOW', 'strategy',
-                '{"post_only": false}'::jsonb, NOW(), 'smoke_test'
-            )
-            RETURNING id, intent_uuid
-            """,
-            (
-                run_id, spot_tw_id,
-                ctx["strategy_id"], ctx["portfolio_id"], ctx["account_id"],
-                spot_instrument_id, ctx["venue_id"], venue_namespace,
-                intent.spot_leg.side.value, intent.spot_leg.quantity,
-                intent.spot_leg.quantity * Decimal("100000"),
-            ),
-        )
-        spot_intent_id, spot_intent_uuid = cur.fetchone()
-
         conn.commit()
 
-    # ─── Step 4: trading.orders inserts (state='pending_submit') ────────
-    with _connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO trading.orders (
-                intent_id, account_id, instrument_id, venue_id, venue_namespace,
-                client_order_id, side, order_type, quantity, time_in_force, state,
-                created_via, created_by
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s,
-                'market', %s, 'ioc', 'pending_submit',
-                'strategy', 'smoke_test'
-            )
-            RETURNING id
-            """,
-            (
-                perp_intent_id, ctx["account_id"], ctx["instrument_id"],
-                ctx["venue_id"], venue_namespace,
-                f"so_{str(perp_intent_uuid).replace('-', '')[:16]}_{intent.perp_leg.side.value}",
-                intent.perp_leg.side.value, intent.perp_leg.quantity,
-            ),
-        )
-        perp_order_id = cur.fetchone()[0]
-
-        cur.execute(
-            """
-            INSERT INTO trading.orders (
-                intent_id, account_id, instrument_id, venue_id, venue_namespace,
-                client_order_id, side, order_type, quantity, time_in_force, state,
-                created_via, created_by
-            ) VALUES (
-                %s, %s, %s, %s, %s, %s, %s,
-                'market', %s, 'ioc', 'pending_submit',
-                'strategy', 'smoke_test'
-            )
-            RETURNING id
-            """,
-            (
-                spot_intent_id, ctx["account_id"], spot_instrument_id,
-                ctx["venue_id"], venue_namespace,
-                f"so_{str(spot_intent_uuid).replace('-', '')[:16]}_{intent.spot_leg.side.value}",
-                intent.spot_leg.side.value, intent.spot_leg.quantity,
-            ),
-        )
-        spot_order_id = cur.fetchone()[0]
-        conn.commit()
-
-    # ─── Step 5: risk.evaluate_action returns 'allowed' for both ────────
-    with _connect() as conn, conn.cursor() as cur:
-        eval_ts = datetime.now(UTC)
-        for leg_label, intent_id, leg in [
-            ("perp", perp_intent_id, intent.perp_leg),
-            ("spot", spot_intent_id, intent.spot_leg),
-        ]:
-            cur.execute(
-                """
-                SELECT risk.evaluate_action(
-                    'intent', %s, %s, 'smoke_test',
-                    %s, %s, %s, %s,
-                    %s, %s, %s,
-                    %s, %s,
-                    NULL,
-                    %s, %s, %s,
-                    NULL, NULL, NULL,
-                    '{}'::jsonb
-                )
-                """,
-                (
-                    f"smoke-{leg_label}",
-                    f"smoke-eval-{leg_label}-{intent_id}",
-                    ctx["portfolio_id"], ctx["strategy_id"],
-                    ctx["account_id"],
-                    (ctx["instrument_id"] if leg_label == "perp"
-                     else spot_instrument_id),
-                    eval_ts, eval_ts, 'LIVE',
-                    leg.quantity if leg.side.value == "buy" else -leg.quantity,
-                    leg.quantity * Decimal("100000"),
-                    ctx["mark_price_set_id"], ctx["mark_source_ts"], "last",
-                ),
-            )
-            eval_id = cur.fetchone()[0]
-            cur.execute(
-                "SELECT verdict_raw FROM risk.evaluations WHERE id = %s",
-                (eval_id,),
-            )
-            verdict = cur.fetchone()[0]
-            assert verdict == "allowed", (
-                f"{leg_label} risk evaluation: expected 'allowed', got {verdict!r}"
-            )
-        conn.commit()
-
-    # ─── Step 5.5: cash reservation per intent (assert_order_submit_ready) ──
-    with _connect() as conn, conn.cursor() as cur:
-        # Required notional per leg = target_value_usd = qty * $100k.
-        # Reserve the exact amount in USDT cash on the account.
-        for intent_id, leg in [
-            (perp_intent_id, intent.perp_leg),
-            (spot_intent_id, intent.spot_leg),
-        ]:
-            cur.execute(
-                """
-                INSERT INTO trading.order_reservations (
-                    intent_id, account_id, asset_id,
-                    reservation_type, amount_reserved
-                ) VALUES (
-                    %s, %s,
-                    (SELECT id FROM registry.assets WHERE symbol = 'USDT'),
-                    'cash', %s
-                )
-                """,
-                (intent_id, ctx["account_id"], leg.quantity * Decimal("100000")),
-            )
-        conn.commit()
-
-    # ─── Step 5.7: oms_outbox 'submit' rows (assert_order_submit_ready) ──
-    with _connect() as conn, conn.cursor() as cur:
-        for order_id in (perp_order_id, spot_order_id):
-            # operation_key format: 'submit:<order_uuid>' exactly.
-            cur.execute(
-                "SELECT order_uuid FROM trading.orders WHERE id = %s",
-                (order_id,),
-            )
-            order_uuid = cur.fetchone()[0]
-            cur.execute(
-                """
-                INSERT INTO trading.oms_outbox (
-                    order_id, operation, operation_key,
-                    payload, state
-                ) VALUES (%s, 'submit', %s, '{}'::jsonb, 'pending')
-                """,
-                (order_id, f"submit:{order_uuid}"),
-            )
-        conn.commit()
-
-    # ─── Step 6: state transitions pending_submit → submitted → working ──
-    with _connect() as conn, conn.cursor() as cur:
-        for label, order_id in [('perp', perp_order_id), ('spot', spot_order_id)]:
-            # pending_submit → submitted: operator-driven transition
-            cur.execute(
-                """
-                SELECT trading.transition_order_state(
-                    %s, 'submitted', 'paper submit',
-                    'system', 'global', 'smoke',
-                    'smoke_test', '{}'::jsonb
-                )
-                """,
-                (order_id,),
-            )
-            # submitted → working: requires record_order_ack (venue ack semantics).
-            # In paper, we synthesize the venue ack with a synthetic id.
-            cur.execute(
-                """
-                SELECT trading.record_order_ack(
-                    %s, %s, '{}'::jsonb, 'smoke_test'
-                )
-                """,
-                (order_id, f"venue-ack-{label}-{order_id}"),
-            )
-        conn.commit()
-
-        for order_id in (perp_order_id, spot_order_id):
-            cur.execute(
-                "SELECT state FROM trading.orders WHERE id = %s", (order_id,)
-            )
-            assert cur.fetchone()[0] == "working"
-
-    # ─── Step 7: SHADOW MODELED_FILL fills, trigger updates filled_qty ──
-    perp_fill_price = Decimal("100000")
-    spot_fill_price = Decimal("100000")
-    fill_ts = datetime.now(UTC)
-    with _connect() as conn, conn.cursor() as cur:
-        # Day 8: fills carry paper-lineage (cost_model_hash, simulation_seed)
-        # in raw_record JSONB. Where these belong long-term (a separate
-        # paper_fill_metadata table? extension columns?) is a Day 9-15
-        # design question — for now, lineage is preserved in raw_record
-        # so reconciliation can read it back.
-        for label, order_id, leg in [
-            ('perp', perp_order_id, intent.perp_leg),
-            ('spot', spot_order_id, intent.spot_leg),
-        ]:
-            instrument_id = (ctx["instrument_id"] if label == 'perp'
-                             else spot_instrument_id)
-            fill_price = perp_fill_price if label == 'perp' else spot_fill_price
-            raw_record = json.dumps({
-                "venue": "binance",
-                "fill_environment": "SHADOW",
-                "fill_settlement_type": "MODELED_FILL",
-                "lineage": {
-                    "cost_model_hash": intent.cost_model_hash,
-                    "sizing_config_hash": intent.sizing_config_hash,
-                    "simulation_seed": 42,
-                    "intent_uuid": str(perp_intent_uuid if label == 'perp'
-                                       else spot_intent_uuid),
-                },
-            })
-            cur.execute(
-                """
-                INSERT INTO trading.fills (
-                    order_id, instrument_id,
-                    venue_fill_id, venue_namespace,
-                    side, quantity, price, notional_value,
-                    liquidity_side,
-                    fill_environment, fill_settlement_type,
-                    filled_at, raw_record
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    'taker',
-                    'SHADOW', 'MODELED_FILL',
-                    %s, %s::jsonb
-                )
-                RETURNING id
-                """,
-                (
-                    order_id, instrument_id,
-                    f"smoke-fill-{label}-{order_id}", venue_namespace,
-                    leg.side.value, leg.quantity, fill_price,
-                    leg.quantity * fill_price,
-                    fill_ts, raw_record,
-                ),
-            )
-            fill_id = cur.fetchone()[0]
-            if label == 'perp':
-                perp_fill_id = fill_id
-            else:
-                spot_fill_id = fill_id
-        conn.commit()
-
-        # Trigger should have flipped state to 'filled' and updated quantities.
-        for order_id, expected_qty in [
-            (perp_order_id, intent.perp_leg.quantity),
-            (spot_order_id, intent.spot_leg.quantity),
-        ]:
-            cur.execute(
-                "SELECT state, filled_quantity FROM trading.orders WHERE id = %s",
-                (order_id,),
-            )
-            state, fq = cur.fetchone()
-            assert state == "filled", (
-                f"order {order_id} expected 'filled', got {state}"
-            )
-            assert fq == expected_qty
+        # Bind variables the rest of the smoke test expects.
+        run_id = sub.allocator_run_id
+        perp_intent_id = sub.perp_intent_id
+        spot_intent_id = sub.spot_intent_id
+        perp_intent_uuid = sub.perp_intent_uuid
+        spot_intent_uuid = sub.spot_intent_uuid
+        perp_order_id = sub.perp_order_id
+        spot_order_id = sub.spot_order_id
+        perp_fill_id = sub.perp_fill_id
+        spot_fill_id = sub.spot_fill_id
 
     # ─── Step 7.5: build + post journal per fill (Day 11 writer) ───────
     # The fills→journal writer exists as of Day 11. FillRecord uses
