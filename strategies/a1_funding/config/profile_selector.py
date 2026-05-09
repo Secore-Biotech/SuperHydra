@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from core.config.cost_model import (
     CostModelConfig,
+    binance_vip5_alt_v1,
     binance_vip5_btc_v1,
 )
 
@@ -45,6 +46,15 @@ from core.config.cost_model import (
 _BINANCE_BTC_ETH_INSTRUMENTS: frozenset[str] = frozenset({
     "BTCUSDT",
     "ETHUSDT",
+})
+
+# Liquid alt instruments calibrated under binance_vip5_alt_v1.
+# SOLUSDT is the initial calibration target. Other alts (DOGE,
+# AVAX, etc.) intentionally omitted until each is empirically
+# calibrated; defaulting them to liquid_alt_tier without a
+# spread/fill-cost check would be calibration-by-assumption.
+_BINANCE_LIQUID_ALT_INSTRUMENTS: frozenset[str] = frozenset({
+    "SOLUSDT",
 })
 
 
@@ -78,12 +88,16 @@ def select_profile_for_a1(
     if venue_normalized == "binance":
         if instrument_code in _BINANCE_BTC_ETH_INSTRUMENTS:
             return binance_vip5_btc_v1()
+        if instrument_code in _BINANCE_LIQUID_ALT_INSTRUMENTS:
+            return binance_vip5_alt_v1()
         raise NotImplementedError(
             f"No A1 cost profile for instrument_code={instrument_code!r} "
-            f"on venue {venue!r}. Currently supported: "
-            f"{sorted(_BINANCE_BTC_ETH_INSTRUMENTS)} on \"binance\". "
-            f"Adding altcoin support requires calibrating a separate "
-            f"slippage tier and fee schedule (deferred to a later Day)."
+            f"on venue {venue!r}. Currently supported on \"binance\": "
+            f"BTC/ETH ({sorted(_BINANCE_BTC_ETH_INSTRUMENTS)}) under "
+            f"binance_vip5_btc_v1; liquid alts "
+            f"({sorted(_BINANCE_LIQUID_ALT_INSTRUMENTS)}) under "
+            f"binance_vip5_alt_v1. Other alts need their own slippage "
+            f"calibration; SOLUSDT is the calibrated example to follow."
         )
 
     raise NotImplementedError(

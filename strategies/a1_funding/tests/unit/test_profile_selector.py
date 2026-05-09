@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import pytest
 
-from core.config.cost_model import binance_vip5_btc_v1
+from core.config.cost_model import (
+    binance_vip5_alt_v1,
+    binance_vip5_btc_v1,
+)
 from strategies.a1_funding.config.profile_selector import (
     select_profile_for_a1,
 )
@@ -70,20 +73,25 @@ class TestVenueCaseInsensitivity:
 
 
 class TestUnsupportedRaises:
-    def test_altcoin_on_binance_raises(self):
-        with pytest.raises(NotImplementedError) as ei:
-            select_profile_for_a1("SOLUSDT", "binance")
-        msg = str(ei.value)
-        assert "SOLUSDT" in msg
-        assert "binance" in msg.lower()
-        # The error should hint at what IS supported.
-        assert "BTCUSDT" in msg
-        assert "ETHUSDT" in msg
-
-    def test_unknown_instrument_on_binance_raises(self):
+    def test_uncalibrated_altcoin_on_binance_raises(self):
+        """DOGEUSDT is uncalibrated. SOLUSDT is now supported, so it
+        cannot be the unsupported example."""
         with pytest.raises(NotImplementedError) as ei:
             select_profile_for_a1("DOGEUSDT", "binance")
-        assert "DOGEUSDT" in str(ei.value)
+        msg = str(ei.value)
+        assert "DOGEUSDT" in msg
+        assert "binance" in msg.lower()
+        # Error message points at SOLUSDT as the calibrated example.
+        assert "SOLUSDT" in msg
+        assert "calibrated example" in msg
+
+    def test_unknown_instrument_on_binance_raises(self):
+        """AVAXUSDT is also uncalibrated."""
+        with pytest.raises(NotImplementedError) as ei:
+            select_profile_for_a1("AVAXUSDT", "binance")
+        msg = str(ei.value)
+        assert "AVAXUSDT" in msg
+        assert "SOLUSDT" in msg  # message still points at calibrated example
 
     def test_bybit_raises(self):
         with pytest.raises(NotImplementedError) as ei:
@@ -128,3 +136,25 @@ class TestReturnedConfigInvariants:
         b = select_profile_for_a1("BTCUSDT", "binance")
         c = select_profile_for_a1("BTCUSDT", "binance")
         assert a.content_hash == b.content_hash == c.content_hash
+
+
+
+# ─── Day 18a: SOLUSDT alt branch ─────────────────────────────────────────
+
+
+class TestBinanceSolUsdt:
+    def test_solusdt_binance_returns_vip5_alt(self):
+        result = select_profile_for_a1("SOLUSDT", "binance")
+        assert result.profile_name == "binance_vip5_alt_v1"
+        assert result.content_hash == binance_vip5_alt_v1().content_hash
+
+    def test_solusdt_distinct_from_btcusdt(self):
+        btc = select_profile_for_a1("BTCUSDT", "binance")
+        sol = select_profile_for_a1("SOLUSDT", "binance")
+        assert btc.profile_name != sol.profile_name
+        assert btc.content_hash != sol.content_hash
+
+    def test_solusdt_case_insensitive_venue(self):
+        for venue in ("binance", "BINANCE", "Binance"):
+            result = select_profile_for_a1("SOLUSDT", venue)
+            assert result.profile_name == "binance_vip5_alt_v1"

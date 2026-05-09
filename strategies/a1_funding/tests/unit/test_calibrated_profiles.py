@@ -23,6 +23,7 @@ import pytest
 
 from core.config.cost_model import (
     binance_vip0_retail_v1,
+    binance_vip5_alt_v1,
     binance_vip5_btc_v1,
     binance_vip9_institutional_v1,
     conservative_default_v0,
@@ -186,3 +187,53 @@ class TestPlaceholderHashStability:
             f"placeholder_v0 hash changed from {expected!r} to "
             f"{cm.content_hash!r}. This breaks lineage. Investigate."
         )
+
+
+
+# ─── Day 18a: alt profile threshold + hash tests ─────────────────────────
+
+
+class TestAltProfile:
+    def test_binance_vip5_alt_v1_threshold(self):
+        """2 * 0.000270 + 2 * 0.0003 + 0.0001/3
+           = 0.000540 + 0.0006 + 0.0000333
+           = 0.001173... per interval (~11.7 bps)
+        Higher than vip5_btc (~7.7 bps) because alt slippage dominates."""
+        cm = binance_vip5_alt_v1()
+        threshold = _per_period_cost_rate(cm)
+        assert Decimal("0.00117") < threshold < Decimal("0.00118"), (
+            f"vip5_alt threshold drifted: {threshold}"
+        )
+
+    def test_alt_threshold_higher_than_btc_threshold(self):
+        """Alt threshold > BTC threshold by construction (3x slippage)."""
+        btc = _per_period_cost_rate(binance_vip5_btc_v1())
+        alt = _per_period_cost_rate(binance_vip5_alt_v1())
+        assert alt > btc, f"alt={alt} not > btc={btc}"
+
+    def test_alt_threshold_below_solusdt_funding_cap(self):
+        """Binance SOLUSDT funding cap ~50 bps per interval; alt threshold
+        ~11.7 bps. The yes-trade economic basis for SOLUSDT under this
+        profile."""
+        SOLUSDT_FUNDING_CAP = Decimal("0.005")  # 50 bps per interval
+        threshold = _per_period_cost_rate(binance_vip5_alt_v1())
+        assert threshold < SOLUSDT_FUNDING_CAP, (
+            f"alt threshold ({threshold}) no longer below SOLUSDT cap "
+            f"({SOLUSDT_FUNDING_CAP}); investigate."
+        )
+
+    def test_alt_profile_distinct_hash_from_btc_profile(self):
+        """Same VIP5 fees, different slippage tier + profile_name →
+        different content_hash."""
+        assert binance_vip5_btc_v1().content_hash != binance_vip5_alt_v1().content_hash
+
+    def test_alt_profile_has_liquid_alt_tier(self):
+        cm = binance_vip5_alt_v1()
+        tier_names = [t.tier_name for t in cm.slippage_tiers]
+        assert tier_names == ["liquid_alt_tier"]
+
+    def test_alt_profile_source_metadata_present(self):
+        cm = binance_vip5_alt_v1()
+        assert cm.source is not None
+        assert cm.source.source_url.startswith("https://")
+        assert cm.source.source_as_of == "2026-05-09"

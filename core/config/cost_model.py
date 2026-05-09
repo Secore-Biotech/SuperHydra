@@ -433,3 +433,79 @@ def binance_vip9_institutional_v1() -> CostModelConfig:
             ),
         ),
     )
+
+
+
+def binance_vip5_alt_v1() -> CostModelConfig:
+    """Calibrated profile for liquid altcoin perps on Binance USDM at
+    VIP5 with BNB discount. Day 18a addition.
+
+    The fee schedule is IDENTICAL to binance_vip5_btc_v1 because Binance
+    USDM-Futures does not differentiate fees by instrument class — VIP5
+    fees apply to all USDM contracts. The profile is nonetheless a
+    distinct CostModelConfig with its own profile_name (and therefore
+    its own content_hash) because per-instrument-class economics are
+    captured at profile-identity level, not just by numeric values. If
+    Binance later charges differently for alts, this profile updates
+    independently of binance_vip5_btc_v1.
+
+    The substantive difference is the slippage tier:
+      btc_eth_top_tier:   1 bp per leg (BTC/ETH top-of-book)
+      liquid_alt_tier:    3 bps per leg (SOL-class liquid alts)
+
+    Threshold under this profile:
+      2 * 0.000270 (taker) + 2 * 0.0003 (slip) + 0.0001/3 (borrow)
+      = 0.000540 + 0.0006 + 0.0000333
+      = 0.001173 (~11.7 bps per interval)
+
+    Compared to:
+      Binance SOLUSDT funding cap: ~50 bps per interval (structural)
+      historical SOL funding spikes: 20-50+ bps in volatile regimes
+
+    So SOLUSDT under this profile is economically tradeable in strong
+    funding regimes — the threshold is well below the cap and below
+    realistic positive-funding observations. This is the basis for
+    Day 18b (real SOL funding fixture probe) and Day 18c (yes-trade
+    integration test).
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                # 1.2 bps * 0.9 (BNB discount) = 1.08 bps, same as BTC
+                maker_bps=Decimal("0.000108"),
+                # 3.0 bps * 0.9 (BNB discount) = 2.7 bps, same as BTC
+                taker_bps=Decimal("0.000270"),
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="liquid_alt_tier",
+                slippage_bps=Decimal("0.0003"),  # 3 bps per leg
+            ),
+        ),
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day floor
+        ),
+        notes=(
+            "Binance VIP5 USDM-Futures with 10% BNB discount, alt "
+            "slippage tier (3 bps per leg). Day 18a addition for "
+            "liquid altcoin perps (SOLUSDT initial calibration target)."
+        ),
+        profile_name="binance_vip5_alt_v1",
+        source=ProfileSource(
+            source_url="https://www.binance.com/en/fee/futureFee",
+            source_as_of="2026-05-09",
+            notes=(
+                "USDM-Futures VIP5 schedule, 10% BNB discount applied. "
+                "Slippage tier estimated from typical SOLUSDT top-of-"
+                "book spread + small-size adverse fill cost; pending "
+                "empirical calibration from live fills."
+            ),
+        ),
+    )
