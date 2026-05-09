@@ -975,3 +975,223 @@ def build_funding_journal(
         created_by=created_by,
         entries=entries,
     )
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Day 14b: write_and_post_funding_journal
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class FundingPaymentMismatchError(Exception):
+    """Raised when an existing funding_payment row conflicts with the
+    incoming event on a critical field. Indicates an integrity failure:
+    the same venue identity was previously recorded with different amount,
+    direction, rate, or pointing to a different journal.
+
+    Caller should treat this as a severe issue requiring investigation —
+    it means either (a) duplicate venue_funding_id from the same venue
+    with different amounts (venue bug), or (b) we tried to post a
+    different event under an identifier we already used."""
+
+    def __init__(
+        self, *,
+        funding_payment_id: int,
+        source_type: str,
+        source_namespace: str,
+        source_id: str,
+        existing_journal_id: int,
+        incoming_journal_id: int,
+        existing_amount_usd: Decimal,
+        incoming_amount_usd: Decimal,
+        existing_direction: str,
+        incoming_direction: str,
+        existing_funding_rate: Decimal,
+        incoming_funding_rate: Decimal,
+    ) -> None:
+        self.funding_payment_id = funding_payment_id
+        self.source_type = source_type
+        self.source_namespace = source_namespace
+        self.source_id = source_id
+        self.existing_journal_id = existing_journal_id
+        self.incoming_journal_id = incoming_journal_id
+        self.existing_amount_usd = existing_amount_usd
+        self.incoming_amount_usd = incoming_amount_usd
+        self.existing_direction = existing_direction
+        self.incoming_direction = incoming_direction
+        self.existing_funding_rate = existing_funding_rate
+        self.incoming_funding_rate = incoming_funding_rate
+        super().__init__(
+            f"funding_payment {funding_payment_id} for "
+            f"{source_type}:{source_namespace}:{source_id} mismatches: "
+            f"journal {existing_journal_id} vs {incoming_journal_id}, "
+            f"amount {existing_amount_usd} vs {incoming_amount_usd}, "
+            f"direction {existing_direction} vs {incoming_direction}, "
+            f"rate {existing_funding_rate} vs {incoming_funding_rate}"
+        )
+
+
+def _load_existing_funding_payment(conn, event: FundingEventRecord):
+    """SELECT by (source_type, source_namespace, source_id). Returns
+    a dict if found, None otherwise."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT id, journal_id, amount_usd, direction, funding_rate
+            FROM accounting.funding_payments
+            WHERE source_type = %s
+              AND source_namespace = %s
+              AND source_id = %s
+            """,
+            ("funding_event", event.venue_namespace, event.venue_funding_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "journal_id": row[1],
+            "amount_usd": row[2],
+            "direction": row[3],
+            "funding_rate": row[4],
+        }
+
+
+def _verify_funding_payment_match(
+    existing: dict, event: FundingEventRecord, journal_id: int
+) -> None:
+    """Validate that the existing funding_payment row is consistent with
+    the incoming event. Raises FundingPaymentMismatchError on any field
+    mismatch.
+
+    Comparisons:
+      - journal_id: must point to the journal we just posted
+      - amount_usd: same to within Decimal exactness
+      - direction: exact string match
+      - funding_rate: same to within Decimal exactness
+    """
+    if (
+        existing["journal_id"] != journal_id
+        or existing["amount_usd"] != event.amount_usd
+        or existing["direction"] != event.direction
+        or existing["funding_rate"] != event.funding_rate
+    ):
+        raise FundingPaymentMismatchError(
+            funding_payment_id=existing["id"],
+            source_type="funding_event",
+            source_namespace=event.venue_namespace,
+            source_id=event.venue_funding_id,
+            existing_journal_id=existing["journal_id"],
+            incoming_journal_id=journal_id,
+            existing_amount_usd=existing["amount_usd"],
+            incoming_amount_usd=event.amount_usd,
+            existing_direction=existing["direction"],
+            incoming_direction=event.direction,
+            existing_funding_rate=existing["funding_rate"],
+            incoming_funding_rate=event.funding_rate,
+        )
+
+
+def _insert_funding_payment(
+    conn, event: FundingEventRecord, *, journal_id: int,
+    asset_id_resolver: Callable[[str], int],
+    instrument_id_resolver: Callable[[str], int | None],
+) -> int:
+    """INSERT a fresh funding_payment row linked to journal_id.
+
+    Resolves asset_id from quote_asset_symbol and instrument_id from
+    instrument_code. The accounting.enforce_event_journal_link trigger
+    fires on INSERT and validates journal_type='funding', source_type/
+    namespace/id match, journal posted+not-voided, strategy_id consistency.
+    """
+    asset_id = asset_id_resolver(event.quote_asset_symbol)
+    instrument_id = instrument_id_resolver(event.instrument_code)
+    if instrument_id is None:
+        raise ValueError(
+            f"instrument_code {event.instrument_code!r} could not be resolved "
+            f"to an instrument_id"
+        )
+
+    # The 'amount' column on funding_payments is the absolute amount in
+    # the asset's natural units. For USD-denominated funding, amount and
+    # amount_usd both equal event.amount_usd.
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO accounting.funding_payments (
+                account_id, strategy_id, instrument_id, asset_id,
+                direction, amount, amount_usd, funding_rate,
+                position_size, source_type, source_namespace, source_id,
+                funded_at, journal_id
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'funding_event', %s, %s, %s, %s
+            )
+            RETURNING id
+            """,
+            (
+                event.account_id, event.strategy_id, instrument_id, asset_id,
+                event.direction, event.amount_usd, event.amount_usd,
+                event.funding_rate, event.position_size,
+                event.venue_namespace, event.venue_funding_id,
+                event.funded_at, journal_id,
+            ),
+        )
+        return cur.fetchone()[0]
+
+
+def write_and_post_funding_journal(
+    conn,
+    draft: JournalDraft,
+    event: FundingEventRecord,
+    *,
+    posted_by: str,
+    asset_id_resolver: Callable[[str], int],
+    instrument_id_resolver: Callable[[str], int | None],
+) -> tuple[int, int, bool]:
+    """Post a funding journal AND link a funding_payment row.
+
+    Returns: (journal_id, funding_payment_id, was_newly_created)
+      - was_newly_created=True only if BOTH the journal and the
+        funding_payment were freshly created in this call
+      - was_newly_created=False on any idempotent replay or partial-
+        recovery path (journal existed, payment didn't, etc.)
+
+    Raises:
+      - JournalSourceHashMismatchError if the journal exists with a
+        different source_hash (same identity, different content)
+      - FundingPaymentMismatchError if the funding_payment exists with
+        different journal_id / amount / direction / rate
+      - ValueError if the instrument_code cannot be resolved
+
+    Caller owns the transaction. On error, caller must rollback.
+    """
+    if not posted_by.strip():
+        raise ValueError("posted_by must be non-empty")
+
+    # Step 1: post the journal (or recognise existing).
+    journal_id, journal_was_new = write_and_post_journal(
+        conn, draft,
+        posted_by=posted_by,
+        asset_id_resolver=asset_id_resolver,
+        instrument_id_resolver=instrument_id_resolver,
+    )
+
+    # Step 2: check whether the funding_payment row already exists.
+    existing = _load_existing_funding_payment(conn, event)
+    if existing is not None:
+        # Replay or recovery path. Validate consistency.
+        _verify_funding_payment_match(existing, event, journal_id)
+        return journal_id, existing["id"], False
+
+    # Step 3: fresh INSERT — links the journal we just posted (or the
+    # one that already existed if this is a recovery path).
+    payment_id = _insert_funding_payment(
+        conn, event,
+        journal_id=journal_id,
+        asset_id_resolver=asset_id_resolver,
+        instrument_id_resolver=instrument_id_resolver,
+    )
+
+    return journal_id, payment_id, journal_was_new
