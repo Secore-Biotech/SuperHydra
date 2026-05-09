@@ -28,6 +28,22 @@ deliberate decision to either
 Do NOT silently lower the assertion threshold to make the test pass
 under a new cost model. Doing so would erase the structural finding
 this test is here to record.
+
+Carry-forward note (Day 17c pivot):
+    The original Day 17c hypothesis was that VIP5 calibration would
+    bring A1's threshold below the BTCUSDT cap, opening a yes-trade
+    window. The math falsified that hypothesis: even VIP9 institutional
+    fees leave the threshold ~5x above the cap because the slippage
+    component (2 * 1 bp = 2 bps) alone exceeds the 1 bp BTCUSDT cap.
+
+    A1 yes-trade evidence will need to come from one of:
+      (a) altcoin perps where funding spikes routinely reach 50+ bps
+          (DOGE, AVAX, SOL, etc.) and a calibrated alt slippage tier
+      (b) a research-only maker-rebate profile that explicitly models
+          passive-only execution with sub-bp slippage assumptions
+
+    Day 18+ will pursue one of these. BTCUSDT remains a no-trade
+    instrument for A1 across all currently-modeled cost profiles.
 """
 from __future__ import annotations
 
@@ -37,7 +53,11 @@ from pathlib import Path
 
 import pytest
 
-from core.config.cost_model import placeholder_v0
+from core.config.cost_model import (
+    binance_vip5_btc_v1,
+    binance_vip9_institutional_v1,
+    placeholder_v0,
+)
 
 
 # Binance BTCUSDT funding rate is structurally capped at 0.01% per 8h
@@ -164,4 +184,123 @@ def test_dec_2024_fixture_max_rate_below_placeholder_cost_threshold():
         f"the documented 0.01% Binance funding cap. This indicates the "
         f"venue has changed its cap, which invalidates the assumption "
         f"underlying the primary invariant test. Investigate."
+    )
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Day 17c — VIP5 calibration changes the economics
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _per_period_cost_rate_for(cost_model) -> Decimal:
+    """Same formula as the placeholder helper, parameterized over the
+    cost model. Replicates evaluate_signal's threshold computation so
+    the test asserts on the strategy's actual math, not a parallel
+    formula."""
+    fee_schedule = cost_model.fee_schedules[0]
+    slippage_tier = cost_model.slippage_tiers[0]
+    fees = Decimal("2") * fee_schedule.taker_bps
+    slip = Decimal("2") * slippage_tier.slippage_bps
+    borrow_per_period = (
+        cost_model.borrow_cost.daily_bps
+        / Decimal(BINANCE_FUNDING_INTERVALS_PER_DAY)
+    )
+    return fees + slip + borrow_per_period
+
+
+def test_btcusdt_funding_cap_below_vip5_cost_threshold():
+    """STRUCTURAL: VIP5 calibration does NOT make BTCUSDT tradeable.
+
+    The original Day 17c hypothesis was that VIP5 economics would bring
+    A1's per-interval threshold below the Binance BTCUSDT 0.0001
+    funding cap, opening a yes-trade window. The math falsified that:
+
+      threshold = 2 * 0.000270 (taker)
+                + 2 * 0.0001   (slippage)
+                + 0.0001 / 3   (borrow per interval)
+                = 0.000773     (~7.7 bps)
+
+      Binance BTCUSDT cap = 0.0001 (1 bp)
+
+    Even ignoring fees entirely, the 2 * slippage component alone
+    (0.0002) already exceeds the funding cap. So no Binance fee tier —
+    not even a maker rebate — can make BTCUSDT a yes-trade instrument
+    for A1 under the current cost model's slippage assumption.
+
+    A1 yes-trade evidence requires either:
+      - moving to altcoin perps (DOGE/AVAX/SOL/etc.) where funding
+        rates routinely exceed 50 bps in volatile regimes, or
+      - a separate research profile that models maker-only execution
+        at top-of-book with sub-bp slippage.
+
+    This test asserts the opposite of the original hypothesis. If a
+    future change lowers the VIP5 threshold below the cap (e.g. by
+    revising the slippage tier), this test fails — investigate
+    rather than relax."""
+    threshold = _per_period_cost_rate_for(binance_vip5_btc_v1())
+    assert threshold > BINANCE_BTCUSDT_FUNDING_CAP_PER_INTERVAL, (
+        f"VIP5 threshold ({threshold}) is no longer above Binance "
+        f"BTCUSDT's structural 0.01% funding cap "
+        f"({BINANCE_BTCUSDT_FUNDING_CAP_PER_INTERVAL}). The cost model "
+        f"or BTCUSDT cap may have changed. Investigate."
+    )
+
+
+def test_btcusdt_funding_cap_below_vip9_cost_threshold():
+    """STRUCTURAL: even institutional VIP9 calibration cannot make
+    BTCUSDT tradeable for A1. VIP9 threshold is ~5.4 bps; the BTCUSDT
+    cap is 1 bp. The 2 * slippage component alone is 2 bps.
+
+    This is the strongest version of the structural finding: A1 has
+    no edge on BTCUSDT regardless of fee tier. The dominant cost
+    component is slippage, not fees, and our slippage tier
+    (btc_eth_top_tier = 1 bp per leg) is already aggressive."""
+    threshold = _per_period_cost_rate_for(binance_vip9_institutional_v1())
+    assert threshold > BINANCE_BTCUSDT_FUNDING_CAP_PER_INTERVAL, (
+        f"VIP9 threshold ({threshold}) unexpectedly fell below Binance "
+        f"BTCUSDT's 0.01% funding cap "
+        f"({BINANCE_BTCUSDT_FUNDING_CAP_PER_INTERVAL}). If the cost "
+        f"model has been recalibrated to make BTCUSDT tradeable, this "
+        f"test should be rewritten to assert what the new economics "
+        f"actually deliver."
+    )
+
+
+def test_dec_2024_fixture_max_rate_below_vip5_threshold():
+    """CORROBORATING EVIDENCE: even the strongest historical BTCUSDT
+    funding window we have (Dec 2024, near peak euphoria) does not
+    deliver any single interval that clears the VIP5 cost threshold.
+
+    The fixture's max funding_rate is bounded above by the Binance
+    0.01% structural cap. The VIP5 threshold is ~7.7x the cap. So
+    no interval in the fixture clears the threshold. Real-data
+    confirmation that the inequality matters in practice, not just
+    in theory."""
+    fixture_path = (
+        Path(__file__).resolve().parents[4]
+        / "tests" / "fixtures" / "binance_funding"
+        / "BTCUSDT_14d_20241217T000000_20241231T000000.json"
+    )
+    if not fixture_path.exists():
+        pytest.skip(
+            f"Dec 2024 fixture not present at {fixture_path}; "
+            f"VIP5 corroboration test cannot run."
+        )
+
+    with fixture_path.open() as f:
+        payload = json.load(f)
+
+    rates = [Decimal(r["funding_rate"]) for r in payload["records"]]
+    assert rates, "fixture has no records"
+
+    max_rate = max(rates)
+    threshold = _per_period_cost_rate_for(binance_vip5_btc_v1())
+
+    assert max_rate < threshold, (
+        f"Dec 2024 BTCUSDT fixture's max funding_rate ({max_rate}) "
+        f"unexpectedly cleared the VIP5 threshold ({threshold}). "
+        f"This would mean BTCUSDT became a yes-trade instrument for "
+        f"A1 under VIP5 economics. If real, rewrite this test and "
+        f"the VIP5 structural test above. Investigate before relaxing."
     )
