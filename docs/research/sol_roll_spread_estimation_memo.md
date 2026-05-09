@@ -266,3 +266,163 @@ research profile (`binance_vip5_alt_research_v1`) remains research-
 only with Kaiko + Amberdata as its single evidence basis until either
 Day 19c (Roll on archive data) or Day 20+ (live A1 fills) provides
 a second independent calibration.
+
+
+## Results — Day 19c.3 archive execution (2026-05-09)
+
+The Day 19c archive backend (`BinanceArchiveTradeFetcher`, commit
+4c9a2bf) wired into the harness via `--source archive` (commit
+fd7e523) was exercised against both predefined regimes. The Day 19b
+TTL gap is closed: both regimes now produce real Roll-tape estimates.
+
+### Run 1: quiet regime (Jan 2025)
+
+```
+.venv/bin/python3 scripts/estimate_binance_roll_spread.py \
+    --symbol SOLUSDT --regime quiet --source archive \
+    --output artifacts/sol_quiet_jan2025_archive.json
+```
+
+| Window start (UTC) | n_trades | full_spread_bps | half_spread_bps |
+| --- | --- | --- | --- |
+| 2025-01-01 12:00 | 932 | 0.1512 | 0.0756 |
+| 2025-01-04 12:00 | 660 | 0.3254 | 0.1627 |
+| 2025-01-07 12:00 | 1238 | 0.2919 | 0.1460 |
+| 2025-01-10 12:00 | 770 | 0.1340 | 0.0670 |
+| 2025-01-13 12:00 | 2725 | 0.4802 | 0.2401 |
+
+Aggregate: 5 valid / 0 undefined / 0 skipped.
+
+| Metric | Full spread (bps) | Half spread (bps) |
+| --- | --- | --- |
+| Median | 0.292 | 0.146 |
+| Mean | 0.277 | 0.138 |
+| Min | 0.134 | 0.067 |
+| Max | 0.480 | 0.240 |
+
+### Run 2: volatile regime (Mar 2024)
+
+```
+.venv/bin/python3 scripts/estimate_binance_roll_spread.py \
+    --symbol SOLUSDT --regime volatile --source archive \
+    --output artifacts/sol_volatile_mar2024_archive.json
+```
+
+| Window start (UTC) | n_trades | full_spread_bps | half_spread_bps | undefined? |
+| --- | --- | --- | --- | --- |
+| 2024-03-01 12:00 | 7951 | 0.3493 | 0.1746 | — |
+| 2024-03-04 12:00 | 5012 | — | — | non_negative_autocovariance |
+| 2024-03-07 12:00 | 12443 | 0.4170 | 0.2085 | — |
+| 2024-03-10 12:00 | 1699 | — | — | non_negative_autocovariance |
+| 2024-03-13 12:00 | 3180 | — | — | non_negative_autocovariance |
+
+Aggregate: 2 valid / 3 undefined / 0 skipped.
+
+| Metric | Full spread (bps) | Half spread (bps) |
+| --- | --- | --- |
+| Median | 0.383 | 0.192 |
+| Mean | 0.383 | 0.192 |
+| Min | 0.349 | 0.175 |
+| Max | 0.417 | 0.209 |
+
+### Interpretation against Day 19a 1 bp/leg calibration
+
+Per the interpretation guide above, Day 19a's research-calibrated
+1 bp/leg = 2 bps full spread. Both regimes produce median full
+spreads materially below 2 bps:
+
+| Regime | Median full spread | Vs. Day 19a (2 bps full) | Band |
+| --- | --- | --- | --- |
+| Quiet (Jan 2025) | 0.292 bps | ~7x tighter | "0.5-2 bps → corroborates" (in fact tighter) |
+| Volatile (Mar 2024) | 0.383 bps | ~5x tighter | "0.5-2 bps → corroborates" (in fact tighter) |
+
+**Day 19a's 1 bp/leg research calibration is corroborated as
+conservative by Roll-tape estimates in both regimes.** Empirical
+spreads measured directly off the tape are several multiples tighter
+than the research profile assumes, in both quiet and volatile
+periods. This INCREASES confidence in the research profile but does
+NOT promote it; the promotion gate remains live A1 fills (Day 20+).
+
+### Two findings worth recording
+
+**Finding 1: 3 of 5 volatile windows return undefined estimates.**
+Roll's autocovariance estimator is signal-saturated by directional
+flow. The three undefined windows (2024-03-04, 2024-03-10,
+2024-03-13) all have positive autocovariance of price changes,
+which Roll's bid-ask-bounce assumption cannot accommodate. This is
+honest behavior from the estimator (it correctly says "I cannot
+measure spread under these conditions"), but it means tape-based
+spread estimation in volatile regimes is methodologically harder
+than in quiet regimes. The two valid volatile estimates (0.349 and
+0.417 bps full) are tightly clustered around 0.38 bps, but a sample
+of 2 is not statistical evidence. A side-aware estimator
+(Lee-Ready, Glosten-Harris) using `is_buyer_maker` would likely
+produce defined estimates in those three windows; this is queued as
+future research-extension work.
+
+**Finding 2: Quiet regime spreads are tight even on a 5-minute
+window.** SOLUSDT in Jan 2025 had median 0.29 bps full spread = 0.15
+bps half-spread per side. That is at the low end of what serious
+crypto market makers report as their realized cost-to-cross — which
+agrees with Day 19a's third-party data (Amberdata Jan 2026 reading
+of 0.79 bps Binance SOLUSDT was already low; tape-direct is even
+lower because it captures actual transaction prices rather than
+quoted spreads).
+
+### Why this still doesn't promote the research profile
+
+Three reasons remain:
+
+1. **Sample size.** 7 valid Roll estimates total across both regimes
+   (5 quiet + 2 volatile). Even with both regimes corroborating, this
+   is research-grade evidence, not governance-grade calibration.
+
+2. **A1-specific clip-size impact not captured.** Roll's estimator
+   reports market-wide spread experienced by all participants. A1
+   crosses with its own clip size; venue-specific impact and
+   cancellation behavior under A1's actual order sizes are absent
+   from the tape estimate.
+
+3. **Live-fill gate unchanged.** The reviewer-locked promotion path
+   for `binance_vip5_alt_research_v1` → `..._empirical_v1` requires
+   live A1 paper fills with adverse-fill cost recorded per fill (Day
+   20+). Tape-based research is one step closer than third-party
+   spread data; live fills are the actual promotion criterion. Roll
+   estimates corroborate but do not substitute.
+
+### Day 19 sub-arc complete
+
+| Day | Deliverable | Outcome |
+| --- | --- | --- |
+| 19a | Research-calibrated alt profile + selector firewall | 1 bp/leg from Kaiko + Amberdata |
+| 19b.1-19b.3 | aggTrades fetcher + Roll estimator + harness | Infrastructure built, REST-only TTL discovered |
+| 19c.1+19c.2 | Archive fetcher (data.binance.vision) + 22 unit tests | Deep history accessible |
+| 19c.3 | Harness `--source archive` flag | Archive backend wired |
+| 19c.3 results (this section) | Roll-tape estimates in both regimes | Day 19a corroborated as conservative |
+
+Three independent calibrations of SOL slippage now exist, all
+agreeing the cost is small:
+
+| Source | Estimate (per leg) |
+| --- | --- |
+| Day 18a placeholder (governance) | 3 bps |
+| Day 19a (Kaiko + Amberdata, research-only) | 1 bp |
+| Day 19c.3 (Roll-tape median, research-only) | 0.15-0.19 bps |
+
+The research-only profile remains research-only. The next step is
+Day 20+ live A1 paper-fill recording infrastructure to produce the
+empirical-calibration estimate that gates promotion.
+
+### Note on harness fix
+
+The first `--source archive` invocation on 2026-05-09 raised
+`TypeError: BinanceArchiveTradeFetcher.fetch_window() got an
+unexpected keyword argument 'limit'`. The harness was originally
+written in Day 19b.3 to call `fetch_window` with REST-specific
+pagination kwargs (`limit=1000, max_pages=200`); the archive fetcher
+streams the whole monthly CSV and has no pagination concept.
+Fixed by removing the kwargs from the harness call site (both
+fetchers' defaults are appropriate for 5-minute windows). Fix
+included in the same commit as this results section per reviewer's
+"memo update only unless code bug exposed" amendment — bug exposed,
+fix landed.

@@ -180,10 +180,7 @@ def main() -> int:
         we = ws + window_delta
         print(f"\n[{i+1}/{len(windows)}] {ws.isoformat()} → {we.isoformat()}")
         try:
-            trades = fetcher.fetch_window(
-                args.symbol, ws, we,
-                limit=1000, max_pages=200,
-            )
+            trades = fetcher.fetch_window(args.symbol, ws, we)
         except (TransientFetcherError, PermanentFetcherError) as e:
             print(f"  fetch failed: {e}")
             per_window.append(_serialize_skipped(ws, 0, f"fetch_failed: {e}"))
