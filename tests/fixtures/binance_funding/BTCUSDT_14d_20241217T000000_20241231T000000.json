@@ -1,0 +1,438 @@
+{
+  "end_utc": "2024-12-31T00:00:00+00:00",
+  "n_records": 43,
+  "records": [
+    {
+      "funding_rate": "0.00007866",
+      "funding_time": "2024-12-17T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "106023.30000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-17T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "106789.01585106",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-17T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "106438.49711348",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-18T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "106083.97803546",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00009159",
+      "funding_time": "2024-12-18T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "104203.79516312",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-18T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "104395.10000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-19T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "100180.74653901",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-19T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "101625.15913475",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-19T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "100657.71907801",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-20T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97434.40000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-20T08:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97822.91234043",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-20T16:00:00.014000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "96968.45573050",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-21T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97764.50000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00001206",
+      "funding_time": "2024-12-21T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "98985.40130496",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-21T16:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97486.50000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-22T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97261.80000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-22T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "96182.08468085",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00009629",
+      "funding_time": "2024-12-22T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95340.90000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-23T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95155.89321986",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-23T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95360.40000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00008981",
+      "funding_time": "2024-12-23T16:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "93217.60000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-24T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94861.10000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-24T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94199.90000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-24T16:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "98246.90943972",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-25T00:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "98633.62231915",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-25T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "98052.36726950",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-25T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "98485.70000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00009827",
+      "funding_time": "2024-12-26T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "99379.60000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00007453",
+      "funding_time": "2024-12-26T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "97682.41824113",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00008585",
+      "funding_time": "2024-12-26T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "96006.00000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-27T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95754.23556738",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-27T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95074.97113475",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-27T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94529.41337589",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-28T00:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94263.83920567",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00007639",
+      "funding_time": "2024-12-28T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94339.82516312",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00005173",
+      "funding_time": "2024-12-28T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94407.80000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00008013",
+      "funding_time": "2024-12-29T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95262.82075887",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-29T08:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "95233.30000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-29T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "94468.77931206",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "-4.2E-7",
+      "funding_time": "2024-12-30T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "93699.90000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00008791",
+      "funding_time": "2024-12-30T08:00:00.001000+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "93700.13509929",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-30T16:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "92087.24777305",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00010000",
+      "funding_time": "2024-12-31T00:00:00+00:00",
+      "ingested_at": "2026-05-09T12:45:15.108152+00:00",
+      "instrument": "BTCUSDT",
+      "mark_price": "92760.38528369",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    }
+  ],
+  "start_utc": "2024-12-17T00:00:00+00:00",
+  "symbol": "BTCUSDT"
+}
