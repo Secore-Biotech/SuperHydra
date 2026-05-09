@@ -151,3 +151,118 @@ the result itself does not depend on wall-clock time of run.
 | Lee, C. and Ready, M. (1991) | "Inferring Trade Direction from Intraday Data." Journal of Finance, 46(2), 733-746. |
 | Glosten, L. and Harris, L. (1988) | "Estimating the components of the bid/ask spread." Journal of Financial Economics, 21(1), 123-142. |
 | Day 19a memo | docs/research/sol_slippage_calibration_memo.md |
+
+
+## Results — Day 19b execution attempt (2026-05-09)
+
+### Run 1: quiet regime (Jan 2025)
+
+```
+python3 scripts/estimate_binance_roll_spread.py \
+    --symbol SOLUSDT --regime quiet --output artifacts/sol_quiet_jan2025.json
+```
+
+**Result: 0 trades returned across all 5 windows.** Aggregate JSON:
+
+```json
+{
+  "n_windows_total": 5,
+  "n_windows_valid": 0,
+  "n_windows_undefined": 0,
+  "n_windows_skipped": 5
+}
+```
+
+Every window was skipped with reason `too_few_trades_for_estimator`
+because the venue returned zero records.
+
+### Diagnostic: direct REST probe
+
+To rule out a fetcher bug, the same URL pattern was issued via raw
+stdlib `urllib`, bypassing `BinanceTradeFetcher`:
+
+```
+GET https://fapi.binance.com/fapi/v1/aggTrades
+    ?symbol=SOLUSDT&startTime=1735732800000&endTime=1735736400000&limit=5
+```
+
+This is `2025-01-01T12:00:00Z` to `2025-01-01T13:00:00Z`, expanded
+to a 1-hour window. The endpoint returned `[]` — zero records.
+
+A second probe against a recent window (`now - 2h` for 5 minutes)
+returned 5 records cleanly with realistic prices and timestamps.
+
+### Finding
+
+**Binance `/fapi/v1/aggTrades` REST endpoint is operationally
+recent-history only.** The TTL is not documented in the public API
+reference but is consistently observed: any window more than a few
+weeks back returns empty arrays without erroring. This makes the
+endpoint unsuitable for deep historical microstructure
+reconstruction.
+
+The fetcher infrastructure (`BinanceTradeFetcher`) is correct and
+works as designed for recent windows. The estimator
+(`estimate_roll`) is correct and tested. The harness
+(`estimate_binance_roll_spread.py`) wires them together correctly.
+The gap is venue data-availability, not implementation.
+
+### What this changes for the calibration question
+
+The Day 19b plan was to compare Roll-tape estimates from Mar 2024
+(volatile, the regime A1 most wants to trade in) and Jan 2025
+(quiet) against Day 19a's 1 bp/leg research calibration. The
+volatile regime is exactly the calibration target where execution
+costs matter most, because it's the regime that delivers the funding
+A1 would harvest. Recent-only data does not address this question:
+recent SOL liquidity may be quite different from March 2024 SOL
+liquidity (different trader base, different volatility regime,
+different market-making capital).
+
+### Honest research stance
+
+Three options were considered:
+
+1. **Reframe to recent-window estimation.** Quick and produces
+   numbers, but the numbers are not comparable to the actually-
+   interesting volatile regime calibration. **Rejected.**
+2. **Document the finding and stop.** The TTL discovery is itself
+   a valuable research result. Day 19b's infrastructure is correct
+   and reusable; the historical-data ingestion is identified as
+   a separate sub-arc. **Adopted.**
+3. **Implement Binance Vision archive ingestion now.** Significant
+   new work (S3-style fetcher, gzip/zip decompression, monthly file
+   parsing). Deferred to Day 19c.
+
+This is the same discipline applied to Day 17c (BTCUSDT structurally
+untradeable) and Day 18b (SOL slippage-bound under conservative
+calibration): falsified hypotheses become tested findings, not
+manufactured passes.
+
+### Day 19c plan
+
+Add `data/ingestion/vendors/binance/archive_trade_fetcher.py` that
+ingests from `data.binance.vision` monthly trade archives:
+
+- Fetch `https://data.binance.vision/data/futures/um/monthly/aggTrades/SOLUSDT/SOLUSDT-aggTrades-YYYY-MM.zip`
+- Decompress without loading the full archive into memory (stream
+  through `zipfile.ZipFile` + `csv.reader`)
+- Normalize each row into the canonical `BinanceTrade` dataclass
+- Optional local cache to avoid re-downloading the same month
+- Validate row count and date range against archive metadata
+
+Once Day 19c lands, this harness can be re-run with the predefined
+`quiet` and `volatile` regimes producing meaningful estimates, and
+the comparison-to-Day-19a question can finally be answered.
+
+### Status of the Roll-tape estimate
+
+**Not produced.** Day 19b sub-arc closed at "infrastructure complete,
+historical-data gap identified." Day 19c will produce the actual
+estimate.
+
+The reviewer-locked discipline holds: no fake numbers committed; the
+research profile (`binance_vip5_alt_research_v1`) remains research-
+only with Kaiko + Amberdata as its single evidence basis until either
+Day 19c (Roll on archive data) or Day 20+ (live A1 fills) provides
+a second independent calibration.

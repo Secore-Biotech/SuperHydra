@@ -50,6 +50,22 @@ from data.ingestion.vendors.binance.trade_fetcher import (
 
 # Predefined regime windows: 5 windows of 5 minutes each, distributed
 # every 3 days through a 14-day fixture window, at 12:00 UTC.
+#
+# WARNING (Day 19b finding, 2026-05-09):
+#   Binance /fapi/v1/aggTrades REST endpoint serves recent history only.
+#   The 'quiet' (Jan 2025) and 'volatile' (Mar 2024) regimes BELOW are
+#   operationally inaccessible via this endpoint — both return zero
+#   trades. To use these windows, ingest from data.binance.vision
+#   monthly archives instead (Day 19c deliverable:
+#   data/ingestion/vendors/binance/archive_trade_fetcher.py). The REST
+#   fetcher in trade_fetcher.py works correctly for recent windows; it
+#   is the venue's data-availability boundary that excludes deep
+#   history, not a fetcher bug.
+#
+#   Until Day 19c lands, --regime quiet and --regime volatile will
+#   produce empty artifacts. Use --regime custom with recent
+#   timestamps for any meaningful Roll estimation today.
+#
 PREDEFINED_REGIMES = {
     "quiet": [
         datetime(2025, 1, 1,  12, 0, tzinfo=timezone.utc),
