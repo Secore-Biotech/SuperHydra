@@ -74,14 +74,11 @@ def test_compute_sharpe_over_backfill_30_intervals(fresh_db):
     assert Decimal("130") < total_funding < Decimal("160"), (
         f"total funding {total_funding} out of expected band"
     )
-    # Note: total_fees is 0 in this test even though fees were paid.
-    # Day 16a's submit_callback uses datetime.now(UTC) for fill_ts, not
-    # the synthetic backfill clock, so fills are timestamped at wall-clock
-    # time and fall outside the synthetic 2026-01 window. This is a
-    # Day 16a hardening concern (the backfill should be temporally
-    # self-consistent), not a Day 16c blocker. Sharpe computation works
-    # correctly with fee_pnl=0; the math is unaffected.
-    assert total_fees == Decimal("0") or total_fees < Decimal("0")
+    # Two legs at $0.50 each = $1 total fee.
+    # (Day 16d.2 fixed the synthetic harness so fill_ts uses the logical
+    # clock; fees now land in the synthetic-window bucket and the strict
+    # equality holds.)
+    assert total_fees == Decimal("-1.00") or total_fees == Decimal("-1")
 
     # Mark P&L is 0 for all intervals (Day 16c does not reconstruct boundary marks).
     for ir in intervals:

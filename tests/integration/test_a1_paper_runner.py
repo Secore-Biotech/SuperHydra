@@ -102,6 +102,13 @@ def _make_current_position_source(conn, ctx, instrument_id_by_code) -> Callable:
         if instrument_id is None:
             return Decimal("0")
         with conn.cursor() as cur:
+            # Filter by created_by='paper_runner' to ignore the bootstrap
+            # NAV snapshot that _setup_basic_0009 creates at wall-clock time.
+            # Without this filter, mixing a synthetic-time runner with a
+            # wall-clock-time bootstrap would cause the runner to read the
+            # bootstrap snapshot (which is timestamped "now" and thus newer
+            # than synthetic snapshots) and conclude the position is flat
+            # when it isn't.
             cur.execute(
                 """
                 SELECT quantity
@@ -110,6 +117,8 @@ def _make_current_position_source(conn, ctx, instrument_id_by_code) -> Callable:
                   AND strategy_id = %s
                   AND account_id = %s
                   AND instrument_id = %s
+                  AND created_by = 'paper_runner'
+                  AND computation_version = 'a1.runner.v0'
                 ORDER BY snapshot_at DESC
                 LIMIT 1
                 """,
@@ -133,6 +142,7 @@ def _make_submit_callback(
     instrument_id_resolver,
     perp_fill_price: Decimal,
     spot_fill_price: Decimal,
+    fill_ts_source: Callable[[], "datetime"] | None = None,
 ) -> Callable[[OrderIntent], None]:
     """Build a submit_callback closure that drives the full accounted path:
     submit_intent_through_oms → journals per fill → reconcile_fill →
@@ -142,7 +152,9 @@ def _make_submit_callback(
     a fully-accounted state.
     """
     def _submit(intent: OrderIntent) -> None:
-        fill_ts = datetime.now(UTC)
+        # If a fill_ts_source is injected (e.g. by a backfill harness using
+        # a logical clock), use it; otherwise use wall-clock time.
+        fill_ts = fill_ts_source() if fill_ts_source is not None else datetime.now(UTC)
 
         # ─── Steps 2-7 via helper ──────────────────────────────────────
         sub: SubmissionResult = submit_intent_through_oms(

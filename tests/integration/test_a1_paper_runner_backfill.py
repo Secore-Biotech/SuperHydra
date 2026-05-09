@@ -231,6 +231,7 @@ def test_a1_paper_runner_backfill_30_intervals(fresh_db):
             instrument_id_resolver=instrument_id_resolver,
             perp_fill_price=SYNTHETIC_MARK,
             spot_fill_price=SYNTHETIC_MARK,
+            fill_ts_source=clock_for_tick,
         )
         current_position_source = _make_current_position_source(
             conn, ctx, instrument_id_by_code,
@@ -414,6 +415,8 @@ def test_a1_paper_runner_backfill_30_intervals(fresh_db):
               AND strategy_id = %s
               AND account_id = %s
               AND instrument_id = %s
+              AND created_by = 'paper_runner'
+              AND computation_version = 'a1.runner.v0'
             ORDER BY snapshot_at DESC
             LIMIT 1
             """,
