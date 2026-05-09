@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from core.config.cost_model import (
+    binance_vip5_alt_research_v1,
     binance_vip5_alt_v1,
     binance_vip5_btc_v1,
 )
@@ -158,3 +159,48 @@ class TestBinanceSolUsdt:
         for venue in ("binance", "BINANCE", "Binance"):
             result = select_profile_for_a1("SOLUSDT", venue)
             assert result.profile_name == "binance_vip5_alt_v1"
+
+
+
+# ─── Day 19a: research-profile firewall ──────────────────────────────────
+
+
+class TestResearchProfileFirewall:
+    """Day 19a added binance_vip5_alt_research_v1 — a research-calibrated
+    profile based on third-party spread data, NOT validated by tape
+    or live A1 fills. The selector deliberately does NOT return the
+    research profile; using it requires calling it directly by name.
+
+    These tests enforce that firewall: any path through select_profile_for_a1
+    must return the conservative binance_vip5_alt_v1, never the research
+    variant. If a future change extends the selector to return the
+    research profile (e.g. as a default), these tests fail and force
+    a deliberate decision about whether the research profile has been
+    empirically validated."""
+
+    def test_solusdt_does_not_return_research_profile(self):
+        result = select_profile_for_a1("SOLUSDT", "binance")
+        assert result.profile_name == "binance_vip5_alt_v1", (
+            f"SOLUSDT must return alt_v1 (conservative); got "
+            f"{result.profile_name}. The research profile is "
+            f"available only via direct call."
+        )
+        assert result.profile_name != "binance_vip5_alt_research_v1"
+
+    def test_research_profile_only_reachable_by_direct_call(self):
+        """The research profile is ONLY reachable by importing and
+        calling it directly. No (instrument, venue) input to the
+        selector returns it."""
+        # Try several plausible inputs; none should yield the research profile.
+        for instrument in ("SOLUSDT", "BTCUSDT", "ETHUSDT"):
+            for venue in ("binance", "BINANCE"):
+                result = select_profile_for_a1(instrument, venue)
+                assert result.profile_name != "binance_vip5_alt_research_v1", (
+                    f"select_profile_for_a1({instrument!r}, {venue!r}) "
+                    f"returned research profile; firewall breached."
+                )
+
+    def test_research_profile_directly_callable(self):
+        """Direct call works (and produces the documented profile)."""
+        cm = binance_vip5_alt_research_v1()
+        assert cm.profile_name == "binance_vip5_alt_research_v1"

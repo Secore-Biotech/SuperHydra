@@ -509,3 +509,110 @@ def binance_vip5_alt_v1() -> CostModelConfig:
             ),
         ),
     )
+
+
+
+def binance_vip5_alt_research_v1() -> CostModelConfig:
+    """RESEARCH-CALIBRATED PROFILE — NOT FOR GOVERNANCE USE.
+
+    Day 19a addition. Lowers the alt slippage assumption from 3 bps per
+    leg (binance_vip5_alt_v1) to 1 bp per leg, based on published
+    market-microstructure observations of liquid altcoin perp spreads
+    on Binance. This profile is intentionally NOT returned by
+    select_profile_for_a1; using it requires calling it directly,
+    which forces an explicit decision rather than silent promotion.
+
+    Evidence basis (see docs/research/sol_slippage_calibration_memo.md
+    for full memo):
+      - Kaiko cheatsheet for bid-ask spreads (Q1 2024): SOL-USDT pair
+        on Binance had widest IQR and most outliers among major pairs,
+        though Binance was tightest among venues for SOL.
+      - Amberdata Digital Asset Snapshot (January 2026): SOL average
+        spread 1.01 bps across venues, Binance SOLUSDT tightest at
+        0.79 bps. BTC: 0.09 bps; ETH: 0.10 bps. SOL is ~10x BTC/ETH.
+
+    Per-leg slippage at 1 bp models:
+      - Half-spread (~0.4 bps for taker) +
+      - Modest impact for small-clip ($1.5k-$3k) sizes +
+      - Adverse-selection cushion
+
+    Threshold:
+      2 * 0.000270 (taker) + 2 * 0.0001 (slip) + 0.0001/3 (borrow)
+      = 0.000540 + 0.0002 + 0.0000333
+      = 0.000773 (~7.7 bps per interval)
+
+    This threshold matches binance_vip5_btc_v1 exactly (same fees,
+    same per-leg slippage). The economic claim is "SOL liquidity at
+    A1 clip size is comparable to BTC liquidity at A1 clip size" —
+    a defensible claim from spreads data but NOT yet validated by
+    real fills on the venue.
+
+    Why "research" not "empirical":
+      - The 1 bp number comes from third-party aggregated spread data,
+        not A1's own fill records.
+      - Spread alone does not equal effective adverse fill cost;
+        impact and adverse selection from informed flow matter too.
+      - The clip size ($1.5k-$3k for a 0.01-BTC-equivalent SOL hedge)
+        is small enough that impact is plausibly negligible, but
+        unverified at the venue level.
+      - Spread observations vary by regime; Q1 2024 / Jan 2026 data
+        may not generalize to volatile periods (March 2024 memecoin
+        frenzy, etc.).
+
+    What promotes this to binance_vip5_alt_empirical_v1 in a future
+    Day:
+      - Tape-based effective-spread estimation across volatile and
+        quiet regimes
+      - Live A1 paper fills on the venue
+      - Both consistent with ~1 bp per leg before promoting
+
+    Until then: this profile may be used for research backtests and
+    sensitivity analysis, but its threshold should NOT serve as the
+    A1-P0-to-P1 gate evidence.
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                # Same VIP5 USDM-Futures fees with 10% BNB discount
+                # as binance_vip5_btc_v1 / binance_vip5_alt_v1.
+                maker_bps=Decimal("0.000108"),
+                taker_bps=Decimal("0.000270"),
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="liquid_alt_research_tier",
+                slippage_bps=Decimal("0.0001"),  # 1 bp per leg
+            ),
+        ),
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day floor
+        ),
+        notes=(
+            "RESEARCH-ONLY profile. Slippage 1 bp/leg from third-party "
+            "spread data (Kaiko + Amberdata). NOT for governance use; "
+            "promotion to binance_vip5_alt_empirical_v1 requires tape "
+            "or live-fill validation. See docs/research/"
+            "sol_slippage_calibration_memo.md."
+        ),
+        profile_name="binance_vip5_alt_research_v1",
+        source=ProfileSource(
+            source_url="https://research.kaiko.com/insights/a-cheatsheet-for-bid-ask-spreads",
+            source_as_of="2026-05-09",
+            notes=(
+                "Slippage tier 1 bp/leg derived from Kaiko Q1 2024 "
+                "spread cheatsheet (SOL-USDT on Binance) and Amberdata "
+                "Jan 2026 snapshot (Binance SOLUSDT tightest at 0.79 "
+                "bps; SOL ~10x BTC/ETH). Research-calibrated; awaiting "
+                "tape and live-fill validation. Fees identical to "
+                "binance_vip5_alt_v1 (Binance does not differentiate "
+                "USDM-Futures fees by instrument class)."
+            ),
+        ),
+    )

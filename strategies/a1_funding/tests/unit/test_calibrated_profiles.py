@@ -23,6 +23,7 @@ import pytest
 
 from core.config.cost_model import (
     binance_vip0_retail_v1,
+    binance_vip5_alt_research_v1,
     binance_vip5_alt_v1,
     binance_vip5_btc_v1,
     binance_vip9_institutional_v1,
@@ -277,3 +278,67 @@ class TestAltProfile:
         assert cm.source is not None
         assert cm.source.source_url.startswith("https://")
         assert cm.source.source_as_of == "2026-05-09"
+
+
+
+# ─── Day 19a: research-calibrated alt profile ───────────────────────────
+
+
+class TestAltResearchProfile:
+    def test_research_profile_threshold_matches_btc_threshold(self):
+        """The research profile drops alt slippage to 1 bp/leg, matching
+        BTC. Same fees + same slippage = same threshold (~7.7 bps).
+        Economic claim: SOL liquidity at A1 clip size is comparable to
+        BTC liquidity at A1 clip size, validated by Kaiko + Amberdata
+        spread observations."""
+        research = _per_period_cost_rate(binance_vip5_alt_research_v1())
+        btc = _per_period_cost_rate(binance_vip5_btc_v1())
+        assert research == btc, (
+            f"research threshold ({research}) should equal BTC ({btc})"
+        )
+
+    def test_research_profile_threshold_below_alt_v1_threshold(self):
+        """Research lowers slippage from 3 bps to 1 bp; threshold drops
+        from ~11.7 bps to ~7.7 bps."""
+        research = _per_period_cost_rate(binance_vip5_alt_research_v1())
+        alt_v1 = _per_period_cost_rate(binance_vip5_alt_v1())
+        assert research < alt_v1, (
+            f"research ({research}) should be < alt_v1 ({alt_v1})"
+        )
+
+    def test_research_profile_distinct_hash_from_alt_v1(self):
+        """Different slippage tier + different profile_name + different
+        source = different content_hash. Lineage stays clean even
+        though fees match."""
+        assert (
+            binance_vip5_alt_research_v1().content_hash
+            != binance_vip5_alt_v1().content_hash
+        )
+
+    def test_research_profile_distinct_hash_from_btc_v1(self):
+        """Same threshold as BTC but distinct hash via profile_name +
+        slippage_tier_name (liquid_alt_research_tier vs btc_eth_top_tier)."""
+        assert (
+            binance_vip5_alt_research_v1().content_hash
+            != binance_vip5_btc_v1().content_hash
+        )
+
+    def test_research_profile_has_research_status_in_notes(self):
+        """The profile-level notes and source.notes must explicitly
+        mark the profile as research-only. This is the textual
+        firewall against governance use."""
+        cm = binance_vip5_alt_research_v1()
+        assert cm.notes is not None
+        assert "RESEARCH-ONLY" in cm.notes or "research" in cm.notes.lower()
+        assert cm.source is not None
+        assert "research" in cm.source.notes.lower()
+
+    def test_research_profile_uses_research_tier_name(self):
+        """Slippage tier name must contain 'research' so anyone reading
+        a serialized config can see at a glance that the slippage
+        assumption is unvalidated."""
+        cm = binance_vip5_alt_research_v1()
+        tier_names = [t.tier_name for t in cm.slippage_tiers]
+        assert tier_names == ["liquid_alt_research_tier"], (
+            f"research profile slippage tiers wrong: {tier_names}"
+        )
