@@ -60,6 +60,7 @@ from execution.ledger.fill_journal_writer import (
     build_funding_journal,
     write_and_post_funding_journal,
 )
+from core.config.cost_model import binance_vip5_alt_v1
 from strategies.a1_funding.config.profile_selector import (
     select_profile_for_a1,
 )
@@ -524,6 +525,268 @@ def _load_fixture_dec_2024() -> tuple[list[FundingRate], dict]:
             f"Dec 2024 fixture not present at {fixture_path}; "
             f"run scripts/refresh_binance_funding_fixture.py "
             f"--days 14 --end-utc 2024-12-31T00:00:00Z to regenerate."
+        )
+
+    with fixture_path.open() as f:
+        payload = json.load(f)
+
+    records = []
+    for r in payload["records"]:
+        records.append(FundingRate(
+            venue=r["venue"],
+            instrument=r["instrument"],
+            funding_time=datetime.fromisoformat(r["funding_time"]),
+            funding_rate=Decimal(r["funding_rate"]),
+            mark_price=Decimal(r["mark_price"]) if r["mark_price"] else None,
+            next_funding_time=(
+                datetime.fromisoformat(r["next_funding_time"])
+                if r["next_funding_time"] else None
+            ),
+            ingested_at=(
+                datetime.fromisoformat(r["ingested_at"])
+                if r["ingested_at"] else None
+            ),
+            schema_version=r["schema_version"],
+        ))
+    return records, payload
+
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Day 18b — SOL March 2024 strong-funding regime, no-trade under alt profile
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The Day 18 hypothesis was that SOLUSDT under binance_vip5_alt_v1
+# (threshold ~11.7 bps) would be tradeable in strong positive-funding
+# regimes. Real-data probes:
+#
+#   Jan 2025 (deleted, no commit): mean 0.14 bps, peaked at 1 bp.
+#                                   Quiet regime. No edge.
+#   Mar 2024 (committed):           mean 6 bps, 100% positive intervals,
+#                                   max single-interval 11.93 bps,
+#                                   rolling-12 mean tops at 7.69 bps.
+#                                   Strong regime, but rolling forecast
+#                                   never clears the 11.7 bps threshold.
+#
+# The honest finding: A1 currently has no edge on SOLUSDT either,
+# because the 3 bps/leg slippage assumption + 1σ discount eat the
+# realized signal. This isn't a "no edge exists" finding — strong
+# funding clearly exists in Mar 2024 — it's a "current calibration
+# can't capture it" finding. Different conclusion from BTCUSDT.
+#
+# Day 19 will calibrate SOL slippage empirically. If realistic SOL
+# slippage is 1 bp per leg (matching BTC top-of-book), alt threshold
+# drops to ~5.7 bps and March 2024-class regimes become tradeable.
+# At that point this test will need to be reframed or split.
+
+
+def test_a1_paper_runner_sol_mar_2024_under_vip5_alt_stays_flat(fresh_db):
+    """Day 18b: real-data no-trade evidence on a strong positive-funding
+    SOL window under binance_vip5_alt_v1.
+
+    SOLUSDT March 2024 funding statistics:
+      mean rate                   ≈ 6 bps per interval (positive)
+      positive intervals          43 of 43 (100%)
+      max single-interval rate    ≈ 11.93 bps
+      rolling-12 mean (max)       ≈ 7.69 bps
+
+    binance_vip5_alt_v1 threshold ≈ 11.7 bps per interval.
+
+    The engine's rolling-12 forecast (after 1σ discount) never clears
+    the threshold. Engine produces signal_flat on every tick. Tripwire
+    callbacks make "no trade" a hard contract.
+
+    This test commits the structural finding: even SOL in a strong-
+    funding regime is currently untradeable for A1, because the alt
+    slippage calibration (3 bps per leg) + forecast discount keep the
+    threshold above the realized rolling forecast. The fixture is
+    retained as a research artifact for Day 19 (empirical SOL slippage
+    calibration). Once that calibration lands, this test will be
+    reframed or split.
+
+    Acceptance:
+      - 30 ticks, all signal_flat
+      - submit_callback never fires (tripwire)
+      - funding_event_callback never fires (tripwire)
+      - 0 order_intents / orders / fills / journals / funding_payments
+      - 0 runner-authoritative position_snapshots
+    """
+    fixture_rates, _ = _load_fixture_sol_mar_2024()
+    assert len(fixture_rates) >= 30, (
+        f"Mar 2024 SOL fixture has {len(fixture_rates)} records; need >= 30"
+    )
+
+    PRIOR = fixture_rates[:12]
+    BACKFILL = fixture_rates[12:42]
+    assert len(BACKFILL) == 30
+
+    INTERVAL = timedelta(hours=8)
+    BACKFILL_START = BACKFILL[0].funding_time
+
+    # Sanity: confirm we have the strong-funding regime this test assumes.
+    mean_rate = (
+        sum(r.funding_rate for r in fixture_rates)
+        / Decimal(len(fixture_rates))
+    )
+    assert mean_rate > Decimal("0.0003"), (
+        f"Mar 2024 SOL fixture mean rate {mean_rate} unexpectedly weak; "
+        f"this test assumes the strong-funding probe artifact (mean ~6 bps)."
+    )
+
+    # ─── DB fixtures ────────────────────────────────────────────────────
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        spot_instrument_id = _create_btc_spot_instrument(cur, ctx)
+        cur.execute(
+            "SELECT instrument_code FROM registry.instruments WHERE id = %s",
+            (ctx["instrument_id"],),
+        )
+        perp_instrument_code = cur.fetchone()[0]
+        conn.commit()
+
+    # The harness still uses the BTCUSDT instrument code in the DB
+    # (the test scaffolding is BTC-specific in _setup_basic_0009);
+    # what matters for the no-trade assertion is the cost model, not
+    # the instrument identity. We pass binance_vip5_alt_v1 explicitly.
+    sizing_config = _sizing_for_btcusdt(perp_instrument_code, "BTCUSDT-SPOT")
+    cost_model = binance_vip5_alt_v1()
+    assert cost_model.profile_name == "binance_vip5_alt_v1"
+
+    instrument_id_by_code = {
+        perp_instrument_code: ctx["instrument_id"],
+        "BTCUSDT-SPOT": spot_instrument_id,
+    }
+
+    current_idx = [0]
+
+    def clock_for_tick():
+        return BACKFILL_START + INTERVAL * current_idx[0]
+
+    def funding_rate_source_for_tick(code, as_of):
+        full = PRIOR + BACKFILL[:current_idx[0]]
+        window = full[-12:] if len(full) >= 12 else full
+        return [
+            FundingRate(
+                venue=r.venue,
+                instrument=code,
+                funding_time=r.funding_time,
+                funding_rate=r.funding_rate,
+                mark_price=r.mark_price,
+                next_funding_time=r.next_funding_time,
+                ingested_at=r.ingested_at,
+                schema_version=r.schema_version,
+            )
+            for r in window
+        ]
+
+    submit_fired: list = []
+    fund_fired: list = []
+
+    def tripwire_submit(intent):
+        submit_fired.append(intent)
+        raise AssertionError(
+            "submit_callback fired under VIP5+alt + Mar 2024 SOL — "
+            "the engine should have produced signal_flat. The "
+            "calibration may have changed; investigate."
+        )
+
+    def tripwire_fund(event):
+        fund_fired.append(event)
+        raise AssertionError("funding_event_callback fired with no position")
+
+    with _connect() as conn:
+        from strategies.a1_funding.runner.paper_runner import A1PaperRunner
+
+        current_position_source = _make_current_position_source(
+            conn, ctx, instrument_id_by_code,
+        )
+
+        runner = A1PaperRunner(
+            clock=clock_for_tick,
+            funding_rate_source=funding_rate_source_for_tick,
+            submit_callback=tripwire_submit,
+            current_position_source=current_position_source,
+            due_events_source=lambda as_of: [],
+            funding_event_callback=tripwire_fund,
+            instruments=[perp_instrument_code],
+            sizing_config=sizing_config,
+            cost_model=cost_model,
+            slippage_tier_name="liquid_alt_tier",
+        )
+
+        outcomes_per_tick: list[tuple[int, str]] = []
+        for idx in range(30):
+            current_idx[0] = idx
+            tick_result = runner.tick()
+            outcome = tick_result.outcomes[0]
+            assert outcome.error is None, (
+                f"interval {idx}: unexpected error {outcome.error}"
+            )
+            assert outcome.intent is None, (
+                f"interval {idx}: unexpected intent in no-trade regime"
+            )
+            outcomes_per_tick.append((idx, outcome.no_intent_reason))
+
+    flat_count = sum(1 for _, r in outcomes_per_tick if r == "signal_flat")
+    assert flat_count == 30, (
+        f"expected all 30 ticks signal_flat under VIP5+alt + Mar 2024 SOL; "
+        f"got {flat_count}. Distribution: "
+        f"{set(r for _, r in outcomes_per_tick)}"
+    )
+    assert submit_fired == []
+    assert fund_fired == []
+
+    with _connect() as conn, conn.cursor() as cur:
+        for query, label in [
+            (
+                "SELECT COUNT(*) FROM trading.order_intents "
+                "WHERE created_by = 'paper_runner'",
+                "order_intents",
+            ),
+            (
+                "SELECT COUNT(*) FROM trading.orders "
+                "WHERE created_by = 'paper_runner'",
+                "orders",
+            ),
+            (
+                "SELECT COUNT(*) FROM trading.fills "
+                "WHERE order_id IN (SELECT id FROM trading.orders "
+                "                   WHERE created_by = 'paper_runner')",
+                "fills",
+            ),
+            (
+                "SELECT COUNT(*) FROM accounting.journals "
+                "WHERE created_by = 'paper_runner'",
+                "journals",
+            ),
+            (
+                "SELECT COUNT(*) FROM accounting.funding_payments",
+                "funding_payments",
+            ),
+            (
+                "SELECT COUNT(*) FROM positions.position_snapshots "
+                "WHERE created_by = 'paper_runner' "
+                "  AND computation_version = 'a1.runner.v0'",
+                "runner-authoritative position_snapshots",
+            ),
+        ]:
+            cur.execute(query)
+            count = cur.fetchone()[0]
+            assert count == 0, f"expected 0 {label}, got {count}"
+
+
+def _load_fixture_sol_mar_2024() -> tuple[list[FundingRate], dict]:
+    """Load the SOL March 2024 fixture (Day 18b probe artifact)."""
+    fixture_path = (
+        Path(__file__).resolve().parent.parent
+        / "fixtures" / "binance_funding"
+        / "SOLUSDT_14d_20240301T000000_20240315T000000.json"
+    )
+    if not fixture_path.exists():
+        pytest.skip(
+            f"SOL Mar 2024 fixture not present at {fixture_path}; "
+            f"run scripts/refresh_binance_funding_fixture.py "
+            f"--symbol SOLUSDT --days 14 --end-utc 2024-03-15T00:00:00Z."
         )
 
     with fixture_path.open() as f:

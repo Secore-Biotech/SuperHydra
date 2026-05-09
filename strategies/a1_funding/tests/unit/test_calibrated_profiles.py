@@ -211,15 +211,55 @@ class TestAltProfile:
         alt = _per_period_cost_rate(binance_vip5_alt_v1())
         assert alt > btc, f"alt={alt} not > btc={btc}"
 
-    def test_alt_threshold_below_solusdt_funding_cap(self):
-        """Binance SOLUSDT funding cap ~50 bps per interval; alt threshold
-        ~11.7 bps. The yes-trade economic basis for SOLUSDT under this
-        profile."""
-        SOLUSDT_FUNDING_CAP = Decimal("0.005")  # 50 bps per interval
+    def test_alt_threshold_above_observed_solusdt_strong_funding_regime(self):
+        """STRUCTURAL (revised Day 18b): the alt threshold (~11.7 bps)
+        is ABOVE the strongest realized SOLUSDT funding regime we have
+        data for (March 2024: max single-interval ~11.93 bps, mean
+        ~6 bps, rolling-12 mean tops out at ~7.69 bps).
+
+        The original Day 18a test asserted alt threshold < 50 bps
+        SOLUSDT cap; that comparison was wrong because:
+          - the cap is a venue-mechanic upper bound (Capped Funding
+            Rate Multiplier * Maintenance Margin Ratio at max
+            leverage), not what realized rates actually deliver
+          - the venue allows funding rates that the market almost
+            never produces
+
+        What matters for A1's no-trade-vs-yes-trade behavior is the
+        RATIO of threshold to typical-realized-and-rolling-mean, not
+        threshold to cap. By that measure, even March 2024's strong-
+        funding regime falls short of clearing the threshold.
+
+        This test uses an observation-based upper bound: 12 bps as a
+        conservative ceiling for SOLUSDT realized rolling-12-interval
+        mean in any historical period we can probe. If a future SOL
+        regime exceeds that ceiling, the test fails and the
+        observation-based bound needs revising — at which point yes-
+        trade may be possible without recalibrating slippage.
+
+        The right path forward is Day 19: empirical slippage
+        calibration. If realistic SOL slippage is 1 bp per leg
+        (matching BTC) instead of 3 bps, alt threshold drops to
+        ~5.7 bps, and March 2024-class regimes become tradeable."""
+        # Observation-based upper bound: SOL rolling-12-interval mean
+        # has not exceeded ~8 bps in any historical window we have
+        # probed. We use 12 bps as a conservative ceiling — comfortably
+        # above the 7.69 bps we saw in March 2024, leaving headroom for
+        # regimes we haven't sampled.
+        SOLUSDT_REALIZED_ROLLING_CEILING = Decimal("0.0012")  # 12 bps
         threshold = _per_period_cost_rate(binance_vip5_alt_v1())
-        assert threshold < SOLUSDT_FUNDING_CAP, (
-            f"alt threshold ({threshold}) no longer below SOLUSDT cap "
-            f"({SOLUSDT_FUNDING_CAP}); investigate."
+        # The current alt threshold sits within (but very close to) this
+        # ceiling — making A1 currently no-trade across all probed
+        # historical SOL windows.
+        assert threshold > Decimal("0.001"), (
+            f"alt threshold ({threshold}) unexpectedly below 10 bps; "
+            f"slippage tier may have changed"
+        )
+        assert threshold <= SOLUSDT_REALIZED_ROLLING_CEILING, (
+            f"alt threshold ({threshold}) above observation-based "
+            f"ceiling ({SOLUSDT_REALIZED_ROLLING_CEILING}); need to "
+            f"re-examine the slippage tier or accept that A1 has no "
+            f"realistic edge on SOL even in extreme regimes."
         )
 
     def test_alt_profile_distinct_hash_from_btc_profile(self):
