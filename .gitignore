@@ -24,3 +24,8 @@ local_data/
 .idea/
 *.swp
 .DS_Store
+
+# Day 19b.3 research artifacts (raw trades and per-run estimates).
+# These are ephemeral by design; the harness is what is committed,
+# not its outputs.
+artifacts/
