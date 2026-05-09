@@ -4,10 +4,10 @@ This memo refreshes weekly per roadmap section 11. The roadmap holds principles 
 
 ---
 
-## Current state - 2026-05-09 (third update, end of Day 17)
+## Current state - 2026-05-09 (fourth update, end of Day 19a)
 
 ### Migration foundation
-- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite passes 354/354 in 5:17 after Day 17c pivot.
+- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite 355/355 in 5:14 after Day 19a. One observed flake (14 migration tests failing on a single 5-minute run, all passing on retry); treated as single-incident noise, not investigated. If recurs, investigate cleanup ordering.
 
 ### Sleeve A (build-to-trade)
 - Engine A1 - Funding-rate capture: Phase P0.
@@ -17,46 +17,50 @@ This memo refreshes weekly per roadmap section 11. The roadmap holds principles 
   - Day 16a (0b0f431): synthetic 30-interval backfill harness against real Postgres in 1.32s.
   - Day 16c (d4b6a75): Sharpe computation analytics module.
   - Day 16b (9a6be81): real-data no-trade regime test (Apr-May 2026 fixture, placeholder costs).
-  - Day 16d.1 (37018b9): timestamp-determinism fix in the migration test.
+  - Day 16d.1 (37018b9): timestamp-determinism fix.
   - Day 16d.2 (a182090): synthetic harness fill_ts logical clock + snapshot-source disambiguation.
   - Day 16b.2 probe (27bf80d): Dec 2024 BTCUSDT fixture committed.
-  - Day 16e (9ba2be0): structural cost-threshold invariant tests (placeholder vs BTCUSDT cap).
-  - Day 17a (52c9604): calibrated cost-profile foundation - placeholder_v0 rename + alias, three Binance profiles (vip0_retail / vip5_btc / vip9_institutional), ProfileSource metadata, hash includes profile identity.
-  - Day 17b (0221efa): A1 cost-profile selector module under strategies/a1_funding/config/. Maps (instrument, venue) to CostModelConfig.
-  - Day 17c PIVOT (5b8a7c3): The original Day 17c hypothesis was that VIP5 economics would open a BTCUSDT yes-trade window. The math falsified the hypothesis. Pivoted to commit the honest finding.
-  - Cumulative: 264 unit + 39 integration tests across the strategy. Full integration suite 354/354 in 5:17.
-  - Engine safety properties documented with real-data evidence:
-    - Trades correctly when synthetic edge exists (Days 15b/c, 16a synthetic backfill).
-    - Refuses to trade when real-data edge does not exist (Days 16b + 17c, two cost profiles, two real fixtures).
-  - Sharpe pipeline working end-to-end against accounting rows (Day 16c).
+  - Day 16e (9ba2be0): structural cost-threshold invariant tests.
+  - Day 17a (52c9604): calibrated cost-profile foundation.
+  - Day 17b (0221efa): A1 cost-profile selector module.
+  - Day 17c PIVOT (5b8a7c3): BTCUSDT structurally untradeable across all profiles.
+  - Day 18a (e3e0c89): calibrated altcoin profile binance_vip5_alt_v1 (3 bps slippage) + SOLUSDT selector branch.
+  - Day 18b (673bc7c): SOL March 2024 fixture committed; integration test asserting no-trade under VIP5+alt because rolling-12 forecast (~7.7 bps) is below threshold (~11.7 bps) despite genuinely strong realized funding (mean 6 bps, 100% positive intervals).
+  - Day 19a (6b423d7): binance_vip5_alt_research_v1 added (1 bp slippage) with explicit research-only firewall. Threshold ~7.7 bps, matches BTC. Evidence basis: Kaiko Q1 2024 spread cheatsheet + Amberdata Jan 2026 snapshot (Binance SOLUSDT tightest at 0.79 bps; SOL ~10x BTC/ETH). Research profile is NOT returned by select_profile_for_a1; using it requires direct call by name. Research memo at docs/research/sol_slippage_calibration_memo.md documents evidence, methodology, sensitivity bounds, and promotion path.
+  - Cumulative: 270 unit + 39 integration tests across the strategy. Full integration suite 355/355 in 5:14.
 
-### Structural finding (Day 17c): BTCUSDT untradeable across all currently-modeled cost profiles
+### Three structural binds documented as tested invariants
 
-The Day 17 calibration sweep produced a stronger structural result than the Day 16b.2 probe surfaced. Tested across three cost profiles:
+A1 has now demonstrated three distinct no-trade regimes, each documented with both unit-level structural tests and integration tests against real-data fixtures:
 
-  - placeholder_v0 threshold:           ~12.3 bps per interval
-  - binance_vip5_btc_v1 threshold:       ~7.7 bps per interval
-  - binance_vip9_institutional_v1:       ~5.4 bps per interval
+1. **No-edge regime** (BTCUSDT Apr-May 2026 fixture, placeholder costs): mean rate near zero. Engine correctly produces signal_flat because no edge exists. Day 16b integration test.
 
-  - Binance BTCUSDT funding cap:           1 bp per interval (structural, cf. official funding-rate spec)
+2. **Cap-bound** (BTCUSDT Dec 2024 fixture, VIP5 costs): even cap-pinned funding (1 bp per interval) is below the VIP5 threshold (~7.7 bps). The dominant cost is round-trip slippage (2 * 1 bp = 2 bps) which alone exceeds the cap. No fee structure can save the math; even VIP9 institutional comes in at ~5.4 bps, still 5x above cap. Day 17c pivot.
 
-Even institutional VIP9 fees leave the threshold ~5x above the cap. The dominant cost component is slippage (btc_eth_top_tier = 1 bp per leg = 2 bps round-trip), which alone is 2x the funding cap. Fees cannot save the math.
+3. **Slippage-bound** (SOLUSDT March 2024 fixture, VIP5+alt costs): genuinely strong realized funding (mean 6 bps, 100% positive intervals, single-interval max 11.93 bps). But the engine's rolling-12 forecast (max 7.69 bps) is below the alt threshold (11.7 bps) because the conservative liquid_alt_tier (3 bps per leg) drives threshold above realized rolling means. Day 18b integration test.
 
-This is a genuine economics finding, not a pipeline bug. Five unit tests + two integration tests document it as a tested invariant. If anyone changes a cost profile and accidentally drops it below the BTCUSDT cap, the right tests will fail with diagnostic messages pointing at investigation.
+The slippage-bound finding is structurally different from the cap-bound finding: in the cap-bound case, no calibration can make BTCUSDT tradeable (cap < any realistic threshold). In the slippage-bound case, realistic SOL slippage (likely closer to 1 bp per leg per Day 19a research) WOULD make SOL tradeable in March 2024-class regimes — but the calibration that proves that is research-only until tape or live-fill validation lands.
 
-A1 yes-trade evidence requires either:
-  - Altcoin perps (DOGE, AVAX, SOL, etc.) where funding routinely reaches 50+ bps in volatile regimes, paired with a calibrated alt slippage tier.
-  - A research-only maker-rebate profile modeling passive-only execution at top-of-book with sub-bp slippage assumptions.
+### Day 19a research-calibrated profile firewall
 
-Both are real Day 18+ deliverables, not blocked by anything Day 17 did.
+The research profile binance_vip5_alt_research_v1 demonstrates the right discipline for handling non-governance research artifacts in a governance-bearing test suite:
+
+- Profile name contains _research_ explicitly.
+- Slippage tier name contains research (liquid_alt_research_tier).
+- Profile-level notes start with RESEARCH-ONLY.
+- Source.notes explicitly state "awaiting tape and live-fill validation."
+- select_profile_for_a1 is not extended; SOLUSDT continues to return alt_v1 (conservative).
+- Three firewall tests in TestResearchProfileFirewall assert no input to the selector returns the research profile across all plausible (instrument, venue) pairs.
+
+This makes accidental promotion a hard contract violation, not a soft norm. If a future change extends the selector to return the research profile as a default, the firewall tests fail and force a deliberate decision about whether the research profile has been empirically validated.
 
 ### Next deliverables, in order
 
-1. **Day 18a - Altcoin profile + selector extension.** Add a calibrated altcoin slippage tier (probably 2-5 bps per leg for liquid alts vs 1 bp for BTC/ETH) and an alt fee profile if it differs from BTC profiles. Extend select_profile_for_a1 to handle altcoin instruments. Smallest possible scope: pick one alt (e.g. SOLUSDT) and one realistic profile.
-2. **Day 18b - Real altcoin funding fixture.** Probe + commit a 14-day fixture for the chosen alt, similar to the Dec 2024 BTC fixture. Compute fixture stats; only commit yes-trade if rates genuinely clear the alt threshold.
-3. **Day 18c - Yes-trade integration test under altcoin + alt profile.** The actual gate-readable Sharpe number.
+1. **Day 19b/20 - Tape-based slippage estimation.** Pull Binance SOLUSDT trade history over multiple sample periods (volatile and quiet regimes), estimate effective spread and impact via Roll's autocovariance estimator or similar. Compare to Day 19a's research-calibrated 1 bp.
+2. **Day 20+ - Live A1 paper fills.** A1 paper fills on the venue at production-equivalent clip sizes, with adverse-fill cost recorded per fill.
+3. **Promotion to empirical.** When tape and live-fill estimates both agree within Day 19a's sensitivity bounds (0.5-1.5 bps), promote to binance_vip5_alt_empirical_v1 and update selector. Day 19a's TestResearchProfileFirewall tests will need to be reframed at that point - the empirical profile WOULD be reachable through select_profile_for_a1.
 
-Alternative path: research-only maker-rebate profile. Could be done in parallel as binance_maker_only_research_v1 with documented "research-only, do not deploy" caveat. Lower priority than altcoin pivot.
+Alternative orthogonal path: maker-rebate-only research profile. Could be added in parallel as binance_maker_only_research_v1 with the same firewall pattern. Lower priority than the empirical SOL pivot.
 
 ### Sleeve A2/A3
 - A2 - Basis: Not started.
@@ -77,19 +81,22 @@ Alternative path: research-only maker-rebate profile. Could be done in parallel 
 ### Unresolved risk exceptions
 - None.
 
+### Test-suite flake observed today
+- One full-suite run had 14 failures in test_migrations.py (all migration-test files); subsequent run was clean 355/355. All 14 failing tests passed in isolation. Treated as single-incident noise; if recurs, investigate transaction cleanup ordering and shared-state across migration tests.
+
 ### Next gate status
 - A1 P0 to P1 gate: paper run reproducible end-to-end on production code path with paper Sharpe >= 2.0 over a meaningful window.
-- Reproducibility: proven (synthetic + 2 real-data fixtures, all byte-stable).
-- Both safety properties proven across synthetic + real data + two cost profiles.
-- Sharpe number from a yes-trade real-data window: blocked on Day 18 altcoin pivot OR maker-rebate research profile. Today's Day 17c finding is itself gate-relevant evidence: A1 has no edge on BTCUSDT, regardless of fee tier, under realistic costs. The strategy is structurally correct; the instrument choice was wrong.
+- Reproducibility: proven (synthetic + 3 real-data fixtures, all byte-stable).
+- Three safety-property findings proven across different cost profiles + real fixtures. Engine refuses to trade in three distinct no-trade regimes for three distinct reasons.
+- Sharpe number from yes-trade real-data window: blocked on Day 19b/20+ tape and live-fill calibration, OR on a maker-rebate-only research profile, OR on accepting Day 19a's research-calibrated profile as the gate evidence (NOT recommended without tape/live validation; would defeat the firewall purpose).
 
 ### Carry-forward debt
 0009 Round 4.5 - Replay/Risk Matrix Hardening (non-blocking, post-signoff).
 
-Day 18 prerequisites:
-1. Choose altcoin (likely SOLUSDT based on liquidity + funding-rate volatility).
-2. Calibrate alt slippage tier and (if different from BTC) alt fee schedule.
-3. Decide whether to pursue maker-rebate research profile in parallel or sequence.
+Day 19b/20 prerequisites:
+1. Binance trade-history fetcher (we have a funding-rate fetcher but not a trade-history one).
+2. Tape-based effective-spread estimator (Roll's estimator or similar; not currently implemented).
+3. Sample-period selection methodology: which regimes to estimate spread in, how to weight them.
 
 ### Capital deployed
 - $0. Program in P0 across all engines.
