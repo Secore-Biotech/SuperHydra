@@ -8407,6 +8407,7 @@ def test_round4_evaluate_action_rejects_foreign_snapshot(fresh_db):
         """, (ctx['venue_id'],))
         other_instrument_id = cur.fetchone()[0]
 
+        eval_ts = datetime.now(timezone.utc)
         with pytest.raises(psycopg.errors.RaiseException) as ei:
             cur.execute("""
                 SELECT risk.evaluate_action(
@@ -8422,10 +8423,10 @@ def test_round4_evaluate_action_rejects_foreign_snapshot(fresh_db):
                 )
             """, (
                 f'src_cancel_foreign_{target}',
-                f'eval_cancel_foreign_{target}_{datetime.now(timezone.utc).timestamp()}',
+                f'eval_cancel_foreign_{target}_{eval_ts.timestamp()}',
                 ctx['portfolio_id'], ctx['strategy_id'], ctx['account_id'],
                 other_instrument_id,  # ← mismatch
-                datetime.now(timezone.utc), datetime.now(timezone.utc), 'LIVE',
+                eval_ts, eval_ts, 'LIVE',
                 target,
                 snapshot_id,  # ← from the original (different scope)
             ))
