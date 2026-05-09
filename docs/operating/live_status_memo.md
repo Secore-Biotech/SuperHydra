@@ -4,45 +4,59 @@ This memo refreshes weekly per roadmap section 11. The roadmap holds principles 
 
 ---
 
-## Current state - 2026-05-09 (late evening, second update)
+## Current state - 2026-05-09 (third update, end of Day 17)
 
 ### Migration foundation
-- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite passes 353/353 in 5:13 after Day 16d.1 fix.
+- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite passes 354/354 in 5:17 after Day 17c pivot.
 
 ### Sleeve A (build-to-trade)
 - Engine A1 - Funding-rate capture: Phase P0.
   - Days 1-12.5: pipeline + smoke test + writers.
   - Days 14a-c: funding journal writer + funding_payment INSERT + smoke test extension.
-  - Days 15a-c: A1PaperRunner skeleton, OMS submit helper, real-DB integration test, multi-tick idempotency tests, dispatch_due_funding_events.
+  - Days 15a-c: A1PaperRunner + OMS submit helper + dispatch_due_funding_events.
   - Day 16a (0b0f431): synthetic 30-interval backfill harness against real Postgres in 1.32s.
-  - Day 16c (d4b6a75): Sharpe computation. analytics/strategy_metrics.py with IntervalReturn, SharpeResult, compute_interval_returns, compute_sharpe. 12 unit tests + 3 integration tests.
-  - Day 16b (9a6be81): real-data no-trade regime test against committed 14-day Binance fixture. The fixture window (Apr 24 - May 8 2026) was a no-edge regime: mean rate -0.000026, 32 of 42 intervals negative. Engine correctly produced signal_flat on every tick. Tripwire callbacks raise if submit/fund ever fire.
-  - Day 16d.1 (37018b9): fixed test_round4_evaluate_action_rejects_foreign_snapshot under load. Diagnosis was not test ordering but two separate datetime.now() calls hitting a Postgres timestamp-precision boundary; capture once and reuse fixed it.
-  - Day 16d.2 (a182090): synthetic harness fill_ts now uses the logical clock; restored strict fee assertion in Sharpe integration. Also discovered and fixed a snapshot-source ambiguity: risk.evaluate_action creates side-effect snapshots at NOW() with computation_version='risk_eval_v1', distinct from the runner's authoritative snapshots at computation_version='a1.runner.v0'. Position queries now filter on the version invariant.
-  - Day 16b.2 probe (27bf80d): Dec 2024 BTCUSDT funding fixture committed for future yes-trade test. Empirical finding: 42/43 intervals positive (mean 0.000091, max 0.0001), but 0/43 above the conservative_default_v0 cost threshold of ~0.0012 per interval.
-  - Cumulative: 247 unit + 36 integration tests across the strategy. Full integration suite 353/353 in 5:13.
-  - **Engine safety properties documented with real-data evidence**:
+  - Day 16c (d4b6a75): Sharpe computation analytics module.
+  - Day 16b (9a6be81): real-data no-trade regime test (Apr-May 2026 fixture, placeholder costs).
+  - Day 16d.1 (37018b9): timestamp-determinism fix in the migration test.
+  - Day 16d.2 (a182090): synthetic harness fill_ts logical clock + snapshot-source disambiguation.
+  - Day 16b.2 probe (27bf80d): Dec 2024 BTCUSDT fixture committed.
+  - Day 16e (9ba2be0): structural cost-threshold invariant tests (placeholder vs BTCUSDT cap).
+  - Day 17a (52c9604): calibrated cost-profile foundation - placeholder_v0 rename + alias, three Binance profiles (vip0_retail / vip5_btc / vip9_institutional), ProfileSource metadata, hash includes profile identity.
+  - Day 17b (0221efa): A1 cost-profile selector module under strategies/a1_funding/config/. Maps (instrument, venue) to CostModelConfig.
+  - Day 17c PIVOT (5b8a7c3): The original Day 17c hypothesis was that VIP5 economics would open a BTCUSDT yes-trade window. The math falsified the hypothesis. Pivoted to commit the honest finding.
+  - Cumulative: 264 unit + 39 integration tests across the strategy. Full integration suite 354/354 in 5:17.
+  - Engine safety properties documented with real-data evidence:
     - Trades correctly when synthetic edge exists (Days 15b/c, 16a synthetic backfill).
-    - Refuses to trade when real-data edge does not exist (Day 16b Apr-May 2026; Day 16b.2 Dec 2024).
+    - Refuses to trade when real-data edge does not exist (Days 16b + 17c, two cost profiles, two real fixtures).
   - Sharpe pipeline working end-to-end against accounting rows (Day 16c).
-  - Real Binance fetcher integration proven (Days 16b + 16b.2 fixtures).
 
-### Structural finding: BTCUSDT yes-trade not reachable under placeholder costs
+### Structural finding (Day 17c): BTCUSDT untradeable across all currently-modeled cost profiles
 
-The Dec 2024 fixture probe surfaced a real economics finding rather than a pipeline issue. With conservative_default_v0 (the placeholder cost model documented in its own docstring as "pending empirical calibration"):
+The Day 17 calibration sweep produced a stronger structural result than the Day 16b.2 probe surfaced. Tested across three cost profiles:
 
-  - Per-interval cost = 2x taker (10 bps) + 2x slippage (2 bps) + borrow amortization (~0.33 bps/interval) = ~12.3 bps per interval.
-  - Binance BTCUSDT funding caps structurally at 0.01% (1 bp) per 8h interval.
-  - Even in the strongest historical funding window we have data for (Dec 2024, near peak euphoria), the rolling 12-interval mean topped out at 9.9 bps - still below the cost threshold.
+  - placeholder_v0 threshold:           ~12.3 bps per interval
+  - binance_vip5_btc_v1 threshold:       ~7.7 bps per interval
+  - binance_vip9_institutional_v1:       ~5.4 bps per interval
 
-This means the engine's correct behavior on real Binance BTCUSDT under the current cost model is **always no-trade**, regardless of regime. This is governance-positive: the engine refuses unprofitable carry. But it also means a yes-trade real-data demonstration requires either:
-  - Calibrated VIP-tier cost model (Binance VIP9 maker rebate brings round-trip cost to ~3 bps), or
-  - A different instrument class (altcoin perps with 0.5%-1% funding spikes) and a corresponding altcoin cost profile.
+  - Binance BTCUSDT funding cap:           1 bp per interval (structural, cf. official funding-rate spec)
 
-### Next deliverables, in order:
-  1. **Memo + structural assertion test** (next session start). Add an explicit integration test that verifies `current placeholder cost threshold > 0.01% Binance BTCUSDT funding cap` so that any future cost model change either preserves the structural inequality (with documentation) or invalidates the assertion (forcing the test to be relabeled or split). This makes today's finding a tested invariant rather than a memo footnote.
-  2. **Day 17: empirical cost-model calibration**. VIP-tier maker/taker scenarios for Binance, Bybit, OKX. Realistic top-of-book slippage for BTC vs altcoins. Per-engine cost profiles (A1, A2, A3). Replace `conservative_default_v0` with calibrated `binance_vip_btc_v1`, `binance_vip_alt_v1`, etc. Each profile gets its own content hash so old paper Sharpes preserve their lineage.
-  3. **Day 16b.2 revisited**. Once Day 17 produces calibrated cost models, retry yes-trade fixture using either VIP-tier BTC costs against the Dec 2024 fixture, or an altcoin window. Both Apr-May 2026 and Dec 2024 fixtures stay committed - the Dec 2024 fixture immediately becomes yes-trade evidence under VIP costs.
+Even institutional VIP9 fees leave the threshold ~5x above the cap. The dominant cost component is slippage (btc_eth_top_tier = 1 bp per leg = 2 bps round-trip), which alone is 2x the funding cap. Fees cannot save the math.
+
+This is a genuine economics finding, not a pipeline bug. Five unit tests + two integration tests document it as a tested invariant. If anyone changes a cost profile and accidentally drops it below the BTCUSDT cap, the right tests will fail with diagnostic messages pointing at investigation.
+
+A1 yes-trade evidence requires either:
+  - Altcoin perps (DOGE, AVAX, SOL, etc.) where funding routinely reaches 50+ bps in volatile regimes, paired with a calibrated alt slippage tier.
+  - A research-only maker-rebate profile modeling passive-only execution at top-of-book with sub-bp slippage assumptions.
+
+Both are real Day 18+ deliverables, not blocked by anything Day 17 did.
+
+### Next deliverables, in order
+
+1. **Day 18a - Altcoin profile + selector extension.** Add a calibrated altcoin slippage tier (probably 2-5 bps per leg for liquid alts vs 1 bp for BTC/ETH) and an alt fee profile if it differs from BTC profiles. Extend select_profile_for_a1 to handle altcoin instruments. Smallest possible scope: pick one alt (e.g. SOLUSDT) and one realistic profile.
+2. **Day 18b - Real altcoin funding fixture.** Probe + commit a 14-day fixture for the chosen alt, similar to the Dec 2024 BTC fixture. Compute fixture stats; only commit yes-trade if rates genuinely clear the alt threshold.
+3. **Day 18c - Yes-trade integration test under altcoin + alt profile.** The actual gate-readable Sharpe number.
+
+Alternative path: research-only maker-rebate profile. Could be done in parallel as binance_maker_only_research_v1 with documented "research-only, do not deploy" caveat. Lower priority than altcoin pivot.
 
 ### Sleeve A2/A3
 - A2 - Basis: Not started.
@@ -55,7 +69,7 @@ This means the engine's correct behavior on real Binance BTCUSDT under the curre
 - None blocking forward progress.
 
 ### Data integrity issues
-- None in production code paths.
+- None.
 
 ### Paper-vs-live drift
 - N/A. No live deployment.
@@ -66,16 +80,16 @@ This means the engine's correct behavior on real Binance BTCUSDT under the curre
 ### Next gate status
 - A1 P0 to P1 gate: paper run reproducible end-to-end on production code path with paper Sharpe >= 2.0 over a meaningful window.
 - Reproducibility: proven (synthetic + 2 real-data fixtures, all byte-stable).
-- Both safety properties proven across synthetic + real data.
-- Sharpe number from a yes-trade real-data window: blocked on Day 17 cost calibration. Today's structural finding is itself gate-relevant evidence: the engine does not generate spurious trades under realistic Binance BTCUSDT funding caps with placeholder costs.
+- Both safety properties proven across synthetic + real data + two cost profiles.
+- Sharpe number from a yes-trade real-data window: blocked on Day 18 altcoin pivot OR maker-rebate research profile. Today's Day 17c finding is itself gate-relevant evidence: A1 has no edge on BTCUSDT, regardless of fee tier, under realistic costs. The strategy is structurally correct; the instrument choice was wrong.
 
 ### Carry-forward debt
 0009 Round 4.5 - Replay/Risk Matrix Hardening (non-blocking, post-signoff).
 
-Day 17 prerequisites:
-1. Add structural-inequality assertion test (Day 16e or first task of Day 17).
-2. Empirical cost calibration for top venues + tier combinations.
-3. Per-engine cost-profile selection logic (A1 picks BTC profile or alt profile based on instrument).
+Day 18 prerequisites:
+1. Choose altcoin (likely SOLUSDT based on liquidity + funding-rate volatility).
+2. Calibrate alt slippage tier and (if different from BTC) alt fee schedule.
+3. Decide whether to pursue maker-rebate research profile in parallel or sequence.
 
 ### Capital deployed
 - $0. Program in P0 across all engines.
