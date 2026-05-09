@@ -48,9 +48,13 @@ import pytest
 from tests.integration.test_migrations import _connect, _setup_basic_0009, fresh_db
 
 # Day 11 writer for fills→journals (now that the keystone exists).
+# Day 14 writer for funding events.
 from execution.ledger.fill_journal_writer import (
     FillRecord,
+    FundingEventRecord,
+    build_funding_journal,
     build_trade_journal,
+    write_and_post_funding_journal,
     write_and_post_journal,
 )
 
@@ -199,6 +203,18 @@ def _hash_funding_window(window: list[FundingRate]) -> str:
     for r in window:
         h.update(r.content_hash.encode("ascii"))
     return h.hexdigest()
+
+
+def _instrument_code_from_ctx_smoke(ctx) -> str:
+    """Look up the instrument_code for the perp instrument
+    that _setup_basic_0009 created (it includes a uuid suffix).
+    Used by step 10's funding event construction."""
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT instrument_code FROM registry.instruments WHERE id = %s",
+            (ctx["instrument_id"],),
+        )
+        return cur.fetchone()[0]
 
 
 def _make_db_resolvers(cur):
@@ -792,6 +808,45 @@ def test_a1_smoke_vertical(fresh_db):
             f"snapshot should derive from exactly one fill, got {fill_count}"
         )
 
+    # ─── Step 10: fake one funding event for the perp leg ───────────────
+    # Position is short -0.01 BTC after reconciliation. Pretend the next
+    # 8h funding interval has rate +0.0001 (longs pay shorts) and BTC mark
+    # is $50,000. Expected receipt: 0.01 * 0.0001 * 50000 = $0.05 USD.
+    # This validates the funding writer end-to-end against the same DB
+    # the fills passed through.
+    funded_at = datetime.now(UTC) + timedelta(hours=8)
+    funding_event = FundingEventRecord(
+        venue_namespace=perp_venue_namespace,
+        venue_funding_id=f"BTCUSDT-{funded_at.strftime('%Y%m%dT%H%M%S')}",
+        portfolio_id=ctx["portfolio_id"],
+        strategy_id=ctx["strategy_id"],
+        account_id=ctx["account_id"],
+        instrument_id=ctx["instrument_id"],
+        instrument_code=_instrument_code_from_ctx_smoke(ctx),
+        quote_asset_symbol="USDT",
+        funding_rate=Decimal("0.0001"),
+        position_size=Decimal("-0.01"),  # short
+        amount_usd=Decimal("0.05"),       # 0.01 * 0.0001 * 50000
+        direction="received",
+        funded_at=funded_at,
+        funding_environment="SHADOW",
+    )
+    funding_draft = build_funding_journal(funding_event, created_by="smoke_test")
+    with _connect() as conn, conn.cursor() as cur:
+        ar, ir = _make_db_resolvers(cur)
+        funding_journal_id, funding_payment_id, funding_was_new = (
+            write_and_post_funding_journal(
+                conn, funding_draft, funding_event,
+                posted_by="smoke_test",
+                asset_id_resolver=ar,
+                instrument_id_resolver=ir,
+            )
+        )
+        conn.commit()
+    assert funding_was_new is True, "fresh funding event should create new rows"
+    assert funding_journal_id > 0
+    assert funding_payment_id > 0
+
 
 # ─── xfail steps 11-12 ────────────────────────────────────────────────────
 # These are the explicit Day 9-15 gap. We DO NOT inline manual journal /
@@ -864,3 +919,63 @@ def test_a1_smoke_vertical_step12_journal_entries_per_fill(fresh_db):
         """)
         v1_entries = cur.fetchone()[0]
     assert v1_entries > 0, "expected v1: account-coded entries from the writer"
+
+
+
+def test_a1_smoke_vertical_step13_funding_journal(fresh_db):
+    """Step 13: the funding event posted in step 10 produced exactly one
+    funding_payments row, linked to a posted non-voided journal of type
+    'funding', with balanced ledger entries (DR cash $0.05, CR
+    funding_income $0.05).
+    """
+    test_a1_smoke_vertical(fresh_db)  # populate fills, journals, funding event
+    with _connect() as conn, conn.cursor() as cur:
+        # Exactly one funding_payment exists.
+        cur.execute(
+            "SELECT id, journal_id, direction, amount_usd, source_namespace, "
+            "       source_id "
+            "FROM accounting.funding_payments"
+        )
+        rows = cur.fetchall()
+        assert len(rows) == 1, f"expected 1 funding_payment, got {len(rows)}"
+        payment_id, journal_id, direction, amount_usd, sns, sid = rows[0]
+        assert direction == "received"
+        assert amount_usd == Decimal("0.05")
+        assert sns.startswith("venue_")
+        assert sid.startswith("BTCUSDT-")
+
+        # The linked journal exists, is posted, not voided, type='funding'.
+        cur.execute(
+            "SELECT status, journal_type, voided_at, source_type "
+            "FROM accounting.journals WHERE id = %s",
+            (journal_id,),
+        )
+        status, jtype, voided_at, stype = cur.fetchone()
+        assert status == "posted"
+        assert jtype == "funding"
+        assert voided_at is None
+        assert stype == "funding_event"
+
+        # Ledger entries: 1 debit to cash, 1 credit to funding_income, both $0.05.
+        cur.execute(
+            """
+            SELECT la.account_code, le.debit_credit, le.amount_usd
+            FROM accounting.ledger_entries le
+            JOIN accounting.ledger_accounts la ON la.id = le.ledger_account_id
+            WHERE le.journal_id = %s
+            ORDER BY le.id
+            """,
+            (journal_id,),
+        )
+        entries = cur.fetchall()
+        assert len(entries) == 2, f"expected 2 entries, got {len(entries)}"
+
+        debits = [e for e in entries if e[1] == "debit"]
+        credits = [e for e in entries if e[1] == "credit"]
+        assert len(debits) == 1
+        assert len(credits) == 1
+        assert debits[0][0].startswith("v1:cash:")
+        assert debits[0][0].endswith(":USDT")
+        assert debits[0][2] == Decimal("0.05")
+        assert credits[0][0].startswith("v1:funding_income:")
+        assert credits[0][2] == Decimal("0.05")
