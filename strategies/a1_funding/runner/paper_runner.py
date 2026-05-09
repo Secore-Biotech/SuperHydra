@@ -100,6 +100,29 @@ class TickResult:
 
 
 @dataclass(frozen=True)
+class FundingDispatchResult:
+    """One pass of funding-event discovery + dispatch.
+
+    Calls clock() exactly once at the top, then propagates that as_of
+    through discover_due_funding_events. Each event is dispatched via
+    the injected funding_event_callback. Errors are captured per-event
+    so one bad event does not stop the batch.
+    """
+    as_of: datetime
+    events: tuple["FundingDueEvent", ...]
+    error_messages: tuple[str, ...]
+
+    @property
+    def events_dispatched(self) -> int:
+        """Events for which the callback returned without raising."""
+        return len(self.events) - len(self.error_messages)
+
+    @property
+    def error_count(self) -> int:
+        return len(self.error_messages)
+
+
+@dataclass(frozen=True)
 class FundingDueEvent:
     """A funding interval that has settled but does not yet have a
     funding_payment row in the DB. Day 15a treats this as opaque
@@ -148,6 +171,7 @@ class A1PaperRunner:
         submit_callback: Callable[[OrderIntent], None],
         current_position_source: Callable[[str], Decimal],
         due_events_source: Callable[[datetime], list[FundingDueEvent]],
+        funding_event_callback: Callable[["FundingDueEvent"], None],
         instruments: list[str],
         sizing_config: SizingConfig,
         cost_model: CostModelConfig,
@@ -177,6 +201,7 @@ class A1PaperRunner:
         self._submit_callback = submit_callback
         self._current_position_source = current_position_source
         self._due_events_source = due_events_source
+        self._funding_event_callback = funding_event_callback
         self._instruments = tuple(instruments)
         self._sizing_config = sizing_config
         self._cost_model = cost_model
@@ -327,16 +352,48 @@ class A1PaperRunner:
         """Return funding intervals that have settled by `as_of` but do
         not yet have a corresponding accounting.funding_payments row.
 
-        15a delegates the actual discovery to the injected
-        due_events_source. Day 15b wires this to a real DB query
-        joining trading.fills (for active positions) against
-        accounting.funding_payments (for what's already been posted).
-
-        The runner does NOT post the journal here — that's the
-        dispatch_due_funding_events method (added in 15b alongside the
-        DB wiring). 15a only reports.
+        Pure pass-through to the injected due_events_source. Does NOT
+        post journals — that's dispatch_due_funding_events.
         """
         return list(self._due_events_source(as_of))
+
+    def dispatch_due_funding_events(self) -> FundingDispatchResult:
+        """Discover funding intervals due as of clock() and dispatch each
+        via the injected funding_event_callback.
+
+        Calls clock() exactly once at the top so the entire dispatch pass
+        operates on one coherent timestamp. Errors from individual
+        callback invocations are captured (event_index → message) so
+        one bad event does not stop the batch — the callback for event N+1
+        still fires after event N raised.
+
+        Returns FundingDispatchResult with events processed + error
+        messages for the caller to log/inspect.
+        """
+        as_of = self._clock()
+        try:
+            events = list(self._due_events_source(as_of))
+        except Exception as exc:
+            return FundingDispatchResult(
+                as_of=as_of,
+                events=(),
+                error_messages=(f"due_events_source raised: {exc}",),
+            )
+
+        error_messages: list[str] = []
+        for event in events:
+            try:
+                self._funding_event_callback(event)
+            except Exception as exc:
+                error_messages.append(
+                    f"funding_event_callback raised on "
+                    f"{event.venue_funding_id}: {exc}"
+                )
+        return FundingDispatchResult(
+            as_of=as_of,
+            events=tuple(events),
+            error_messages=tuple(error_messages),
+        )
 
     # ─── Read-only accessors (test conveniences) ────────────────────────
 

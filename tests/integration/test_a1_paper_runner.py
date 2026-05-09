@@ -40,6 +40,7 @@ from strategies.a1_funding.runner.oms_submit import (
 )
 from strategies.a1_funding.runner.paper_runner import (
     A1PaperRunner,
+    FundingDueEvent,
 )
 
 # Reuse the smoke test's DB fixtures and helpers.
@@ -305,6 +306,7 @@ def test_a1_paper_runner_one_tick_drives_full_accounted_path(fresh_db):
             submit_callback=submit_callback,
             current_position_source=current_position_source,
             due_events_source=lambda as_of: [],
+            funding_event_callback=lambda e: None,
             instruments=[perp_instrument_code],
             sizing_config=sizing_config,
             cost_model=cost_model,
@@ -377,3 +379,271 @@ def test_a1_paper_runner_one_tick_drives_full_accounted_path(fresh_db):
         assert snap_count >= 1, (
             f"expected at least one position_snapshot from runner; got {snap_count}"
         )
+
+
+
+# ─── Day 15c: multi-tick + funding dispatch idempotency ──────────────────
+
+
+def test_a1_paper_runner_two_ticks_no_double_exposure(fresh_db):
+    """Day 15c Test A: tick 1 establishes position; tick 2 sees position
+    via current_position_source and produces no new intent (or a no-op
+    sized intent). Total OMS rows do not double after tick 2.
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        spot_instrument_id = _create_btc_spot_instrument(cur, ctx)
+        cur.execute(
+            "SELECT venue_code FROM registry.venues WHERE id = %s",
+            (ctx["venue_id"],),
+        )
+        venue_namespace = cur.fetchone()[0]
+        cur.execute(
+            "SELECT instrument_code FROM registry.instruments WHERE id = %s",
+            (ctx["instrument_id"],),
+        )
+        perp_instrument_code = cur.fetchone()[0]
+        conn.commit()
+
+    funding_window = _make_funding_window(instrument_code=perp_instrument_code)
+    funding_window_hash = _hash_funding_window(funding_window)
+    sizing_config = _sizing_for_btcusdt(perp_instrument_code, "BTCUSDT-SPOT")
+    cost_model = cost_default()
+
+    from strategies.a1_funding.signal.expected_funding import expected_next_funding
+    from strategies.a1_funding.signal.evaluate import evaluate_signal
+    forecast = expected_next_funding(
+        funding_window, discount_k=Decimal("1"),
+        as_of=datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC),
+    )
+    signal_eval = evaluate_signal(
+        forecast, cost_model,
+        slippage_tier_name="btc_eth_top_tier",
+        funding_intervals_per_day=3,
+    )
+
+    instrument_id_by_code = {
+        perp_instrument_code: ctx["instrument_id"],
+        "BTCUSDT-SPOT": spot_instrument_id,
+    }
+
+    with _connect() as conn, conn.cursor() as resolver_cur:
+        asset_id_resolver, instrument_id_resolver = _make_db_resolvers(resolver_cur)
+        submit_callback = _make_submit_callback(
+            conn, ctx,
+            spot_instrument_id=spot_instrument_id,
+            venue_namespace=venue_namespace,
+            funding_window_hash=funding_window_hash,
+            signal_eval=signal_eval,
+            asset_id_resolver=asset_id_resolver,
+            instrument_id_resolver=instrument_id_resolver,
+            perp_fill_price=Decimal("100000"),
+            spot_fill_price=Decimal("100000"),
+        )
+        current_position_source = _make_current_position_source(
+            conn, ctx, instrument_id_by_code,
+        )
+
+        # Two distinct clock values so any internal timestamp ordering
+        # works (some triggers compare against snapshot_at).
+        clocks = iter([
+            datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC),
+            datetime(2026, 1, 5, 0, 5, 0, tzinfo=UTC),
+        ])
+
+        runner = A1PaperRunner(
+            clock=lambda: next(clocks),
+            funding_rate_source=lambda code, as_of: _make_funding_window(
+                instrument_code=code,
+            ),
+            submit_callback=submit_callback,
+            current_position_source=current_position_source,
+            due_events_source=lambda as_of: [],
+            funding_event_callback=lambda e: None,
+            instruments=[perp_instrument_code],
+            sizing_config=sizing_config,
+            cost_model=cost_model,
+            slippage_tier_name="btc_eth_top_tier",
+        )
+
+        result1 = runner.tick()
+        assert result1.outcomes[0].error is None
+        assert result1.outcomes[0].intent is not None, "tick 1 should establish"
+        assert result1.submitted_count == 1
+
+        # ─── After tick 1 ──────────────────────────────────────────────
+        with _connect() as audit_conn, audit_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM trading.fills "
+                "WHERE order_id IN (SELECT id FROM trading.orders "
+                "                   WHERE created_by = 'paper_runner')"
+            )
+            fills_after_t1 = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM positions.position_snapshots "
+                "WHERE created_by = 'paper_runner'"
+            )
+            snaps_after_t1 = cur.fetchone()[0]
+        assert fills_after_t1 == 2
+        assert snaps_after_t1 >= 1
+
+        result2 = runner.tick()
+        outcome2 = result2.outcomes[0]
+        # tick 2: position now exists. Acceptable outcomes:
+        #   - no_intent_reason="signal_flat" (signal flipped flat — won't happen)
+        #   - no_intent_reason="current_position_matches_target"
+        #   - no_intent_reason="sizer_no_op"
+        #   - intent is None for any of the above
+        assert outcome2.error is None, f"tick 2 error: {outcome2.error}"
+        assert outcome2.intent is None, (
+            f"tick 2 expected no intent (already in position); "
+            f"got intent={outcome2.intent}, no_intent_reason={outcome2.no_intent_reason}"
+        )
+        assert result2.submitted_count == 0
+
+        # ─── After tick 2: no new fills, no new snapshots ──────────────
+        with _connect() as audit_conn, audit_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM trading.fills "
+                "WHERE order_id IN (SELECT id FROM trading.orders "
+                "                   WHERE created_by = 'paper_runner')"
+            )
+            fills_after_t2 = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM positions.position_snapshots "
+                "WHERE created_by = 'paper_runner'"
+            )
+            snaps_after_t2 = cur.fetchone()[0]
+        assert fills_after_t2 == 2, (
+            f"tick 2 must not produce new fills; "
+            f"after t1={fills_after_t1}, after t2={fills_after_t2}"
+        )
+        assert snaps_after_t2 == snaps_after_t1, (
+            f"tick 2 must not produce new snapshots; "
+            f"after t1={snaps_after_t1}, after t2={snaps_after_t2}"
+        )
+
+
+def test_a1_paper_runner_funding_dispatch_three_intervals_then_replay(fresh_db):
+    """Day 15c Test B: dispatch 3 due funding events; each posts one
+    journal + one funding_payment. Replay returns 0 new events; counts
+    remain 3 / 3 (Day 14b's writer idempotency).
+    """
+    from execution.ledger.fill_journal_writer import (
+        FundingEventRecord,
+        build_funding_journal,
+        write_and_post_funding_journal,
+    )
+
+    with _connect() as conn, conn.cursor() as cur:
+        ctx = _setup_basic_0009(cur)
+        cur.execute(
+            "SELECT instrument_code FROM registry.instruments WHERE id = %s",
+            (ctx["instrument_id"],),
+        )
+        perp_instrument_code = cur.fetchone()[0]
+        conn.commit()
+
+    base_ts = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC)
+    intervals = [base_ts + timedelta(hours=8 * i) for i in range(3)]
+
+    # Track which intervals still need posting. After dispatch, this
+    # becomes empty so replay returns no events.
+    pending_intervals: list[datetime] = list(intervals)
+
+    with _connect() as conn, conn.cursor() as resolver_cur:
+        asset_id_resolver, instrument_id_resolver = _make_db_resolvers(resolver_cur)
+
+        def due_source(as_of):
+            return [
+                FundingDueEvent(
+                    instrument_code=perp_instrument_code,
+                    funded_at=t,
+                    venue_namespace="venue_test",
+                    venue_funding_id=f"BTCUSDT-{t.strftime('%Y%m%dT%H%M%S')}",
+                )
+                for t in pending_intervals
+            ]
+
+        def fund_callback(event):
+            record = FundingEventRecord(
+                venue_namespace=event.venue_namespace,
+                venue_funding_id=event.venue_funding_id,
+                portfolio_id=ctx["portfolio_id"],
+                strategy_id=ctx["strategy_id"],
+                account_id=ctx["account_id"],
+                instrument_id=ctx["instrument_id"],
+                instrument_code=perp_instrument_code,
+                quote_asset_symbol="USDT",
+                funding_rate=Decimal("0.0001"),
+                position_size=Decimal("-0.01"),
+                amount_usd=Decimal("0.05"),
+                direction="received",
+                funded_at=event.funded_at,
+                funding_environment="SHADOW",
+            )
+            draft = build_funding_journal(record, created_by="paper_runner")
+            write_and_post_funding_journal(
+                conn, draft, record,
+                posted_by="paper_runner",
+                asset_id_resolver=asset_id_resolver,
+                instrument_id_resolver=instrument_id_resolver,
+            )
+            conn.commit()
+            # Mark this interval as processed so replay returns no events.
+            pending_intervals.remove(event.funded_at)
+
+        runner = A1PaperRunner(
+            clock=lambda: base_ts + timedelta(hours=24),
+            funding_rate_source=lambda c, t: [],
+            submit_callback=lambda i: None,
+            current_position_source=lambda c: Decimal("0"),
+            due_events_source=due_source,
+            funding_event_callback=fund_callback,
+            instruments=[perp_instrument_code],
+            sizing_config=_sizing_for_btcusdt(perp_instrument_code, "BTCUSDT-SPOT"),
+            cost_model=cost_default(),
+            slippage_tier_name="btc_eth_top_tier",
+        )
+
+        # ─── First dispatch ────────────────────────────────────────────
+        result1 = runner.dispatch_due_funding_events()
+        assert result1.events_dispatched == 3
+        assert result1.error_count == 0
+
+        with _connect() as audit_conn, audit_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM accounting.funding_payments "
+                "WHERE source_type = 'funding_event'"
+            )
+            payments_after_first = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM accounting.journals "
+                "WHERE journal_type = 'funding' AND status = 'posted'"
+            )
+            journals_after_first = cur.fetchone()[0]
+        assert payments_after_first == 3
+        assert journals_after_first == 3
+
+        # ─── Replay ────────────────────────────────────────────────────
+        # All intervals were popped from pending_intervals during dispatch,
+        # so due_source now returns []. This simulates the production
+        # path where the DB query for "intervals lacking a payment" returns
+        # nothing once everything is posted.
+        result2 = runner.dispatch_due_funding_events()
+        assert result2.events == ()
+        assert result2.events_dispatched == 0
+
+        with _connect() as audit_conn, audit_conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) FROM accounting.funding_payments "
+                "WHERE source_type = 'funding_event'"
+            )
+            payments_after_replay = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM accounting.journals "
+                "WHERE journal_type = 'funding' AND status = 'posted'"
+            )
+            journals_after_replay = cur.fetchone()[0]
+        assert payments_after_replay == 3
+        assert journals_after_replay == 3

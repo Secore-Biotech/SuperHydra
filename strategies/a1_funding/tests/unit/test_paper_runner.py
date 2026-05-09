@@ -93,6 +93,7 @@ def _build_runner(
     current_position_source=None,
     due_events_source=None,
     submit_recorder: list = None,
+    fund_recorder: list = None,
     clock_value: datetime = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC),
 ):
     """Construct a runner with sensible defaults; tests override what they need."""
@@ -109,6 +110,9 @@ def _build_runner(
     if submit_recorder is None:
         submit_recorder = []
     submit_callback = submit_recorder.append
+    if fund_recorder is None:
+        fund_recorder = []
+    funding_event_callback = fund_recorder.append
 
     return A1PaperRunner(
         clock=lambda: clock_value,
@@ -116,6 +120,7 @@ def _build_runner(
         submit_callback=submit_callback,
         current_position_source=current_position_source,
         due_events_source=due_events_source,
+        funding_event_callback=funding_event_callback,
         instruments=instruments,
         sizing_config=_multi_instrument_sizing(instruments),
         cost_model=cost_default(),
@@ -141,6 +146,7 @@ class TestRunnerConstruction:
                 submit_callback=lambda i: None,
                 current_position_source=lambda c: Decimal("0"),
                 due_events_source=lambda t: [],
+                funding_event_callback=lambda e: None,
                 instruments=[],
                 sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
                 cost_model=cost_default(),
@@ -159,6 +165,7 @@ class TestRunnerConstruction:
                 submit_callback=lambda i: None,
                 current_position_source=lambda c: Decimal("0"),
                 due_events_source=lambda t: [],
+                funding_event_callback=lambda e: None,
                 instruments=["BTCUSDT_PERP"],
                 sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
                 cost_model=cost_default(),
@@ -174,6 +181,7 @@ class TestRunnerConstruction:
                 submit_callback=lambda i: None,
                 current_position_source=lambda c: Decimal("0"),
                 due_events_source=lambda t: [],
+                funding_event_callback=lambda e: None,
                 instruments=["BTCUSDT_PERP"],
                 sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
                 cost_model=cost_default(),
@@ -189,6 +197,7 @@ class TestRunnerConstruction:
                 submit_callback=lambda i: None,
                 current_position_source=lambda c: Decimal("0"),
                 due_events_source=lambda t: [],
+                funding_event_callback=lambda e: None,
                 instruments=["BTCUSDT_PERP"],
                 sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
                 cost_model=cost_default(),
@@ -215,6 +224,7 @@ class TestTickCoherence:
             submit_callback=lambda i: None,
             current_position_source=lambda c: Decimal("0"),
             due_events_source=lambda t: [],
+            funding_event_callback=lambda e: None,
             instruments=["BTCUSDT_PERP", "ETHUSDT_PERP"],
             sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
             cost_model=cost_default(),
@@ -462,3 +472,129 @@ class TestDiscoverDueFundingEvents:
         )
         runner.discover_due_funding_events(ts)
         assert submitted == []
+
+
+
+# ─── dispatch_due_funding_events ─────────────────────────────────────────
+
+
+class TestDispatchDueFundingEvents:
+    def test_dispatch_clock_called_once_and_propagated_to_source(self):
+        ts = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC)
+        clock_calls: list[datetime] = []
+        source_calls: list[datetime] = []
+
+        def clock():
+            clock_calls.append(ts)
+            return ts
+
+        def source(as_of):
+            source_calls.append(as_of)
+            return []
+
+        runner = A1PaperRunner(
+            clock=clock,
+            funding_rate_source=lambda c, t: [],
+            submit_callback=lambda i: None,
+            current_position_source=lambda c: Decimal("0"),
+            due_events_source=source,
+            funding_event_callback=lambda e: None,
+            instruments=["BTCUSDT_PERP"],
+            sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
+            cost_model=cost_default(),
+            slippage_tier_name="btc_eth_top_tier",
+        )
+        result = runner.dispatch_due_funding_events()
+        assert len(clock_calls) == 1
+        assert source_calls == [ts]
+        assert result.as_of == ts
+        assert result.events == ()
+        assert result.events_dispatched == 0
+        assert result.error_count == 0
+
+    def test_dispatch_calls_callback_per_event(self):
+        ts = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC)
+        events = [
+            FundingDueEvent(
+                instrument_code="BTCUSDT_PERP",
+                funded_at=ts + timedelta(hours=8 * i),
+                venue_namespace="venue_test",
+                venue_funding_id=f"BTCUSDT-evt-{i:03d}",
+            )
+            for i in range(3)
+        ]
+        recorded: list[FundingDueEvent] = []
+        runner = _build_runner(
+            due_events_source=lambda as_of: events,
+            fund_recorder=recorded,
+        )
+        result = runner.dispatch_due_funding_events()
+        assert result.events_dispatched == 3
+        assert result.error_count == 0
+        assert recorded == events
+
+    def test_dispatch_empty_events_no_callback(self):
+        recorded: list[FundingDueEvent] = []
+        runner = _build_runner(
+            due_events_source=lambda as_of: [],
+            fund_recorder=recorded,
+        )
+        result = runner.dispatch_due_funding_events()
+        assert result.events == ()
+        assert recorded == []
+
+    def test_dispatch_callback_error_captured_and_continues(self):
+        ts = datetime(2026, 1, 5, 0, 0, 0, tzinfo=UTC)
+        events = [
+            FundingDueEvent(
+                instrument_code="BTCUSDT_PERP",
+                funded_at=ts,
+                venue_namespace="venue_test",
+                venue_funding_id="evt_0",
+            ),
+            FundingDueEvent(
+                instrument_code="BTCUSDT_PERP",
+                funded_at=ts,
+                venue_namespace="venue_test",
+                venue_funding_id="evt_BAD",
+            ),
+            FundingDueEvent(
+                instrument_code="BTCUSDT_PERP",
+                funded_at=ts,
+                venue_namespace="venue_test",
+                venue_funding_id="evt_2",
+            ),
+        ]
+        seen: list[str] = []
+
+        def cb(event):
+            if "BAD" in event.venue_funding_id:
+                raise RuntimeError("synthetic failure")
+            seen.append(event.venue_funding_id)
+
+        runner = A1PaperRunner(
+            clock=lambda: ts,
+            funding_rate_source=lambda c, t: [],
+            submit_callback=lambda i: None,
+            current_position_source=lambda c: Decimal("0"),
+            due_events_source=lambda as_of: events,
+            funding_event_callback=cb,
+            instruments=["BTCUSDT_PERP"],
+            sizing_config=_sizing_for_btcusdt("BTCUSDT_PERP", "BTCUSDT_SPOT"),
+            cost_model=cost_default(),
+            slippage_tier_name="btc_eth_top_tier",
+        )
+        result = runner.dispatch_due_funding_events()
+        assert result.events_dispatched == 2
+        assert result.error_count == 1
+        assert "BAD" in result.error_messages[0]
+        assert seen == ["evt_0", "evt_2"]
+
+    def test_dispatch_due_events_source_error_captured(self):
+        def bad(as_of):
+            raise RuntimeError("vendor down")
+        runner = _build_runner(due_events_source=bad)
+        result = runner.dispatch_due_funding_events()
+        assert result.events == ()
+        assert result.error_count == 1
+        assert "vendor down" in result.error_messages[0]
