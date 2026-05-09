@@ -41,6 +41,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from analytics.effective_spread import estimate_roll, RollEstimate
+from data.ingestion.vendors.binance.archive_trade_fetcher import (
+    BinanceArchiveTradeFetcher,
+)
 from data.ingestion.vendors.binance.trade_fetcher import (
     BinanceTradeFetcher,
     PermanentFetcherError,
@@ -51,20 +54,14 @@ from data.ingestion.vendors.binance.trade_fetcher import (
 # Predefined regime windows: 5 windows of 5 minutes each, distributed
 # every 3 days through a 14-day fixture window, at 12:00 UTC.
 #
-# WARNING (Day 19b finding, 2026-05-09):
+# NOTE (Day 19b finding + Day 19c.3 resolution):
 #   Binance /fapi/v1/aggTrades REST endpoint serves recent history only.
 #   The 'quiet' (Jan 2025) and 'volatile' (Mar 2024) regimes BELOW are
-#   operationally inaccessible via this endpoint — both return zero
-#   trades. To use these windows, ingest from data.binance.vision
-#   monthly archives instead (Day 19c deliverable:
-#   data/ingestion/vendors/binance/archive_trade_fetcher.py). The REST
-#   fetcher in trade_fetcher.py works correctly for recent windows; it
-#   is the venue's data-availability boundary that excludes deep
-#   history, not a fetcher bug.
-#
-#   Until Day 19c lands, --regime quiet and --regime volatile will
-#   produce empty artifacts. Use --regime custom with recent
-#   timestamps for any meaningful Roll estimation today.
+#   operationally inaccessible via REST and return zero trades there.
+#   Use --source archive to ingest from data.binance.vision monthly
+#   archives instead. The REST fetcher works correctly for recent
+#   windows; the data-availability boundary is venue-side. The
+#   --source archive path was added in Day 19c.3.
 #
 PREDEFINED_REGIMES = {
     "quiet": [
@@ -134,6 +131,10 @@ def parse_args() -> argparse.Namespace:
                    help="Window length in minutes (default 5)")
     p.add_argument("--output", required=True,
                    help="Output path for JSON artifact")
+    p.add_argument("--source", default="rest",
+                   choices=["rest", "archive"],
+                   help="Data source: 'rest' uses /fapi/v1/aggTrades (recent history only); "
+                        "'archive' uses data.binance.vision monthly archives (deep history)")
     return p.parse_args()
 
 
@@ -158,10 +159,14 @@ def main() -> int:
     else:
         windows = PREDEFINED_REGIMES[args.regime]
 
-    print(f"Estimating Roll spread for {args.symbol} in regime '{args.regime}'")
+    print(f"Estimating Roll spread for {args.symbol} in regime '{args.regime}' "
+          f"using --source {args.source}")
     print(f"Windows: {len(windows)} of {args.window_minutes}min each")
 
-    fetcher = BinanceTradeFetcher()
+    if args.source == "rest":
+        fetcher = BinanceTradeFetcher()
+    else:
+        fetcher = BinanceArchiveTradeFetcher()
     window_delta = timedelta(minutes=args.window_minutes)
 
     per_window: list[dict] = []
@@ -245,6 +250,7 @@ def main() -> int:
         "symbol": args.symbol,
         "regime": args.regime,
         "window_minutes": args.window_minutes,
+        "source": args.source,
         "estimator_name": "roll_1984",
         "estimator_version": "v1",
         "started_at_utc": started_at.isoformat(),
