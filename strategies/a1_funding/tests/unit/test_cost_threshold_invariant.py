@@ -1,18 +1,18 @@
 """Cost-threshold structural invariant tests.
 
 These tests document a NARROW invariant:
-    Under the conservative_default_v0 placeholder cost model, the
+    Under the placeholder_v0 cost model (alias: conservative_default_v0), the
     per-funding-interval breakeven threshold for A1's signal evaluator
     exceeds Binance BTCUSDT's structural 0.01% per-8h funding cap.
 
 This is NOT a universal A1 invariant. It is a finding about the
 specific combination of:
-  - the conservative_default_v0 cost model (placeholder values
+  - the placeholder_v0 cost model (placeholder values
     explicitly documented as "pending empirical calibration"), and
   - Binance BTCUSDT (whose funding rate is structurally capped at
     0.01% per 8-hour funding interval).
 
-The structural consequence: A1 + conservative_default_v0 + Binance
+The structural consequence: A1 + placeholder_v0 + Binance
 BTCUSDT can never produce a non-flat signal under any historical
 funding regime, because even a maximally favorable single interval
 falls short of breaking even after fees, slippage, and borrow.
@@ -37,7 +37,7 @@ from pathlib import Path
 
 import pytest
 
-from core.config.cost_model import conservative_default_v0
+from core.config.cost_model import placeholder_v0
 
 
 # Binance BTCUSDT funding rate is structurally capped at 0.01% per 8h
@@ -57,7 +57,7 @@ def _per_period_cost_rate_from_default() -> Decimal:
     formula. If evaluate_signal's cost computation changes, this test
     must change with it (and the failure tells the implementer to
     re-evaluate the structural invariant)."""
-    cost_model = conservative_default_v0()
+    cost_model = placeholder_v0()
 
     # The default config has a single fee schedule and a single slippage
     # tier. If that ever changes, the test should re-pick the same way
@@ -81,7 +81,7 @@ def _per_period_cost_rate_from_default() -> Decimal:
 
 
 def test_btcusdt_funding_cap_below_placeholder_cost_threshold():
-    """PRIMARY INVARIANT: conservative_default_v0's per-period cost
+    """PRIMARY INVARIANT: placeholder_v0's per-period cost
     threshold exceeds Binance BTCUSDT's 0.01% structural funding cap.
 
     Under the placeholder cost model, A1 cannot produce a non-flat signal

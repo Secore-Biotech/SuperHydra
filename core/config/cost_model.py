@@ -94,6 +94,46 @@ class BorrowCost:
 
 
 @dataclass(frozen=True)
+class ProfileSource:
+    """Source attribution for a calibrated cost profile.
+
+    Documents WHERE the numeric values came from and WHEN they were
+    valid. Two profiles claiming to model the same venue/tier should
+    cite the same source URL; differing values across profiles with
+    matching sources indicate a calibration bug.
+
+    Fields:
+      source_url: canonical URL where the venue's official fee schedule
+        is documented. For Binance: docs URL or fee-schedule page.
+      source_as_of: ISO date string (YYYY-MM-DD) when the values were
+        captured from source. Profiles SHOULD be re-verified periodically;
+        this field tells the next maintainer when verification is due.
+      notes: free-text, included in hash. Use this to record edge cases
+        (e.g. "BNB discount applied"; "VIP5 maker -0.0001 floor").
+    """
+
+    source_url: str
+    source_as_of: str  # YYYY-MM-DD
+    notes: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.source_url or not self.source_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"source_url must be an http(s) URL, got {self.source_url!r}"
+            )
+        # Crude format check: YYYY-MM-DD has 10 chars with dashes at
+        # positions 4 and 7.
+        if (
+            len(self.source_as_of) != 10
+            or self.source_as_of[4] != "-"
+            or self.source_as_of[7] != "-"
+        ):
+            raise ValueError(
+                f"source_as_of must be YYYY-MM-DD, got {self.source_as_of!r}"
+            )
+
+
+@dataclass(frozen=True)
 class CostModelConfig:
     """Full cost model — one snapshot, hashable.
 
@@ -108,6 +148,8 @@ class CostModelConfig:
     funding_uncertainty: FundingUncertainty
     borrow_cost: BorrowCost
     notes: str = ""  # free-text, included in hash so changing notes changes hash
+    profile_name: str | None = None  # e.g. "binance_vip5_btc_v1"; in hash if set
+    source: ProfileSource | None = None  # in hash if set
 
     def __post_init__(self) -> None:
         if self.schema_version != COST_MODEL_SCHEMA_VERSION:
@@ -155,11 +197,23 @@ class CostModelConfig:
             },
             "notes": self.notes,
         }
+        # New optional fields are included in the hash ONLY when set.
+        # This preserves placeholder_v0's hash stability: a config
+        # that doesn't set profile_name/source produces the same hash
+        # it produced before these fields were added.
+        if self.profile_name is not None:
+            payload["profile_name"] = self.profile_name
+        if self.source is not None:
+            payload["source"] = {
+                "url": self.source.source_url,
+                "as_of": self.source.source_as_of,
+                "notes": self.source.notes,
+            }
         canonical = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(canonical).hexdigest()
 
 
-def conservative_default_v0() -> CostModelConfig:
+def placeholder_v0() -> CostModelConfig:
     """Conservative seed config per roadmap §3.1.1.
 
     These values are explicitly placeholders. They exist so the system can
@@ -196,5 +250,186 @@ def conservative_default_v0() -> CostModelConfig:
             "v0 conservative defaults per roadmap §3.1.1. "
             "Placeholders pending empirical calibration. "
             "Do not interpret these values as production assumptions."
+        ),
+    )
+
+
+
+# ─── Backward-compatible alias ───────────────────────────────────────────
+# `conservative_default_v0` was the original name of the placeholder cost
+# model. Day 17a renamed the canonical implementation to `placeholder_v0`
+# to make the placeholder vs. calibrated distinction explicit. The old
+# name is preserved as an alias so existing imports continue to work.
+# New code should use `placeholder_v0()`.
+conservative_default_v0 = placeholder_v0
+
+
+# ─── Calibrated Binance profiles (Day 17a) ───────────────────────────────
+
+
+def binance_vip0_retail_v1() -> CostModelConfig:
+    """Conservative public-user profile: Binance VIP0, no BNB discount.
+
+    Represents the worst realistic Binance retail user. This is the
+    baseline against which all other Binance profiles claim improvement.
+
+    Reference values (Binance official fee schedules):
+      - USDM-Futures VIP0: maker 2 bps (0.02%), taker 5 bps (0.05%)
+      - Spot VIP0:         maker 10 bps (0.1%), taker 10 bps (0.1%)
+    A1 trades the perp leg on USDM-Futures and hedges on Spot, so the
+    per-leg fees here are the futures schedule (the spot leg is much
+    more expensive — see binance_vip5_btc_v1 for a profile that models
+    a maker-rebate spot hedge).
+
+    Slippage:
+      - btc_eth_top_tier: 1 bp (top-of-book BTC/ETH typical fill cost)
+
+    Borrow:
+      - daily_bps: 1 bp/day floor — same conservative non-zero as
+        placeholder_v0 pending empirical calibration.
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                maker_bps=Decimal("0.0002"),  # 2 bps VIP0 USDM maker
+                taker_bps=Decimal("0.0005"),  # 5 bps VIP0 USDM taker
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="btc_eth_top_tier",
+                slippage_bps=Decimal("0.0001"),  # 1 bp
+            ),
+        ),
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day
+        ),
+        notes="Binance VIP0 retail, no BNB discount; calibrated Day 17a.",
+        profile_name="binance_vip0_retail_v1",
+        source=ProfileSource(
+            source_url="https://www.binance.com/en/fee/futureFee",
+            source_as_of="2026-05-09",
+            notes="USDM-Futures VIP0 schedule.",
+        ),
+    )
+
+
+def binance_vip5_btc_v1() -> CostModelConfig:
+    """Realistic mid-VIP retail profile with BNB discount: Binance VIP5,
+    BNB-fee-discount enabled. This is the default reference profile for
+    A1 BTC/ETH economics.
+
+    Reference values (Binance official fee schedules):
+      - USDM-Futures VIP5: maker 1.2 bps (0.012%), taker 3.0 bps (0.03%)
+      - 10% BNB discount on eligible USDM-Futures fees per Binance FAQ
+        => effective maker 1.08 bps, taker 2.7 bps
+
+    Slippage:
+      - btc_eth_top_tier: 1 bp
+
+    Borrow:
+      - daily_bps: 1 bp/day floor
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                # 1.2 bps * 0.9 (BNB discount) = 1.08 bps
+                maker_bps=Decimal("0.000108"),
+                # 3.0 bps * 0.9 (BNB discount) = 2.7 bps
+                taker_bps=Decimal("0.000270"),
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="btc_eth_top_tier",
+                slippage_bps=Decimal("0.0001"),  # 1 bp
+            ),
+        ),
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day
+        ),
+        notes=(
+            "Binance VIP5 USDM-Futures with 10% BNB discount on fees; "
+            "calibrated Day 17a per Binance public fee schedule."
+        ),
+        profile_name="binance_vip5_btc_v1",
+        source=ProfileSource(
+            source_url="https://www.binance.com/en/fee/futureFee",
+            source_as_of="2026-05-09",
+            notes=(
+                "USDM-Futures VIP5 schedule, 10% BNB discount applied "
+                "per Binance Futures FAQ."
+            ),
+        ),
+    )
+
+
+def binance_vip9_institutional_v1() -> CostModelConfig:
+    """Aggressive institutional profile: Binance VIP9, BNB-fee-discount
+    enabled. Few users qualify; this profile represents the best-case
+    economics A1 can achieve on Binance.
+
+    Reference values (Binance official fee schedules):
+      - USDM-Futures VIP9: maker 0 bps, taker 1.7 bps (0.017%)
+        (VIP9 maker is sometimes negative as a rebate; we model 0
+        conservatively pending empirical confirmation.)
+      - 10% BNB discount on eligible USDM-Futures fees
+        => effective maker 0 bps, taker 1.53 bps
+
+    Slippage:
+      - btc_eth_top_tier: 1 bp
+
+    Borrow:
+      - daily_bps: 1 bp/day floor
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                # VIP9 maker 0 bps * 0.9 (BNB discount) = 0 bps
+                maker_bps=Decimal("0"),
+                # 1.7 bps * 0.9 (BNB discount) = 1.53 bps
+                taker_bps=Decimal("0.000153"),
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="btc_eth_top_tier",
+                slippage_bps=Decimal("0.0001"),  # 1 bp
+            ),
+        ),
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day
+        ),
+        notes=(
+            "Binance VIP9 institutional with 10% BNB discount; "
+            "VIP9 maker conservatively modeled at 0 (rebate path "
+            "pending empirical confirmation); calibrated Day 17a."
+        ),
+        profile_name="binance_vip9_institutional_v1",
+        source=ProfileSource(
+            source_url="https://www.binance.com/en/fee/futureFee",
+            source_as_of="2026-05-09",
+            notes=(
+                "USDM-Futures VIP9 schedule, 10% BNB discount applied. "
+                "Maker rebate path not yet modeled."
+            ),
         ),
     )
