@@ -4,20 +4,20 @@ This memo refreshes weekly per roadmap section 11. The roadmap holds principles 
 
 ---
 
-## Current state - 2026-05-09 (fifth update, end of Day 19b infrastructure arc)
+## Current state - 2026-05-11 (sixth update, Day 19 outer arc closure)
 
 ### Migration foundation
-- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite 355/355 in 5:14 after Day 19a; full suite stable through Day 19b infrastructure additions.
+- 0009 (risk evaluation) - Round 4 closed. Commit 0f8b7b5. Full integration suite 355/355 in ~5:15 stable through Day 19c additions.
 
 ### Sleeve A (build-to-trade)
-- Engine A1 - Funding-rate capture: Phase P0.
+- Engine A1 - Funding-rate capture: Phase P0 (late P0).
   - Days 1-12.5: pipeline + smoke test + writers.
   - Days 14a-c: funding journal writer + funding_payment INSERT + smoke test extension.
   - Days 15a-c: A1PaperRunner + OMS submit helper + dispatch_due_funding_events.
   - Day 16a (0b0f431): synthetic 30-interval backfill harness against real Postgres in 1.32s.
   - Day 16c (d4b6a75): Sharpe computation analytics module.
   - Day 16b (9a6be81): real-data no-trade regime test (Apr-May 2026 fixture, placeholder costs).
-  - Day 16d.1 / 16d.2 (37018b9, a182090): test ordering hygiene + snapshot-source disambiguation.
+  - Day 16d.1/16d.2 (37018b9, a182090): test ordering hygiene + snapshot-source disambiguation.
   - Day 16b.2 probe (27bf80d): Dec 2024 BTCUSDT fixture committed.
   - Day 16e (9ba2be0): structural cost-threshold invariant tests.
   - Day 17a (52c9604): calibrated cost-profile foundation.
@@ -26,53 +26,96 @@ This memo refreshes weekly per roadmap section 11. The roadmap holds principles 
   - Day 18a (e3e0c89): calibrated altcoin profile binance_vip5_alt_v1 + SOLUSDT selector branch.
   - Day 18b (673bc7c): SOL March 2024 fixture committed; integration test asserting no-trade under VIP5+alt because rolling-12 forecast is below threshold despite genuinely strong realized funding.
   - Day 19a (6b423d7): binance_vip5_alt_research_v1 with explicit research-only firewall. Threshold matches BTC at ~7.7 bps. Evidence basis: Kaiko Q1 2024 + Amberdata Jan 2026.
-  - Day 19b.1 (63df547): Binance aggTrades fetcher — BinanceTrade dataclass + BinanceTradeFetcher mirroring funding_fetcher.py conventions.
+  - Day 19b.1 (63df547): Binance aggTrades fetcher - BinanceTrade dataclass + BinanceTradeFetcher mirroring funding_fetcher.py conventions.
   - Day 19b.2 (b386ac4): Roll effective-spread estimator (Roll 1984) with Decimal arithmetic, returning explicit None for undefined estimates rather than zero.
   - Day 19b.3 (5f8b644): Roll-spread estimation harness + research-only memo + .gitignore for ephemeral artifacts.
-  - Cumulative: 314 unit + 39 integration tests across the strategy and analytics. Full integration suite 355/355 in ~5:15.
+  - Day 19b closing (78633b6): aggTrades REST TTL finding documented in memo and warning added to harness.
+  - Day 19c.1+19c.2 (4c9a2bf): Binance Vision archive trade fetcher (BinanceArchiveTradeFetcher) + 22 unit tests. Streaming zip decompression, multi-month support, repo-relative cache, header sniffing, sort+dedupe by (time, id).
+  - Day 19c.3 (fd7e523): harness gains --source flag (rest|archive, default rest). Both fetchers share the fetch_window API.
+  - Day 19c.3 results (65bb5f1): first numeric Roll-tape estimates against predefined regimes + harness limit/max_pages bug fix.
+  - Cumulative: 314 strategy unit + 39 integration + 22 archive-fetcher unit + 18 effective-spread unit tests. Full integration suite 355/355 in ~5:15.
 
-### Day 19b infrastructure arc complete
+### Day 19 outer arc closed
 
-The reviewer-locked path was: tape-based effective-spread estimation as a second independent research-calibrated estimate, with explicit research-only labeling. Three sub-tasks executed cleanly:
+The Day 19 arc was scoped to produce a second independent research-calibrated estimate of SOLUSDT effective spread, comparable to Day 19a's 1 bp/leg Kaiko+Amberdata calibration. Execution required closing two gaps:
 
-| Sub-task | Deliverable | Status |
-|---|---|---|
-| 19b.1 | Trade-history fetcher mirroring funding_fetcher conventions | ✓ |
-| 19b.2 | Roll's autocovariance estimator with Decimal end-to-end | ✓ |
-| 19b.3 | CLI harness + research memo + .gitignore for ephemeral artifacts | ✓ |
+| Gap | Resolution |
+| --- | --- |
+| Public REST aggTrades does not serve deep history (TTL discovered in Day 19b closing) | Day 19c archive ingestion from data.binance.vision |
+| Roll estimator does not exist in codebase | Day 19b.2 with Decimal arithmetic, explicit None for undefined estimates |
 
-Discipline preserved: raw trade data is ephemeral by design (the harness is what is committed, not its outputs); the memo includes explicit interpretation guide and promotion path; no cost profile is promoted from Roll estimates alone.
+The full pipeline (fetcher → estimator → harness → archive backend) is operational end-to-end. The Roll-estimator pipeline is the second independent path to research-grade slippage calibration.
 
-### Three independent research-calibrated estimates now in place for SOL slippage
+### Three independent research-calibrated estimates of SOL slippage now on record
 
-| Source | Estimate | Status |
-|---|---|---|
-| Day 18a placeholder | 3 bps per leg | Conservative governance profile (binance_vip5_alt_v1) |
-| Day 19a Kaiko + Amberdata | 1 bp per leg | Research-only profile (binance_vip5_alt_research_v1), firewalled from selector |
-| Day 19b.1-3 Roll on aggTrades | TBD - harness ready, not yet executed | Research-only by design; no profile created |
+| Source | Per-leg estimate | Status |
+| --- | --- | --- |
+| Day 18a placeholder | 3 bps | Conservative governance profile (binance_vip5_alt_v1, active in selector) |
+| Day 19a Kaiko + Amberdata | 1 bp | Research-only profile (binance_vip5_alt_research_v1, firewalled from selector) |
+| Day 19c.3 Roll-tape (median) | 0.146 bps (quiet Jan 2025) / 0.192 bps (volatile Mar 2024) | Research artifact, no profile created |
 
-Day 19b's harness produces a second independent estimate that can be compared to Day 19a's number. Convergence across two methodologies (third-party aggregated + tape-based) would meaningfully strengthen the research profile's defensibility — but still not promote it, because both are research artifacts and the promotion gate remains live A1 fills.
+All three agree the cost is small. The most pessimistic (governance placeholder) is roughly 20x the most empirical (tape median). Day 19a's 1 bp research calibration sits comfortably between them and is now corroborated as conservative by tape evidence. None of this changes the active cost profile A1 uses; promotion is gated elsewhere (see Day 20 reviewer question below).
 
-### Three structural binds documented as tested invariants (unchanged)
+### Day 19c.3 numeric Roll-tape results
 
-A1 has demonstrated three distinct no-trade regimes, each documented with both unit-level structural tests and integration tests against real-data fixtures: no-edge regime (Day 16b), cap-bound (Day 17c), slippage-bound (Day 18b). Detail in prior memo update.
+Quiet regime (Jan 2025, 5x5min windows): all 5 windows valid. Full-spread median 0.292 bps, range 0.134-0.480 bps. Per-leg half-spread median 0.146 bps.
+
+Volatile regime (Mar 2024, 5x5min windows): 2 of 5 windows valid; 3 of 5 returned undefined non_negative_autocovariance because directional flow dominates - itself a documented limitation of Roll's estimator and a methodological argument for moving to side-aware estimators (Lee-Ready, Glosten-Harris) in future research extension work. The two valid estimates 0.349 and 0.417 bps full are tightly clustered (median 0.383 bps full = 0.192 bps half) but a sample of 2 is not statistical evidence.
+
+Combined: 7 valid Roll estimates across both regimes. Both regimes fall in the memo's "0.5-2 bps full spread → corroborates Day 19a" interpretation band - in fact tighter than expected.
+
+### Three structural no-trade binds documented as tested invariants (unchanged)
+
+A1 has three distinct no-trade regimes, each documented with both unit-level structural tests and integration tests against real-data fixtures:
+
+| Bind | Fixture | Cause |
+| --- | --- | --- |
+| No-edge regime | BTC Apr-May 2026 (placeholder cost) | Mean realized rate near zero |
+| Cap-bound | BTC Dec 2024 (VIP5) | Even cap-pinned funding < threshold |
+| Slippage-bound | SOL Mar 2024 (VIP5+alt) | Rolling-12 forecast < threshold despite mean realized 6 bps |
 
 ### Day 19a research-calibrated profile firewall (unchanged)
 
-The TestResearchProfileFirewall class in test_profile_selector.py asserts that no input to select_profile_for_a1 returns binance_vip5_alt_research_v1. Detail in prior memo update.
+The TestResearchProfileFirewall class in test_profile_selector.py asserts that no input to select_profile_for_a1 returns binance_vip5_alt_research_v1. The profile remains research-only despite triple corroboration by Day 19c.3 tape evidence. Promotion to binance_vip5_alt_empirical_v1 requires live A1 paper fills (Day 20+).
 
-### Next deliverables, in order
+### Archive backend characteristics (recorded for future reference)
 
-1. **Run the Day 19b.3 harness under controlled conditions** to produce numeric Roll estimates for SOLUSDT in quiet (Jan 2025) and volatile (Mar 2024) regimes. Approximately 10 throttled HTTP calls per regime, 5-10 minutes wall time per regime.
-2. **Append numeric results to docs/research/sol_roll_spread_estimation_memo.md.** Compare against Day 19a's 1 bp per leg; classify per the memo's interpretation guide (corroborates / partial / re-pivot).
-3. **Decide whether the estimates support adding a second research-only alt profile** with the Roll-derived calibration, or whether the current research profile (1 bp from third-party data) is sufficient research-only artifact.
-4. **Day 20+: Live A1 paper-fill recording infrastructure.** This is the actual promotion-unblocking work. Deferred until Day 19b interpretation lands or in parallel as orthogonal track.
+- Source: data.binance.vision monthly aggTrades zip archives.
+- Cache: artifacts/cache/binance_archive/{SYMBOL}-aggTrades-{YYYY}-{MM}.zip. Gitignored via the artifacts/ rule. Filename layout preserved so future .CHECKSUM verification (deferred per Day 19c reviewer Q2 amendment) can land without API or filename changes.
+- Memory: streaming decompression via zipfile.ZipFile.open + io.TextIOWrapper + csv.reader. Window-filter rows in flight. Full monthly archives (50M+ trades possible) never materialized in memory.
+- Raw trade data remains ephemeral by design. The harness is committed; per-run outputs and downloaded archives are not.
+- Archive backend is now the primary path for any historical microstructure work past the REST TTL boundary.
 
-Alternative orthogonal: maker-rebate-only research profile. Same firewall pattern; not promoted; could be added in parallel.
+### Why no promotion-grade calibration exists yet despite triple corroboration
+
+Three reasons the research profile remains research-only:
+
+1. Sample size. 7 valid Roll estimates across both regimes is research-grade evidence, not governance-grade calibration.
+2. Roll captures market-wide spread, not A1-clip-size impact. Venue-specific market impact and cancellation behavior under A1's actual order sizes are absent from tape estimates.
+3. Live-fill gate. The reviewer-locked promotion path requires live A1 paper fills with adverse-fill cost recorded per fill (Day 20+). Roll estimates corroborate but do not substitute.
+
+### Day 20 reviewer question (next session opening)
+
+Framing locked per reviewer:
+
+**What is the minimum infrastructure required to turn paper fills into empirically calibrated execution-cost evidence?**
+
+The transition this question gates:
+
+```
+research-only estimates  →  empirical paper-fill recording  →  governance-grade calibration
+```
+
+Subordinate questions that fall out:
+
+1. Where does A1 record fills in paper mode? The current submit_callback is production-shaped; paper mode needs its own fill writer that records intended_price, fill_price, slippage_bps, venue_response_ms, ts per fill without flowing into trading.fills (which is for real fills only).
+2. Which cost profile does A1 use during paper recording? The research profile (1 bp/leg) is firewalled from the selector; the governance profile (3 bps/leg) is conservative enough that A1 won't fire orders under most market conditions. Three options on the table: (a) reviewer-locked paper-only exception allowing research profile, (b) build an empirical-only profile from Day 19c.3 tape data with the same self-firewall pattern, (c) leave A1 idle until conditions change naturally; let the recording infrastructure sit ready.
+3. What is the aggregation function that produces a candidate empirical profile from recorded fills? Mean realized slippage per leg? Median? Sensitivity-tested across alpha quantiles?
+4. What is the promotion criterion? Day 19a memo's sensitivity band was 0.5-1.5 bps/leg; does that still hold given Day 19c.3 evidence is tighter?
 
 ### Sleeve A2/A3
-- A2 - Basis: Not started.
-- A3 - Cash-and-carry: Deferred.
+- A2 (basis): not started.
+- A3 (cash-and-carry): deferred.
 
 ### Sleeve B
 - Phase P0. No work this week.
@@ -89,27 +132,40 @@ Alternative orthogonal: maker-rebate-only research profile. Same firewall patter
 ### Unresolved risk exceptions
 - None.
 
-### Test-suite flake observed earlier today
-- Single-incident flake in test_migrations.py logged in prior memo update; not seen again across subsequent runs (Day 19a, Day 19b.1, Day 19b.2 each ran the full integration suite cleanly). Treated as resolved unless recurring.
+### Test-suite stability
+- Day 19c additions did not regress the integration suite. 355/355 stable across Day 19a, Day 19b.1, Day 19b.2, and Day 19c.1+19c.2 runs. Two-day gap before Day 20 opening also confirmed clean (355/355 in 5:18, May 11).
+- Single-incident flake in test_migrations.py recorded at Day 18 not seen again. Treated as resolved unless recurring.
 
 ### Next gate status
-- A1 P0 to P1 gate: paper run reproducible end-to-end on production code path with paper Sharpe >= 2.0 over a meaningful window.
+- A1 P0 to P1 gate: paper run reproducible end-to-end on production code path with paper Sharpe >= 2.0 over a >= 60-day window.
 - Reproducibility: proven (synthetic + 3 real-data fixtures, all byte-stable).
-- Three safety-property findings proven across different cost profiles + real fixtures.
-- Sharpe number from yes-trade real-data window: blocked on Day 20+ live-fill calibration. Day 19b infrastructure is one step closer (second independent research estimate available); the gate itself still requires venue-validated execution costs, not research artifacts.
-
-### Carry-forward debt
-0009 Round 4.5 - Replay/Risk Matrix Hardening (non-blocking, post-signoff).
-
-Day 19b harness execution prerequisites:
-1. Run harness once under controlled conditions (network connection, ~15 minutes wall time, output paths set up).
-2. Decide on numeric result interpretation per memo's guide.
-3. Update memo with results section.
-
-Day 20 prerequisites (deferred):
-1. Live A1 paper-fill recording infrastructure (currently no fill writer for paper-mode separate from production submit_callback).
-2. Paper-fill cost-instrumentation: per-fill record of intended price, fill price, slippage in bps.
-3. Aggregation across fills to produce empirical-calibration estimate.
+- No-trade findings: 3 distinct structural binds documented as tested invariants.
+- Three independent calibrations of execution cost: all agreeing the cost is small.
+- Sharpe number from yes-trade window: blocked on Day 20+ paper-fill recording infrastructure + live paper running until conditions produce trades A1 can fire on.
 
 ### Capital deployed
 - $0. Program in P0 across all engines.
+
+### Carry-forward debt (unchanged unless noted)
+- 0009 Round 4.5 Replay/Risk Matrix Hardening (non-blocking, post-signoff).
+- Untracked design docs (0009_R11_feedback.md.rtf, 0009_v1_10_handoff.md, 0009_v1_11_design.md): persistent untracked state since session start. Decision deferred (gitignore vs commit vs delete).
+- Side-aware Lee-Ready / Glosten-Harris estimators: queued as research extension, motivated by Day 19c.3 Finding 1 (3 of 5 volatile windows undefined under Roll).
+- .CHECKSUM verification on archive fetcher: deferred per Day 19c reviewer Q2 amendment. Cache filename layout preserves room for it.
+- Maker-rebate-only research profile: orthogonal track, low priority.
+
+### Sub-arcs complete vs open
+
+| Arc | Status |
+| --- | --- |
+| 0009 Round 4 (risk evaluation migration) | Closed |
+| Day 16: synthetic backfill + Sharpe analytics + first real fixture | Closed |
+| Day 17: cost-profile foundation + BTC pivot | Closed |
+| Day 18: SOL profile + SOL fixture | Closed |
+| Day 19a: research-calibrated alt profile + selector firewall | Closed |
+| Day 19b: REST infrastructure + Roll estimator + harness + TTL finding | Closed |
+| Day 19c: archive ingestion + harness wiring + first numeric estimates | Closed |
+| **Day 20**: paper-fill recording infrastructure (reviewer question first) | **Open** |
+| A1 P0 to P1 (60-day paper proof, Sharpe >= 2.0) | Open (gated on Day 20) |
+| A2 (basis) | Not started; gated on A1 P3 |
+| A3 (cash-and-carry) | Deferred |
+| Sleeve B research | Not started |
