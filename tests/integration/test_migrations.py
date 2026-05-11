@@ -51,6 +51,7 @@ def fresh_db():
                 schemas = [
                     "validation", "feature_store", "market_data", "data_ingestion",
                     "audit", "risk", "positions", "trading", "accounting", "registry",
+                    "paper",
                 ]
                 for schema in schemas:
                     cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
