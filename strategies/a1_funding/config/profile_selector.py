@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from core.config.cost_model import (
     CostModelConfig,
+    binance_vip5_alt_research_v1,
     binance_vip5_alt_v1,
     binance_vip5_btc_v1,
 )
@@ -104,4 +105,71 @@ def select_profile_for_a1(
         f"No A1 cost profile for venue {venue!r}. Currently supported: "
         f"\"binance\" only. Multi-venue support is deferred to a later "
         f"Day."
+    )
+
+
+
+# ─── EXPLICIT FIREWALL HOLE (Day 20.4) ────────────────────────────────────
+#
+# The function below returns research-firewalled cost profiles for use
+# in PAPER_RESEARCH-mode paper.fills writes ONLY. It is named with an
+# explicit `_research_` infix so the firewall hole is visible at every
+# call site grep would find. The default selector `select_profile_for_a1`
+# above continues to refuse research profiles; the firewall regression
+# test (TestResearchProfileFirewall) verifies that no input to the
+# default selector returns a research-named profile.
+#
+# Callers using `select_research_profile_for_a1` are responsible for
+# ensuring the result flows ONLY into:
+#   - paper.fills rows with source_mode='PAPER_RESEARCH'
+#   - promotion_eligible = false (enforced by DB CHECK)
+#   - Never trading.fills, never accounting.funding_payments
+#
+# Misuse outside PAPER_RESEARCH mode is the caller's bug; the firewall
+# at the schema/DB layer remains in place regardless.
+
+
+def select_research_profile_for_a1(
+    instrument_code: str,
+    venue: str,
+) -> CostModelConfig:
+    """Return the research-firewalled cost profile for a PAPER_RESEARCH
+    paper.fills write.
+
+    This function is the ONLY supported way to obtain a research profile
+    for use in A1's paper-research flow. It is intentionally NOT the
+    default selector; the default `select_profile_for_a1` continues to
+    refuse research profiles.
+
+    Args:
+        instrument_code: Venue-native instrument symbol (case-sensitive).
+        venue: Venue identifier (case-insensitive).
+
+    Returns:
+        A research-firewalled CostModelConfig. Caller responsibility:
+        the result must only be used for PAPER_RESEARCH paper.fills
+        writes, never for live execution, canary, or any record marked
+        promotion_eligible=true.
+
+    Raises:
+        NotImplementedError: when no research profile exists for the
+            (instrument_code, venue) pair.
+    """
+    venue_normalized = venue.lower()
+
+    if venue_normalized == "binance":
+        if instrument_code in _BINANCE_LIQUID_ALT_INSTRUMENTS:
+            return binance_vip5_alt_research_v1()
+        raise NotImplementedError(
+            f"No A1 research profile for instrument_code={instrument_code!r} "
+            f"on venue {venue!r}. Currently supported on \"binance\": "
+            f"liquid alts ({sorted(_BINANCE_LIQUID_ALT_INSTRUMENTS)}) "
+            f"under binance_vip5_alt_research_v1. BTC/ETH research "
+            f"profiles do not exist (Day 17c found BTCUSDT structurally "
+            f"untradeable across all profiles)."
+        )
+
+    raise NotImplementedError(
+        f"No A1 research profile for venue {venue!r}. Currently "
+        f"supported: \"binance\" only."
     )
