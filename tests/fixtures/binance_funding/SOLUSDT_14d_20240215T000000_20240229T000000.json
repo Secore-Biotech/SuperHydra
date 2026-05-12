@@ -1,0 +1,438 @@
+{
+  "end_utc": "2024-02-29T00:00:00+00:00",
+  "n_records": 43,
+  "records": [
+    {
+      "funding_rate": "0.00013572",
+      "funding_time": "2024-02-15T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "117.09173686",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00015932",
+      "funding_time": "2024-02-15T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "115.09659855",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00012000",
+      "funding_time": "2024-02-15T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "114.08665167",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00022371",
+      "funding_time": "2024-02-16T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "113.59700000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00032087",
+      "funding_time": "2024-02-16T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "111.55200000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00016914",
+      "funding_time": "2024-02-16T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "109.72400000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00017661",
+      "funding_time": "2024-02-17T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "110.39169654",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00042046",
+      "funding_time": "2024-02-17T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "110.41000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00028279",
+      "funding_time": "2024-02-17T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "107.26800000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00022777",
+      "funding_time": "2024-02-18T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "109.00724484",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00019395",
+      "funding_time": "2024-02-18T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "109.29084412",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00022192",
+      "funding_time": "2024-02-18T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "112.40701989",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00030230",
+      "funding_time": "2024-02-19T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "112.32154665",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00029566",
+      "funding_time": "2024-02-19T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "113.28900000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00031944",
+      "funding_time": "2024-02-19T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "113.78000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00047470",
+      "funding_time": "2024-02-20T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "111.63358358",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00029934",
+      "funding_time": "2024-02-20T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "109.52366726",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00031742",
+      "funding_time": "2024-02-20T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "106.59061438",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00016255",
+      "funding_time": "2024-02-21T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "108.39609459",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00025310",
+      "funding_time": "2024-02-21T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "104.91685745",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00017730",
+      "funding_time": "2024-02-21T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "103.90400000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00016351",
+      "funding_time": "2024-02-22T00:00:00.001000+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "105.10500000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00021049",
+      "funding_time": "2024-02-22T08:00:00.001000+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "105.16100000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00018339",
+      "funding_time": "2024-02-22T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "105.46900000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00026289",
+      "funding_time": "2024-02-23T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "101.80500000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00032841",
+      "funding_time": "2024-02-23T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "102.04600000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00016957",
+      "funding_time": "2024-02-23T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "100.34084709",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00027113",
+      "funding_time": "2024-02-24T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "99.94884067",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00033132",
+      "funding_time": "2024-02-24T08:00:00.001000+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "102.31200000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00026230",
+      "funding_time": "2024-02-24T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "102.02748108",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00027207",
+      "funding_time": "2024-02-25T00:00:00.001000+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "104.10902289",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00041614",
+      "funding_time": "2024-02-25T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "103.08854499",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00042645",
+      "funding_time": "2024-02-25T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "102.85000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00055329",
+      "funding_time": "2024-02-26T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "103.56900000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00055349",
+      "funding_time": "2024-02-26T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "103.38663887",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00038701",
+      "funding_time": "2024-02-26T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "105.05500000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00060184",
+      "funding_time": "2024-02-27T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "110.02913939",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00069189",
+      "funding_time": "2024-02-27T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "110.47468133",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00051508",
+      "funding_time": "2024-02-27T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "106.88460847",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00032603",
+      "funding_time": "2024-02-28T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "108.45000000",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00040753",
+      "funding_time": "2024-02-28T08:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "110.14368128",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00078549",
+      "funding_time": "2024-02-28T16:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "113.17211082",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    },
+    {
+      "funding_rate": "0.00089000",
+      "funding_time": "2024-02-29T00:00:00+00:00",
+      "ingested_at": "2026-05-12T18:39:44.796121+00:00",
+      "instrument": "SOLUSDT",
+      "mark_price": "119.24687856",
+      "next_funding_time": null,
+      "schema_version": "funding_rate.v1",
+      "venue": "binance"
+    }
+  ],
+  "start_utc": "2024-02-15T00:00:00+00:00",
+  "symbol": "SOLUSDT"
+}
