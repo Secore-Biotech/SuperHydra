@@ -616,3 +616,116 @@ def binance_vip5_alt_research_v1() -> CostModelConfig:
             ),
         ),
     )
+
+
+# ─── A2 spot-leg profile (Day 22, placeholder) ────────────────────────────
+
+
+def binance_vip5_spot_placeholder_v0() -> CostModelConfig:
+    """PLACEHOLDER SPOT PROFILE — NOT EMPIRICALLY CALIBRATED.
+
+    Day 22 addition. A2 perp-vs-spot basis trades require a cost model
+    for the spot leg, distinct from the perp leg's existing profiles
+    (binance_vip5_btc_v1, binance_vip5_alt_v1). This profile is the
+    first spot-leg model in the cost-model registry.
+
+    Naming: 'placeholder' makes the un-calibrated status explicit at
+    every call site, mirroring placeholder_v0's discipline. A future
+    Day will produce binance_vip5_spot_empirical_v1 (or similar) once
+    spot-leg fills exist for calibration.
+
+    Fee schedule (Binance Spot VIP5 with BNB discount):
+      - Maker: 1.35 bps (Binance public Spot VIP5 maker 1.8 bps × 0.75
+        BNB discount)
+      - Taker: 3.4 bps (Binance public Spot VIP5 taker 4.5 bps × 0.75
+        BNB discount, rounded)
+
+    Source: Binance fee schedule page. Note that spot fees are
+    significantly higher than perp fees (VIP5 perp taker is 2.7 bps
+    vs spot taker 3.4 bps). A2 economics must account for both legs;
+    this is not a number to ignore.
+
+    Slippage tiers (conservative operator-judgment placeholders):
+      - spot_btc_eth_top_tier: 3 bps per leg
+        Reasoning: BTC/ETH spot top-of-book is wider than perp top-of-
+        book because spot has more order types and more diverse
+        participants. Perp tier is 1 bp; spot placeholder is 3x to
+        capture spread + impact + adverse selection without being
+        absurdly conservative.
+      - spot_liquid_alt_tier: 5 bps per leg
+        Reasoning: SOL spot is materially wider than SOL perp on
+        Binance. The perp tier under binance_vip5_alt_v1 is 3 bps;
+        spot placeholder is ~1.7x perp to reflect typical liquidity
+        differential at clip-size levels.
+
+    Borrow cost:
+      A2 holds positions across the basis convergence window
+      (typically <24h). Borrow on the short spot leg matters only
+      when the structure is long-perp + short-spot. The placeholder
+      retains the 1 bp/day floor from placeholder_v0 pending real
+      spot-borrow calibration.
+
+    What this is NOT:
+      - Not a fee schedule for cross-venue A2 (deferred indefinitely)
+      - Not calibrated against any real fill data
+      - Not a substitute for tape-grounded spread estimation
+      - Not for governance-tier decisions; A2 is PAPER_RESEARCH only
+
+    Promotion path to empirical:
+      1. Day 22-25 implementation produces A2 fills under this profile
+      2. Day 26+ tape analysis (Roll's estimator on Binance spot
+         trades) provides spread evidence
+      3. New profile binance_vip5_spot_empirical_v1 lands when both
+         live A2 paper fills and tape evidence converge
+    """
+    return CostModelConfig(
+        schema_version=COST_MODEL_SCHEMA_VERSION,
+        fee_schedules=(
+            FeeSchedule(
+                venue="binance",
+                maker_bps=Decimal("0.000135"),  # 1.35 bps
+                taker_bps=Decimal("0.00034"),   # 3.4 bps
+            ),
+        ),
+        slippage_tiers=(
+            SlippageTier(
+                tier_name="spot_btc_eth_top_tier",
+                slippage_bps=Decimal("0.0003"),  # 3 bps per leg
+            ),
+            SlippageTier(
+                tier_name="spot_liquid_alt_tier",
+                slippage_bps=Decimal("0.0005"),  # 5 bps per leg
+            ),
+        ),
+        # FundingUncertainty isn't directly used by A2 spot trades,
+        # but the schema requires the field. Retain the conservative
+        # defaults; A2 signal evaluator does NOT consume this for the
+        # spot leg.
+        funding_uncertainty=FundingUncertainty(
+            lookback_days=30,
+            discount_k=Decimal("1.0"),
+        ),
+        borrow_cost=BorrowCost(
+            daily_bps=Decimal("0.0001"),  # 1 bp/day floor
+        ),
+        notes=(
+            "PLACEHOLDER spot profile for Day 22 A2 basis engine. "
+            "Fees from Binance Spot VIP5 with BNB discount. Slippage "
+            "tiers are conservative operator-judgment placeholders. "
+            "Awaits empirical calibration from A2 paper fills + tape "
+            "spread analysis. Do NOT use for governance-tier decisions; "
+            "A2 is PAPER_RESEARCH only."
+        ),
+        profile_name="binance_vip5_spot_placeholder_v0",
+        source=ProfileSource(
+            source_url="https://www.binance.com/en/fee/schedule",
+            source_as_of="2026-05-12",
+            notes=(
+                "Spot VIP5 with BNB discount: maker 1.35 bps "
+                "(public 1.8 bps × 0.75), taker 3.4 bps (public 4.5 "
+                "bps × 0.75 rounded). Slippage tiers placeholder; "
+                "perp-to-spot widening based on operator judgment "
+                "of Binance spot vs perp liquidity differential."
+            ),
+        ),
+    )
