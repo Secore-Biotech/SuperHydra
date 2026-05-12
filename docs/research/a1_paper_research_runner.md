@@ -187,3 +187,103 @@ Beyond Day 20.4:
 - Day 19a memo (`docs/research/sol_slippage_calibration_memo.md`)
 - Day 19c.3 memo (`docs/research/sol_roll_spread_estimation_memo.md`)
 - Day 20.3a memo (`docs/research/replay_slippage_methodology.md`)
+
+## SOLUSDT May 2024 candidate sweep (Day 20.5B)
+
+Following the Day 20.5 harness landing, we ran the first candidate-
+fixture sweep against `SOLUSDT_14d_20240501T000000_20240515T000000.json`
+(refreshed via the existing `scripts/refresh_binance_funding_fixture.py`,
+no new network code). The reviewer-locked hypothesis was: do any
+14-day SOL windows besides Mar 2024 produce sustained funding above
+the 7.7 bps research threshold?
+
+### Harness output
+
+```json
+{
+  "cost_profile_name": "binance_vip5_alt_research_v1",
+  "events_loaded": 43,
+  "events_skipped_below_lookback": 12,
+  "events_skipped_below_threshold": 31,
+  "events_skipped_no_reference_price": 0,
+  "events_skipped_zero_funding": 0,
+  "fixture": "tests/fixtures/binance_funding/SOLUSDT_14d_20240501T000000_20240515T000000.json",
+  "intents_fired": 0,
+  "median_observed_slippage_bps": null,
+  "observed_slippage_non_null": 0,
+  "observed_slippage_null": 0,
+  "p90_observed_slippage_bps": null,
+  "paper_fills_after": 0,
+  "paper_fills_before": 0,
+  "quantity_per_intent": "10.0",
+  "source_mode": "PAPER_RESEARCH",
+  "symbol": "SOLUSDT",
+  "trading_fills_after": 0,
+  "trading_fills_before": 0
+}
+```
+
+### Diagnostic: funding-rate distribution
+
+| Window | n | Min | Max | Mean | Rolling-12 forecast max | Threshold | Gap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Mar 1-15 2024 | 43 | (~6 bps mean) | ~10+ bps | ~6 bps | **~7.69 bps** | 7.7 bps | Near-miss (~0.01 bps below) |
+| **May 1-15 2024** | **43** | **-0.88 bps** | **+1.00 bps** | **0.51 bps** | **0.46 bps** | **7.7 bps** | **~7.24 bps below — order of magnitude** |
+
+### Reading the finding
+
+The two zero-fire results are not the same outcome.
+
+- **Mar 2024** was a near-miss. Sustained mean ~6 bps, peak realized
+  funding above 10 bps, rolling-12 forecast peaking at ~7.69 bps —
+  just barely below the 7.7 bps research threshold. The structural
+  finding (Day 18b) was that this window is on the threshold edge.
+
+- **May 2024** is structurally far from clearing. Mean 0.51 bps, max
+  realized 1.00 bps, rolling-12 forecast peak 0.46 bps. The market
+  was simply in a low-carry regime; threshold is not the issue, the
+  regime is.
+
+This means SOL funding regimes vary substantially across short
+periods. Only "high-carry" regimes approach the research threshold.
+Most periods, including May 2024, are an order of magnitude below.
+
+### Implications for Day 20.5C
+
+The reviewer's pre-sweep decision gate stated: if intents_fired == 0
+across all candidates, 20.5B closes with a negative finding and 20.5C
+is deferred. That gate is met for the single-candidate sweep.
+
+A future Day could expand the sweep to identify other high-carry
+windows beyond Mar 2024. Plausible candidates worth probing:
+
+- **2021 SOL run** (Sep-Nov 2021), historical high-funding period
+- **2024 SOL Q1 broader** (Feb-Apr 2024), bracketing Mar 2024
+- **Any post-2023 mania periods** where SOL perp had sustained skew
+
+Tape replay (20.5C) only adds value if we have a fixture window
+where intents fire. Until then it would replay against no fills.
+
+### Operating posture
+
+The infrastructure is correct. The runner is honest. The empirical
+evidence shows that SOL funding does not reliably clear the research
+threshold under sustained 14-day windows; the Mar 2024 edge-case
+finding was not coincidence but also was not regime-typical.
+
+Two operational reads, both honest:
+
+1. **Threshold is correctly calibrated to be selective.** The
+   research profile threshold of 7.7 bps is high enough that only
+   genuinely-sustained funding regimes clear it. SOL's average
+   regime is structurally below.
+2. **A1 funding-rate capture on SOL alone is regime-dependent.**
+   Profitable windows exist (Mar 2024 edge-case-style mean ~6 bps)
+   but are not the typical case. Production A1 on SOL would need
+   regime detection or instrument diversification, neither of
+   which is in current Day 20 scope.
+
+Both reads are consistent with the operating premise of A1 as a
+selective capture strategy. They argue against tape replay on
+low-carry data and for sweeping more historical periods to
+characterize the carry-regime distribution.
