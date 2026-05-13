@@ -42,101 +42,19 @@ class _NoopFetcher:
         return []
 
 
-# ─── Registry bootstrap for A2 tests ────────────────────────────────────
+# ─── Registry bootstrap for A2 tests (refactored to harness module) ────
+# Per Day 25.1: bootstrap helper lives in the harness module; this test
+# wrapper preserves the positional call convention of the existing
+# Day 24 test call sites.
 
 
 def _bootstrap_a2_registry(conn, suffix: str) -> dict:
-    """Create A2-specific registry entries with UUID suffix.
-
-    Returns dict of IDs needed by the A2 runner.
-    """
-    with conn.cursor() as cur:
-        # Venue: binance (idempotent)
-        cur.execute("""
-            INSERT INTO registry.venues (venue_code, display_name, venue_type, status)
-            VALUES ('binance', 'Binance', 'cex_futures', 'active')
-            RETURNING id;
-        """)
-        venue_id = cur.fetchone()[0]
-
-        # Assets: SOL, USDT (idempotent)
-        cur.execute("""
-            INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status)
-            VALUES ('SOL', 'Solana', 'crypto', 9, 'active')
-            RETURNING id;
-        """)
-        sol_asset_id = cur.fetchone()[0]
-        cur.execute("""
-            INSERT INTO registry.assets (symbol, display_name, asset_type, decimals, status)
-            VALUES ('USDT', 'Tether USD', 'stablecoin', 6, 'active')
-            RETURNING id;
-        """)
-        usdt_asset_id = cur.fetchone()[0]
-
-        # A2 strategy (suffixed to avoid collision)
-        strategy_name = f"a2_basis_research_{suffix}"
-        cur.execute("""
-            INSERT INTO registry.strategies
-                (name, display_name, current_phase, phase_entered_at,
-                 hypothesis_doc_path, config)
-            VALUES (%s, %s, 'research', NOW(),
-                    'docs/strategies/a2_basis_design_brief.md', '{}'::jsonb)
-            RETURNING id;
-        """, (strategy_name, "A2 Basis Research"))
-        strategy_id = cur.fetchone()[0]
-
-        # A2 portfolio
-        portfolio_code = f"a2_basis_portfolio_{suffix}"
-        cur.execute("""
-            INSERT INTO registry.portfolios
-                (portfolio_code, display_name, product_type, status)
-            VALUES (%s, %s, 'paper', 'research')
-            RETURNING id;
-        """, (portfolio_code, "A2 Basis Portfolio"))
-        portfolio_id = cur.fetchone()[0]
-
-        # A2 account
-        account_code = f"a2_basis_account_{suffix}"
-        cur.execute("""
-            INSERT INTO registry.accounts
-                (venue_id, account_code, display_name, account_type, status)
-            VALUES (%s, %s, %s, 'trading', 'active')
-            RETURNING id;
-        """, (venue_id, account_code, "A2 Basis Account"))
-        account_id = cur.fetchone()[0]
-
-        # Perp instrument: SOLUSDT (suffixed)
-        perp_code = f"SOLUSDT_a2_{suffix}"
-        cur.execute("""
-            INSERT INTO registry.instruments
-                (instrument_code, display_name, venue_id, base_asset_id,
-                 quote_asset_id, instrument_type, status)
-            VALUES (%s, %s, %s, %s, %s, 'perp', 'active')
-            RETURNING id;
-        """, (perp_code, "SOLUSDT Perp (A2)", venue_id, sol_asset_id, usdt_asset_id))
-        perp_instrument_id = cur.fetchone()[0]
-
-        # Spot instrument: SOLUSDT_SPOT (suffixed)
-        spot_code = f"SOLUSDT_SPOT_a2_{suffix}"
-        cur.execute("""
-            INSERT INTO registry.instruments
-                (instrument_code, display_name, venue_id, base_asset_id,
-                 quote_asset_id, instrument_type, status)
-            VALUES (%s, %s, %s, %s, %s, 'spot', 'active')
-            RETURNING id;
-        """, (spot_code, "SOLUSDT Spot (A2)", venue_id, sol_asset_id, usdt_asset_id))
-        spot_instrument_id = cur.fetchone()[0]
-
-    return {
-        "venue_id": venue_id,
-        "sol_asset_id": sol_asset_id,
-        "usdt_asset_id": usdt_asset_id,
-        "strategy_id": strategy_id,
-        "portfolio_id": portfolio_id,
-        "account_id": account_id,
-        "perp_instrument_id": perp_instrument_id,
-        "spot_instrument_id": spot_instrument_id,
-    }
+    """Thin wrapper around the harness module's _bootstrap_a2_registry,
+    preserving the positional suffix convention used by Day 24's tests."""
+    from strategies.a2_basis.runner.paper_research_harness import (
+        _bootstrap_a2_registry as _harness_bootstrap,
+    )
+    return _harness_bootstrap(conn, suffix=suffix)
 
 
 # ═══════════════════════════════════════════════════════════════════════
