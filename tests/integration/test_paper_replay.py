@@ -481,3 +481,92 @@ def test_replay_rejects_invalid_fetch_source(fresh_db):
                 conn, [intent],
                 fetcher=fetcher, fetch_source="websocket",
             )
+
+
+
+# ─── Day 24 additions: extra_metadata on PaperReplayIntent ──────────────
+
+
+class TestExtraMetadata:
+    """Day 24 reviewer-approved extension of PaperReplayIntent.
+
+    The extra_metadata field lets callers attach arbitrary metadata keys
+    to paper.fills rows. Audit keys from replay_runner must take
+    precedence on collision so callers cannot override the audit trail.
+    """
+
+    def test_extra_metadata_persists_into_fill(self, fresh_db):
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                refs = _bootstrap(cur)
+            intent = _make_intent(refs, extra_metadata={
+                "custom_key": "custom_value",
+                "another_key": 42,
+            })
+            fetcher = FakeFetcher()
+            fetcher.default_response = []
+            replay_intents(conn, [intent], fetcher=fetcher, fetch_source="archive")
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT metadata FROM paper.fills WHERE paper_fill_uuid = %s;",
+                    (intent.paper_fill_uuid,),
+                )
+                metadata = cur.fetchone()[0]
+
+        assert metadata["custom_key"] == "custom_value"
+        assert metadata["another_key"] == 42
+        assert metadata["window_seconds"] == 5
+        assert metadata["fetch_source"] == "archive"
+
+    def test_audit_keys_take_precedence_over_caller_keys(self, fresh_db):
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                refs = _bootstrap(cur)
+            intent = _make_intent(refs, extra_metadata={
+                "replay_status": "fake_status",
+                "window_seconds": 999,
+                "fetch_source": "fake_source",
+                "trade_count": -1,
+                "legitimate_key": "ok",
+            })
+            fetcher = FakeFetcher()
+            fetcher.default_response = []
+            replay_intents(conn, [intent], fetcher=fetcher, fetch_source="archive")
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT metadata FROM paper.fills WHERE paper_fill_uuid = %s;",
+                    (intent.paper_fill_uuid,),
+                )
+                metadata = cur.fetchone()[0]
+
+        # Audit fields took precedence
+        assert metadata["replay_status"] == "empty_window"
+        assert metadata["window_seconds"] == 5
+        assert metadata["fetch_source"] == "archive"
+        assert metadata["trade_count"] == 0
+        # Caller's other key still there
+        assert metadata["legitimate_key"] == "ok"
+
+    def test_extra_metadata_none_preserves_a1_behavior(self, fresh_db):
+        with _connect() as conn:
+            with conn.cursor() as cur:
+                refs = _bootstrap(cur)
+            intent = _make_intent(refs)
+            fetcher = FakeFetcher()
+            fetcher.default_response = []
+            replay_intents(conn, [intent], fetcher=fetcher, fetch_source="archive")
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT metadata FROM paper.fills WHERE paper_fill_uuid = %s;",
+                    (intent.paper_fill_uuid,),
+                )
+                metadata = cur.fetchone()[0]
+
+        expected_keys = {"window_seconds", "fetch_source", "replay_status", "trade_count"}
+        assert set(metadata.keys()) == expected_keys

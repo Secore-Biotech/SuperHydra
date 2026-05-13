@@ -101,6 +101,7 @@ class PaperReplayIntent:
     intended_fill_at: datetime
     order_intent_id: int | None = None
     order_id: int | None = None
+    extra_metadata: dict | None = None
 
     def __post_init__(self) -> None:
         if self.intended_fill_at.tzinfo is None:
@@ -178,10 +179,12 @@ def _replay_one(
     window_end = intent.intended_fill_at + window_delta
 
     observed_slippage_bps: Decimal | None = None
-    metadata: dict = {
+    # Caller-supplied metadata first (so audit keys take precedence on collision).
+    metadata: dict = dict(intent.extra_metadata or {})
+    metadata.update({
         "window_seconds": window_seconds,
         "fetch_source": fetch_source,
-    }
+    })
     replay_status: str
     trade_count: int
 
