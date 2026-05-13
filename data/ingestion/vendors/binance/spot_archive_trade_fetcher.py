@@ -19,11 +19,15 @@ Recon (Day 26 precondition):
 """
 from __future__ import annotations
 
+import csv
+import io
 import time
+import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 from data.ingestion.vendors.binance.archive_trade_fetcher import (
     BINANCE_VISION_BASE,
@@ -31,7 +35,6 @@ from data.ingestion.vendors.binance.archive_trade_fetcher import (
     INITIAL_BACKOFF_SECONDS,
     MAX_RETRIES,
     MIN_INTERVAL_SECONDS,
-    _iter_trades_in_window,
     _months_overlapping,
     _sort_and_dedupe,
 )
@@ -61,6 +64,108 @@ def _build_spot_archive_url(symbol: str, year: int, month: int) -> str:
         symbol=symbol, year=year, month=month,
     )
     return f"{BINANCE_VISION_BASE}{path}"
+
+
+def _iter_spot_trades_in_window(
+    archive_bytes: bytes,
+    *,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    ingested_at: datetime,
+) -> Iterator[BinanceTrade]:
+    """Stream the inner CSV of a Binance Vision SPOT aggTrades zip,
+    yielding BinanceTrade for rows with timestamp in [start_ms, end_ms).
+
+    Spot CSV schema (8 columns, vs perp's 7):
+        0: agg_trade_id (int)
+        1: price (Decimal)
+        2: quantity (Decimal)
+        3: first_trade_id (int)         [unused]
+        4: last_trade_id (int)          [unused]
+        5: transact_time_ms (int)
+        6: is_buyer_maker (bool string)
+        7: is_best_match (bool string)  [unused; spot-specific]
+
+    The column-count gate is strict at 8 to catch schema drift. The
+    is_best_match column is read but not propagated into BinanceTrade
+    (which has no field for it).
+
+    This parser is intentionally separate from the perp parser
+    (data.ingestion.vendors.binance.archive_trade_fetcher._iter_trades_in_window)
+    per the Day 26.5 reviewer decision: spot-local parser preserves the
+    Day 26.1 firewall that A1's perp fetcher path is bit-for-bit
+    unmodified by Day 26 work.
+    """
+    with zipfile.ZipFile(io.BytesIO(archive_bytes)) as zf:
+        names = zf.namelist()
+        if len(names) != 1:
+            raise PermanentFetcherError(
+                f"expected exactly 1 entry in archive, got {len(names)}: {names}"
+            )
+        csv_name = names[0]
+
+        with zf.open(csv_name) as raw:
+            text_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+            reader = csv.reader(text_stream)
+
+            header_check_done = False
+            for row in reader:
+                if not header_check_done:
+                    header_check_done = True
+                    if not row:
+                        continue
+                    try:
+                        int(row[0])
+                    except ValueError:
+                        # Non-numeric first cell — header row, skip it.
+                        continue
+                    # Numeric first cell — first row is data; fall through.
+
+                if len(row) != 8:
+                    raise PermanentFetcherError(
+                        f"expected 8 columns in spot CSV row, got {len(row)}: {row}"
+                    )
+
+                try:
+                    agg_id = int(row[0])
+                    price = Decimal(row[1])
+                    qty = Decimal(row[2])
+                    time_ms = int(row[5])
+                    is_buyer_maker_str = row[6].strip().lower()
+                except (ValueError, InvalidOperation) as e:
+                    raise PermanentFetcherError(
+                        f"malformed spot CSV row {row!r}: {e}"
+                    ) from e
+
+                if is_buyer_maker_str == "true":
+                    is_buyer_maker = True
+                elif is_buyer_maker_str == "false":
+                    is_buyer_maker = False
+                else:
+                    raise PermanentFetcherError(
+                        f"unexpected is_buyer_maker value in spot row "
+                        f"{row!r}: {row[6]!r}"
+                    )
+
+                if time_ms < start_ms or time_ms >= end_ms:
+                    continue
+
+                try:
+                    yield BinanceTrade(
+                        venue="binance",
+                        instrument=symbol,
+                        id=agg_id,
+                        price=price,
+                        qty=qty,
+                        time=datetime.fromtimestamp(time_ms / 1000, tz=timezone.utc),
+                        is_buyer_maker=is_buyer_maker,
+                        ingested_at=ingested_at,
+                    )
+                except (ValueError, TypeError) as e:
+                    raise PermanentFetcherError(
+                        f"record validation failed for spot row {row!r}: {e}"
+                    ) from e
 
 
 @dataclass
@@ -119,7 +224,7 @@ class BinanceSpotArchiveTradeFetcher:
 
         for year, month in _months_overlapping(start, end):
             archive_bytes = self._fetch_archive(symbol, year, month)
-            for trade in _iter_trades_in_window(
+            for trade in _iter_spot_trades_in_window(
                 archive_bytes,
                 symbol=symbol,
                 start_ms=start_ms,
@@ -161,9 +266,7 @@ class BinanceSpotArchiveTradeFetcher:
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self._last_request_at = self._now()
-                response = self.transport(url, timeout=self.timeout_seconds)
-                # response: bytes (the archive)
-                return response
+                return self.transport.get(url, timeout_seconds=self.timeout_seconds)
             except TransientFetcherError as e:
                 last_exc = e
                 if attempt < MAX_RETRIES:
