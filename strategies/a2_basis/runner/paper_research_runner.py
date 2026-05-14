@@ -41,7 +41,15 @@ from strategies.a2_basis.signal.cost_threshold import (
     compute_a2_round_trip_threshold_bps,
 )
 from strategies.a2_basis.data.positions import (
+    close_position,
     open_position,
+)
+from strategies.a2_basis.signal.evaluate_exit import (
+    A2ExitConfig,
+    A2ExitDecision,
+    A2ExitEvaluation,
+    A2ExitReason,
+    evaluate_a2_exit_signal,
 )
 from strategies.a2_basis.signal.evaluate import (
     A2SignalConfig,
@@ -137,7 +145,76 @@ class A2RunSummary:
     evaluations_skipped_cost_not_cleared: int
     evaluations_skipped_already_positioned: int
     a2_intents_fired: int
+    # Day 28b.2 — exit-side counters (mirrored by reason)
+    exit_evaluations_total: int
+    exit_evaluations_hold_insufficient_lookback: int
+    exit_evaluations_hold_stale_window: int
+    exit_evaluations_hold_zero_or_near_zero_stdev: int
+    exit_evaluations_hold_still_dislocated: int
+    a2_exits_fired_basis_converged: int
+    a2_exits_fired_time_forced: int
+    positions_open_at_end_of_run: int
     replay_results: list[ReplayResult]
+
+
+
+# ─── P&L computation helper ──────────────────────────────────────────────
+
+
+def _compute_leg_pnl_bps(
+    *,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    entry_side: str,
+) -> Decimal:
+    """Profit-positive realized P&L for one leg, in bps.
+
+    DAY 28B.2 PROFIT-POSITIVE SEMANTIC (reviewer lock Q2):
+
+        Result > 0  ⇔  leg made money
+        Result == 0 ⇔  flat
+        Result < 0  ⇔  leg lost money
+
+    FORMULAS BY LEG DIRECTION:
+
+      LONG leg (entry_side == "buy"):
+        Bought at entry_price; sold at exit_price.
+        Profit when exit > entry (price went up).
+            pnl_bps = (exit_price - entry_price) / entry_price * 10000
+
+      SHORT leg (entry_side == "sell"):
+        Sold at entry_price; bought back at exit_price.
+        Profit when exit < entry (price went down).
+            pnl_bps = (entry_price - exit_price) / entry_price * 10000
+
+    EXAMPLE — SHORT_PERP_LONG_SPOT trade:
+        Entry: perp_side="sell" at 100.85; spot_side="buy" at 100.00.
+        Exit:  perp at 100.00; spot at 100.00.
+
+        perp_pnl_bps = (100.85 - 100.00) / 100.85 * 10000
+                     = 0.85 / 100.85 * 10000
+                     = 84.28 bps profit  (short converged: good)
+
+        spot_pnl_bps = (100.00 - 100.00) / 100.00 * 10000
+                     = 0.00 bps  (spot flat: neutral)
+
+        gross_pnl_bps = 84.28 bps
+        round_trip_cost_bps = 33.84 (SOL — includes ~20% safety margin)
+        net_pnl_bps = 84.28 - 33.84 = 50.44 bps profit
+
+    NORMALIZATION:
+        Denominator is entry_price. Convention: P&L measured as
+        percentage of capital deployed at entry, expressed in bps
+        (1 bp = 0.01%).
+
+    Raises:
+        ValueError: if entry_side is not "buy" or "sell".
+    """
+    if entry_side == "buy":
+        return (exit_price - entry_price) / entry_price * Decimal(10000)
+    if entry_side == "sell":
+        return (entry_price - exit_price) / entry_price * Decimal(10000)
+    raise ValueError(f"Unexpected entry_side: {entry_side!r}")
 
 
 # ─── Runner ──────────────────────────────────────────────────────────────
@@ -179,6 +256,7 @@ class A2PaperResearchRunner:
         venue: str,
         base_symbol: str,
         quantity_per_intent: Decimal,
+        exit_config: A2ExitConfig | None = None,
         cost_bundle: A2CostBundle | None = None,
         uncertainty_margin_fraction: Decimal = DEFAULT_UNCERTAINTY_MARGIN_FRACTION,
         signal_config: A2SignalConfig | None = None,
@@ -226,6 +304,9 @@ class A2PaperResearchRunner:
             uncertainty_margin_fraction=uncertainty_margin_fraction,
         )
         self._cost_threshold_bps = cost.total_threshold_bps
+        # Day 28b.2: exit-side configuration. Defaults to A2ExitConfig()
+        # which encodes the reviewer-locked 4h max-holding window.
+        self._exit_config = exit_config or A2ExitConfig()
         self._round_trip_cost = cost
 
         # Resolve per-leg modeled slippage in bps (for paper.fills rows).
@@ -258,11 +339,23 @@ class A2PaperResearchRunner:
     # ─── Public API ────────────────────────────────────────────────────
 
     def run(self, conn) -> A2RunSummary:
-        """Process observations and write paper.fills rows.
+        """Process observations with interleaved entry/exit logic.
+
+        Day 28b.2: per reviewer-locked design (Q5a/Q5b/Q5c):
+          - Each observation triggers exactly one of three paths:
+            (1) exit-eval if currently positioned,
+            (2) entry-eval if not positioned,
+            (3) skip with appropriate counter.
+          - DELETE paper.positions inside the loop on close (same txn).
+          - Re-entry allowed unbounded within a single run.
+          - Positions still open at end-of-run are written to paper.positions
+            (paper.fills carries the full audit; paper.positions is the
+            materialized state of CURRENTLY-OPEN positions only).
 
         Caller owns the transaction; this method does not commit.
         """
         intents: list[PaperReplayIntent] = []
+        # Entry counters (existing Day 24/28a)
         skip_insufficient = 0
         skip_stale = 0
         skip_zero_stdev = 0
@@ -270,29 +363,94 @@ class A2PaperResearchRunner:
         skip_cost_not_cleared = 0
         skip_already_positioned = 0
         evaluations_total = 0
-        # Day 28a: in-memory anti-reentry state. Position writes go to
-        # paper.positions after replay_intents succeeds.
+        entries_fired = 0
+        # Exit counters (Day 28b.2)
+        exit_evaluations_total = 0
+        exit_skip_insufficient_lookback = 0
+        exit_skip_stale_window = 0
+        exit_skip_zero_or_near_zero_stdev = 0
+        exit_skip_still_dislocated = 0
+        exits_fired_basis_converged = 0
+        exits_fired_time_forced = 0
+        # In-memory state for the (at most one) currently-open position.
+        # Re-used across re-entries within the same run.
         positioned = False
-        perp_intent_captured = None
-        spot_intent_captured = None
-        position_opened_at = None
+        open_perp_intent: PaperReplayIntent | None = None
+        open_spot_intent: PaperReplayIntent | None = None
+        open_position_opened_at: datetime | None = None
+        open_a2_intent_uuid: str | None = None
+        # Half of the entry round-trip cost threshold, per Day 28b.2 lock.
+        convergence_threshold_bps = self._cost_threshold_bps / Decimal(2)
 
         n = len(self._observations)
         for i in range(n):
-            # Build window: last window_size observations up to and
-            # including index i. For i < window_size-1, the window is
-            # shorter than window_size, and the evaluator's min_lookback
-            # check handles insufficient cases.
             window_size = self._signal_config.window_size
             start = max(0, i - window_size + 1)
             window = self._observations[start:i + 1]
             current_obs = self._observations[i]
-
-            # as_of must be strictly after the latest sample. Use latest
-            # sample + 1 second for deterministic synthetic-fixture runs.
-            # In production this would be the real evaluation moment.
             as_of = current_obs.sampled_at + timedelta(seconds=1)
 
+            if positioned:
+                # ─── EXIT-EVALUATION PATH ─────────────────────────────
+                exit_eval = evaluate_a2_exit_signal(
+                    window,
+                    convergence_threshold_bps=convergence_threshold_bps,
+                    entry_time=open_position_opened_at,
+                    as_of=as_of,
+                    config=self._exit_config,
+                )
+                exit_evaluations_total += 1
+
+                if exit_eval.decision == A2ExitDecision.HOLD:
+                    if exit_eval.reason == A2ExitReason.INSUFFICIENT_LOOKBACK:
+                        exit_skip_insufficient_lookback += 1
+                    elif exit_eval.reason == A2ExitReason.STALE_WINDOW:
+                        exit_skip_stale_window += 1
+                    elif exit_eval.reason == A2ExitReason.ZERO_OR_NEAR_ZERO_STDEV:
+                        exit_skip_zero_or_near_zero_stdev += 1
+                    elif exit_eval.reason == A2ExitReason.STILL_DISLOCATED:
+                        exit_skip_still_dislocated += 1
+                    continue
+
+                # CLOSE: build paired exit intents with P&L.
+                exit_intents = self._build_exit_intents(
+                    current_obs=current_obs,
+                    exit_eval=exit_eval,
+                    entry_perp_intent=open_perp_intent,
+                    entry_spot_intent=open_spot_intent,
+                    a2_intent_uuid=open_a2_intent_uuid,
+                )
+                intents.extend(exit_intents)
+
+                # DELETE the paper.positions rows. Idempotent: if no row
+                # exists (typical when entry+exit happen in same run and
+                # we never wrote a row to begin with), it's a no-op.
+                close_position(
+                    conn,
+                    strategy_id=self._strategy_id,
+                    instrument_id=self._perp_instrument_id,
+                )
+                close_position(
+                    conn,
+                    strategy_id=self._strategy_id,
+                    instrument_id=self._spot_instrument_id,
+                )
+
+                # Reset in-memory state. Re-entry on a later observation
+                # is allowed (Q5b: unbounded).
+                positioned = False
+                open_perp_intent = None
+                open_spot_intent = None
+                open_position_opened_at = None
+                open_a2_intent_uuid = None
+
+                if exit_eval.reason == A2ExitReason.BASIS_CONVERGED:
+                    exits_fired_basis_converged += 1
+                elif exit_eval.reason == A2ExitReason.TIME_FORCED:
+                    exits_fired_time_forced += 1
+                continue
+
+            # ─── ENTRY-EVALUATION PATH ────────────────────────────────
             evaluation = evaluate_a2_signal(
                 window,
                 self._cost_threshold_bps,
@@ -301,7 +459,6 @@ class A2PaperResearchRunner:
             )
             evaluations_total += 1
 
-            # Skip taxonomy
             if evaluation.decision == A2SignalDecision.FLAT:
                 if evaluation.reason == "insufficient_lookback":
                     skip_insufficient += 1
@@ -315,35 +472,30 @@ class A2PaperResearchRunner:
                     skip_cost_not_cleared += 1
                 continue
 
-            # Day 28a: hard-block anti-reentry. Once we have fired,
-            # all subsequent non-FLAT decisions are skipped.
-            if positioned:
-                skip_already_positioned += 1
-                continue
-
-            # Non-FLAT decision: construct 2 intents (perp + spot legs).
+            # Non-FLAT decision: construct entry intents and capture
+            # in-memory state for the open position.
             new_intents = self._build_intents(current_obs, evaluation)
             intents.extend(new_intents)
-
-            # Capture position data for the post-replay paper.positions
-            # write. _build_intents returns [perp_intent, spot_intent].
-            perp_intent_captured = new_intents[0]
-            spot_intent_captured = new_intents[1]
-            position_opened_at = as_of
+            entries_fired += 1
+            open_perp_intent = new_intents[0]
+            open_spot_intent = new_intents[1]
+            open_position_opened_at = as_of
+            open_a2_intent_uuid = new_intents[0].extra_metadata["a2_intent_uuid"]
             positioned = True
 
+        # End of loop. Replay all accumulated intents at once.
         results = replay_intents(
             conn, intents,
             fetcher=self._trade_fetcher,
             fetch_source=self._fetch_source,
         )
 
-        # Day 28a: persist paper.positions for the (at most one) intent that
-        # fired. paper.positions is materialized state; source of truth remains
-        # paper.fills. The UNIQUE (strategy_id, instrument_id) constraint is
-        # the DB-level backstop for the in-loop anti-reentry flag above.
+        # Day 28b.2 Q5c: positions still open at end-of-run are written
+        # to paper.positions. Closed positions never touch the table.
+        positions_open_at_end_of_run = 0
         if positioned:
-            a2_iuuid = perp_intent_captured.extra_metadata["a2_intent_uuid"]
+            positions_open_at_end_of_run = 1
+            a2_iuuid = open_perp_intent.extra_metadata["a2_intent_uuid"]
             open_position(
                 conn,
                 strategy_id=self._strategy_id,
@@ -351,16 +503,16 @@ class A2PaperResearchRunner:
                 account_id=self._account_id,
                 instrument_id=self._perp_instrument_id,
                 quantity=(
-                    perp_intent_captured.quantity
-                    if perp_intent_captured.side == "buy"
-                    else -perp_intent_captured.quantity
+                    open_perp_intent.quantity
+                    if open_perp_intent.side == "buy"
+                    else -open_perp_intent.quantity
                 ),
-                avg_entry_price=perp_intent_captured.decision_reference_price,
-                opened_at=position_opened_at,
+                avg_entry_price=open_perp_intent.decision_reference_price,
+                opened_at=open_position_opened_at,
                 metadata={
                     "a2_intent_uuid": a2_iuuid,
                     "a2_leg": "perp",
-                    "entry_paper_fill_uuid": str(perp_intent_captured.paper_fill_uuid),
+                    "entry_paper_fill_uuid": str(open_perp_intent.paper_fill_uuid),
                 },
             )
             open_position(
@@ -370,21 +522,18 @@ class A2PaperResearchRunner:
                 account_id=self._account_id,
                 instrument_id=self._spot_instrument_id,
                 quantity=(
-                    spot_intent_captured.quantity
-                    if spot_intent_captured.side == "buy"
-                    else -spot_intent_captured.quantity
+                    open_spot_intent.quantity
+                    if open_spot_intent.side == "buy"
+                    else -open_spot_intent.quantity
                 ),
-                avg_entry_price=spot_intent_captured.decision_reference_price,
-                opened_at=position_opened_at,
+                avg_entry_price=open_spot_intent.decision_reference_price,
+                opened_at=open_position_opened_at,
                 metadata={
                     "a2_intent_uuid": a2_iuuid,
                     "a2_leg": "spot",
-                    "entry_paper_fill_uuid": str(spot_intent_captured.paper_fill_uuid),
+                    "entry_paper_fill_uuid": str(open_spot_intent.paper_fill_uuid),
                 },
             )
-
-        # Number of A2 intents fired = half the replay results (one per leg).
-        a2_intents_fired = len(intents) // 2
 
         return A2RunSummary(
             evaluations_total=evaluations_total,
@@ -394,7 +543,15 @@ class A2PaperResearchRunner:
             evaluations_skipped_z_below_threshold=skip_z_below,
             evaluations_skipped_cost_not_cleared=skip_cost_not_cleared,
             evaluations_skipped_already_positioned=skip_already_positioned,
-            a2_intents_fired=a2_intents_fired,
+            a2_intents_fired=entries_fired,
+            exit_evaluations_total=exit_evaluations_total,
+            exit_evaluations_hold_insufficient_lookback=exit_skip_insufficient_lookback,
+            exit_evaluations_hold_stale_window=exit_skip_stale_window,
+            exit_evaluations_hold_zero_or_near_zero_stdev=exit_skip_zero_or_near_zero_stdev,
+            exit_evaluations_hold_still_dislocated=exit_skip_still_dislocated,
+            a2_exits_fired_basis_converged=exits_fired_basis_converged,
+            a2_exits_fired_time_forced=exits_fired_time_forced,
+            positions_open_at_end_of_run=positions_open_at_end_of_run,
             replay_results=results,
         )
 
@@ -483,6 +640,173 @@ class A2PaperResearchRunner:
         if leg not in ("perp", "spot"):
             raise ValueError(f"leg must be 'perp' or 'spot', got {leg!r}")
         canonical = f"a2_basis_research|{leg}|{intent_uuid}"
+        digest = hashlib.sha256(canonical.encode("utf-8")).digest()
+        return UUID(bytes=digest[:16])
+
+
+    def _build_exit_intents(
+        self,
+        *,
+        current_obs: BasisObservation,
+        exit_eval: A2ExitEvaluation,
+        entry_perp_intent: PaperReplayIntent,
+        entry_spot_intent: PaperReplayIntent,
+        a2_intent_uuid: str,
+    ) -> list[PaperReplayIntent]:
+        """Build the two PaperReplayIntents for an exit (close).
+
+        Per Day 28b.2 reviewer locks:
+          - Q1: deterministic UUID from (strategy_id, instrument_id,
+                exit_sampled_at, side, quantity, a2_intent_uuid).
+          - Q2: profit-positive P&L plus per-leg fields for audit.
+          - Q3: same cost_profile_name as entry.
+          - Q4 not relevant here (summary-side concern).
+          - Q5a not relevant here (timing concern in run()).
+
+        Exit fills mirror the structure of entry fills with these key
+        differences in extra_metadata:
+          - a2_phase = "exit" (vs entry's "entry")
+          - a2_exit_reason carries the A2ExitReason value
+          - a2_entry_paper_fill_uuid points to the entry leg
+          - research_perp_pnl_bps, research_spot_pnl_bps: per-leg P&L
+          - research_gross_pnl_bps: sum across legs (pre-cost)
+          - research_round_trip_cost_bps: full round-trip cost
+            (uses self._cost_threshold_bps; see comment on
+            research_round_trip_cost_bps in this method)
+          - research_pnl_bps: net realized P&L = gross - cost
+        """
+        # Inverse sides: closing a SHORT means BUYing back; closing a LONG
+        # means SELLing.
+        perp_exit_side = "buy" if entry_perp_intent.side == "sell" else "sell"
+        spot_exit_side = "buy" if entry_spot_intent.side == "sell" else "sell"
+
+        # Per-leg P&L, profit-positive (see _compute_leg_pnl_bps docstring).
+        perp_pnl_bps = _compute_leg_pnl_bps(
+            entry_price=entry_perp_intent.decision_reference_price,
+            exit_price=current_obs.perp_price,
+            entry_side=entry_perp_intent.side,
+        )
+        spot_pnl_bps = _compute_leg_pnl_bps(
+            entry_price=entry_spot_intent.decision_reference_price,
+            exit_price=current_obs.spot_price,
+            entry_side=entry_spot_intent.side,
+        )
+        gross_pnl_bps = perp_pnl_bps + spot_pnl_bps
+
+        # research_round_trip_cost_bps: conservative estimate using the
+        # entry threshold (which includes a ~20% safety margin per the
+        # Day 22 cost model). This means research_pnl_bps is slightly
+        # pessimistic vs the true post-fee P&L; refinement to actual
+        # round-trip cost (sans margin) is a Day 28b.3+ improvement.
+        round_trip_cost_bps = self._cost_threshold_bps
+        net_pnl_bps = gross_pnl_bps - round_trip_cost_bps
+
+        # Deterministic exit UUIDs (Q1 lock).
+        perp_exit_uuid = self._make_exit_leg_uuid(
+            a2_intent_uuid=a2_intent_uuid,
+            leg="perp",
+            exit_sampled_at=current_obs.sampled_at,
+            side=perp_exit_side,
+        )
+        spot_exit_uuid = self._make_exit_leg_uuid(
+            a2_intent_uuid=a2_intent_uuid,
+            leg="spot",
+            exit_sampled_at=current_obs.sampled_at,
+            side=spot_exit_side,
+        )
+
+        # Common P&L metadata applied to both legs.
+        common_pnl_metadata = {
+            "a2_phase": "exit",
+            "a2_exit_reason": exit_eval.reason.value,
+            "a2_holding_duration_seconds": exit_eval.holding_duration_seconds,
+            "research_perp_pnl_bps": str(perp_pnl_bps),
+            "research_spot_pnl_bps": str(spot_pnl_bps),
+            "research_gross_pnl_bps": str(gross_pnl_bps),
+            "research_round_trip_cost_bps": str(round_trip_cost_bps),
+            "research_pnl_bps": str(net_pnl_bps),
+        }
+        if exit_eval.current_basis_bps is not None:
+            common_pnl_metadata["a2_exit_basis_bps"] = str(
+                exit_eval.current_basis_bps
+            )
+
+        perp_intent = PaperReplayIntent(
+            paper_fill_uuid=perp_exit_uuid,
+            strategy_id=self._strategy_id,
+            portfolio_id=self._portfolio_id,
+            account_id=self._account_id,
+            instrument_id=self._perp_instrument_id,
+            symbol=self._base_symbol,
+            side=perp_exit_side,
+            quantity=self._quantity_per_intent,
+            decision_reference_price=current_obs.perp_price,
+            modeled_slippage_bps=self._perp_modeled_slippage_bps,
+            cost_profile_name=self._cost_bundle.perp_profile.profile_name,
+            cost_profile_hash=self._cost_bundle.perp_profile.content_hash,
+            intended_fill_at=current_obs.sampled_at,
+            extra_metadata={
+                **common_pnl_metadata,
+                "a2_intent_uuid": a2_intent_uuid,
+                "a2_leg": "perp",
+                "a2_entry_paper_fill_uuid": str(entry_perp_intent.paper_fill_uuid),
+            },
+        )
+        spot_intent = PaperReplayIntent(
+            paper_fill_uuid=spot_exit_uuid,
+            strategy_id=self._strategy_id,
+            portfolio_id=self._portfolio_id,
+            account_id=self._account_id,
+            instrument_id=self._spot_instrument_id,
+            symbol=self._base_symbol,
+            side=spot_exit_side,
+            quantity=self._quantity_per_intent,
+            decision_reference_price=current_obs.spot_price,
+            modeled_slippage_bps=self._spot_modeled_slippage_bps,
+            cost_profile_name=self._cost_bundle.spot_profile.profile_name,
+            cost_profile_hash=self._cost_bundle.spot_profile.content_hash,
+            intended_fill_at=current_obs.sampled_at,
+            extra_metadata={
+                **common_pnl_metadata,
+                "a2_intent_uuid": a2_intent_uuid,
+                "a2_leg": "spot",
+                "a2_entry_paper_fill_uuid": str(entry_spot_intent.paper_fill_uuid),
+            },
+        )
+
+        return [perp_intent, spot_intent]
+
+    def _make_exit_leg_uuid(
+        self,
+        *,
+        a2_intent_uuid: str,
+        leg: str,
+        exit_sampled_at: datetime,
+        side: str,
+    ) -> UUID:
+        """Deterministic UUID for an exit-leg fill.
+
+        Per Day 28b.2 Q1 lock: inputs are strategy_id, instrument_id,
+        exit_sampled_at, side, quantity, a2_intent_uuid.
+
+        Including a2_intent_uuid eliminates the (rare) collision risk
+        where a future re-entry-then-exit on the same instrument at the
+        same sampled_at + side + quantity would otherwise produce the
+        same UUID as a prior exit.
+        """
+        instrument_id = (
+            self._perp_instrument_id if leg == "perp"
+            else self._spot_instrument_id
+        )
+        canonical = (
+            f"a2_basis_research|exit|"
+            f"{self._strategy_id}|"
+            f"{instrument_id}|"
+            f"{exit_sampled_at.astimezone(timezone.utc).isoformat()}|"
+            f"{side}|"
+            f"{self._quantity_per_intent}|"
+            f"{a2_intent_uuid}"
+        )
         digest = hashlib.sha256(canonical.encode("utf-8")).digest()
         return UUID(bytes=digest[:16])
 

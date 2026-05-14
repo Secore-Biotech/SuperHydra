@@ -166,3 +166,37 @@ def paper_position_count(
                 (strategy_id,),
             )
         return cur.fetchone()[0]
+
+
+
+def close_position(
+    conn,
+    *,
+    strategy_id: int,
+    instrument_id: int,
+) -> bool:
+    """DELETE the paper.positions row for (strategy_id, instrument_id).
+
+    Idempotent: if no row exists, returns False without raising. This
+    matches the Day 28b.2 reviewer-locked DELETE-inside-loop semantic
+    (Q5a) — the loop may attempt to close a position that was never
+    persisted to DB (typical when entry+exit happen within the same
+    run; paper.positions is materialized only for positions still
+    OPEN at end of run, not for closed ones).
+
+    Returns:
+        True  if a row was deleted.
+        False if no row existed (no-op).
+
+    The caller owns the transaction; this function does not commit.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM paper.positions
+            WHERE strategy_id = %s AND instrument_id = %s
+            RETURNING paper_position_uuid;
+            """,
+            (strategy_id, instrument_id),
+        )
+        return cur.fetchone() is not None

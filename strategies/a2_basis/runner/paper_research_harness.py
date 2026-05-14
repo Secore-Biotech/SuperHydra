@@ -484,6 +484,29 @@ def run_harness(config: HarnessConfig) -> dict[str, Any]:
         "evaluations_skipped_already_positioned": (
             summary.evaluations_skipped_already_positioned
         ),
+        # Day 28b.2 exit-side counters
+        "exit_evaluations_total": summary.exit_evaluations_total,
+        "exit_evaluations_hold_insufficient_lookback": (
+            summary.exit_evaluations_hold_insufficient_lookback
+        ),
+        "exit_evaluations_hold_stale_window": (
+            summary.exit_evaluations_hold_stale_window
+        ),
+        "exit_evaluations_hold_zero_or_near_zero_stdev": (
+            summary.exit_evaluations_hold_zero_or_near_zero_stdev
+        ),
+        "exit_evaluations_hold_still_dislocated": (
+            summary.exit_evaluations_hold_still_dislocated
+        ),
+        "a2_exits_fired_basis_converged": (
+            summary.a2_exits_fired_basis_converged
+        ),
+        "a2_exits_fired_time_forced": (
+            summary.a2_exits_fired_time_forced
+        ),
+        "positions_open_at_end_of_run": (
+            summary.positions_open_at_end_of_run
+        ),
         "a2_intents_fired": summary.a2_intents_fired,
         "paper_fills_before": paper_fills_before,
         "paper_fills_after": paper_fills_after,

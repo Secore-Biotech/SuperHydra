@@ -358,14 +358,19 @@ class TestAntiReentry:
             summary = runner.run(conn)
             conn.commit()
 
-        # Hard-block: exactly one logical intent fires across 3 spikes.
-        assert summary.a2_intents_fired == 1
-        # Subsequent spike-observations should be blocked by anti-reentry.
-        assert summary.evaluations_skipped_already_positioned >= 1
+        # Day 28b.2 update: with exit logic, each spike now produces
+        # a complete trade (entry → converge → exit). All three spikes
+        # fire as separate trades because the basis converges between
+        # them. The Day 28a hard-block-within-same-position invariant
+        # still holds — anti-reentry only blocks while positioned, and
+        # the position closes between spikes via basis_converged exit.
+        assert summary.a2_intents_fired == 3
+        assert summary.a2_exits_fired_basis_converged == 3
+        assert summary.positions_open_at_end_of_run == 0
 
-        # paper.positions has exactly 2 rows: one perp, one spot.
+        # paper.positions is empty (all 3 trades closed).
         with _connect() as conn:
-            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 2
+            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 0
 
     def test_position_metadata_links_to_entry_fill(self, fresh_db):
         """paper.positions metadata carries a2_intent_uuid + a2_leg +
@@ -494,3 +499,354 @@ class TestAntiReentry:
         assert len(rows) == 2
         for (meta,) in rows:
             assert meta["a2_phase"] == "entry"
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Day 28b.2: exit logic integration tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+from strategies.a2_basis.signal.evaluate_exit import (  # noqa: E402
+    A2ExitConfig,
+)
+
+
+class TestExitLogic:
+    """Reviewer-locked checks 1-8 for Day 28b.2."""
+
+    def test_complete_trade_writes_4_paper_fills(self, fresh_db):
+        """Check 2: complete-trade fixture writes 2 entry + 2 exit fills."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM paper.fills WHERE strategy_id = %s;",
+                    (ids["strategy_id"],),
+                )
+                fill_count = cur.fetchone()[0]
+
+        assert summary.a2_intents_fired == 1
+        # Check 2: 2 entry + 2 exit = 4 paper.fills rows
+        assert fill_count == 4
+        # Exit fired with basis_converged (price collapsed back to flat)
+        assert summary.a2_exits_fired_basis_converged == 1
+        assert summary.a2_exits_fired_time_forced == 0
+
+    def test_complete_trade_leaves_paper_positions_empty(self, fresh_db):
+        """Check 3: paper.positions empty after a completed trade."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 0
+        assert summary.positions_open_at_end_of_run == 0
+
+    def test_sustained_spike_leaves_paper_positions_populated(self, fresh_db):
+        """Check 4: paper.positions remains populated if fixture ends before exit."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_sustained_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 2
+        assert summary.positions_open_at_end_of_run == 1
+        assert summary.a2_intents_fired == 1
+        # Position still open: no exit fired
+        assert summary.a2_exits_fired_basis_converged == 0
+        assert summary.a2_exits_fired_time_forced == 0
+
+    def test_research_pnl_is_profit_positive(self, fresh_db):
+        """Check 5: research_pnl_bps is profit-positive."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT metadata FROM paper.fills
+                    WHERE strategy_id = %s
+                      AND metadata->>'a2_phase' = 'exit'
+                    ORDER BY id;
+                    """,
+                    (ids["strategy_id"],),
+                )
+                rows = cur.fetchall()
+
+        # 2 exit rows expected
+        assert len(rows) == 2
+        for (meta,) in rows:
+            # Check 6: all P&L fields present
+            assert "research_pnl_bps" in meta
+            assert "research_gross_pnl_bps" in meta
+            assert "research_round_trip_cost_bps" in meta
+            assert "research_perp_pnl_bps" in meta
+            assert "research_spot_pnl_bps" in meta
+        # Both rows carry the SAME aggregate P&L (each leg's exit fill
+        # records the entire trade's P&L for audit symmetry).
+        gross_pnl = Decimal(rows[0][0]["research_gross_pnl_bps"])
+        net_pnl = Decimal(rows[0][0]["research_pnl_bps"])
+        cost = Decimal(rows[0][0]["research_round_trip_cost_bps"])
+        # Check 5: research_pnl_bps profit-positive for this fixture
+        # (perp went 100.85 → 100.00 = 84.28 bps profit on SHORT;
+        #  spot flat; gross ≈ 84.28; cost 33.84; net ≈ 50.44 profit)
+        assert gross_pnl > 0
+        assert net_pnl > 0
+        # Sanity: net = gross - cost
+        assert net_pnl == gross_pnl - cost
+
+    def test_re_entry_within_same_run_writes_8_fills(self, fresh_db):
+        """Re-entry: two complete trades within one fixture, 4 fills each."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_re_entry.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FROM paper.fills WHERE strategy_id = %s;",
+                    (ids["strategy_id"],),
+                )
+                fill_count = cur.fetchone()[0]
+
+        # 2 entries, 2 exits, 2 legs each = 8 paper.fills rows
+        assert summary.a2_intents_fired == 2
+        assert summary.a2_exits_fired_basis_converged == 2
+        assert fill_count == 8
+        # No open positions at end (both trades closed)
+        assert summary.positions_open_at_end_of_run == 0
+
+    def test_trading_fills_unchanged_after_complete_trade(self, fresh_db):
+        """Check 8: trading.fills is untouched by paper-research workflow."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM trading.fills;")
+                trading_count = cur.fetchone()[0]
+                cur.execute("SELECT COUNT(*) FROM paper.fills;")
+                paper_count = cur.fetchone()[0]
+
+        # Check 8: trading.fills untouched (firewall holds)
+        assert trading_count == 0
+        # paper.fills has the 4 expected rows
+        assert paper_count == 4
+
+    def test_exit_fill_shares_entry_a2_intent_uuid(self, fresh_db):
+        """Q4 lock: exit fills share entry's a2_intent_uuid (a2_phase
+        discriminates within a single trade lifecycle)."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT metadata->>'a2_phase', metadata->>'a2_intent_uuid'
+                    FROM paper.fills
+                    WHERE strategy_id = %s
+                    ORDER BY id;
+                    """,
+                    (ids["strategy_id"],),
+                )
+                rows = cur.fetchall()
+
+        # 4 rows: 2 entry + 2 exit, all with same a2_intent_uuid
+        assert len(rows) == 4
+        phases = [r[0] for r in rows]
+        uuids = [r[1] for r in rows]
+        assert phases.count("entry") == 2
+        assert phases.count("exit") == 2
+        assert len(set(uuids)) == 1  # single shared a2_intent_uuid
+
+    def test_constant_fixture_no_changes(self, fresh_db):
+        """Check 1: entry-only-zero fixtures (no entries → no exits)
+        behave correctly. Constant fixture still produces 0 entries,
+        0 exits, 0 open positions."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+        assert summary.a2_intents_fired == 0
+        assert summary.exit_evaluations_total == 0
+        assert summary.a2_exits_fired_basis_converged == 0
+        assert summary.a2_exits_fired_time_forced == 0
+        assert summary.positions_open_at_end_of_run == 0

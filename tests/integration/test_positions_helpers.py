@@ -315,3 +315,64 @@ def test_paper_position_count_filter_by_strategy(fresh_db):
         assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 1
         # Unrelated strategy id: zero
         assert paper_position_count(conn, strategy_id=999999) == 0
+
+
+
+# Day 28b.2: close_position helper
+
+
+from strategies.a2_basis.data.positions import close_position  # noqa: E402
+
+
+def test_close_position_returns_false_when_no_row(fresh_db):
+    """Idempotent: returns False when no row to delete."""
+    _alembic("upgrade", "0011")
+    suffix = uuid.uuid4().hex[:8]
+
+    with _connect() as conn:
+        ids = _bootstrap_minimal(conn, suffix)
+        conn.commit()
+        result = close_position(
+            conn,
+            strategy_id=ids["strategy_id"],
+            instrument_id=ids["perp_id"],
+        )
+    assert result is False
+
+
+def test_close_position_deletes_existing_row(fresh_db):
+    """Inserts a position then closes it; second call returns False."""
+    _alembic("upgrade", "0011")
+    suffix = uuid.uuid4().hex[:8]
+
+    with _connect() as conn:
+        ids = _bootstrap_minimal(conn, suffix)
+        open_position(
+            conn,
+            strategy_id=ids["strategy_id"],
+            portfolio_id=ids["portfolio_id"],
+            account_id=ids["account_id"],
+            instrument_id=ids["perp_id"],
+            quantity=Decimal("10.0"),
+            avg_entry_price=Decimal("100.0"),
+            opened_at=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc),
+            metadata={"a2_intent_uuid": str(uuid.uuid4()), "a2_leg": "perp"},
+        )
+        conn.commit()
+
+        first = close_position(
+            conn,
+            strategy_id=ids["strategy_id"],
+            instrument_id=ids["perp_id"],
+        )
+        second = close_position(
+            conn,
+            strategy_id=ids["strategy_id"],
+            instrument_id=ids["perp_id"],
+        )
+        conn.commit()
+
+        assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 0
+
+    assert first is True
+    assert second is False
