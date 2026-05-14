@@ -65,7 +65,7 @@ def _bootstrap_a2_registry(conn, suffix: str) -> dict:
 def test_constant_fixture_produces_zero_fires(fresh_db):
     """60 obs at constant basis = 10 bps. Expected: zero_or_near_zero_stdev
     on every evaluation past min_lookback. No paper.fills rows."""
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     suffix = uuid.uuid4().hex[:8]
 
@@ -122,7 +122,7 @@ def test_constant_fixture_produces_zero_fires(fresh_db):
 def test_spike_fixture_produces_one_fire_with_two_legs(fresh_db):
     """59 obs at basis=0, 1 final obs at basis=85. Expected: 1 fire,
     2 paper.fills rows with shared a2_intent_uuid."""
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     suffix = uuid.uuid4().hex[:8]
 
@@ -199,7 +199,7 @@ def test_spike_fixture_produces_one_fire_with_two_legs(fresh_db):
 def test_spike_fixture_writes_only_paper_research_with_promotion_false(fresh_db):
     """Every paper.fills row from A2 must have source_mode='PAPER_RESEARCH'
     and promotion_eligible=false. trading.fills must be unchanged."""
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
     suffix = uuid.uuid4().hex[:8]
 
     with _connect() as conn:
@@ -253,7 +253,7 @@ def test_deterministic_uuids_across_reruns(fresh_db):
     """Re-running the same fixture produces same paper_fill_uuid for
     both legs. The Day 20.1 writer's hash-mismatch check then makes
     the second write a silent no-op."""
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
     suffix = uuid.uuid4().hex[:8]
 
     with _connect() as conn:
@@ -311,3 +311,186 @@ def test_deterministic_uuids_across_reruns(fresh_db):
         # Both summaries reported one fire each
         assert summary1.a2_intents_fired == 1
         assert summary2.a2_intents_fired == 1
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Day 28a: anti-reentry integration tests
+# ═══════════════════════════════════════════════════════════════════════
+
+
+from strategies.a2_basis.data.positions import (  # noqa: E402
+    paper_position_count,
+    get_open_position,
+)
+
+
+FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "a2_basis"
+
+
+class TestAntiReentry:
+    """Day 28a hard-block: once positioned, subsequent fires are skipped."""
+
+    def test_three_spike_fixture_fires_only_once(self, fresh_db):
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_three_spikes.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+        # Hard-block: exactly one logical intent fires across 3 spikes.
+        assert summary.a2_intents_fired == 1
+        # Subsequent spike-observations should be blocked by anti-reentry.
+        assert summary.evaluations_skipped_already_positioned >= 1
+
+        # paper.positions has exactly 2 rows: one perp, one spot.
+        with _connect() as conn:
+            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 2
+
+    def test_position_metadata_links_to_entry_fill(self, fresh_db):
+        """paper.positions metadata carries a2_intent_uuid + a2_leg +
+        entry_paper_fill_uuid so Day 28b's exit logic can find the entry."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+
+            perp_pos = get_open_position(
+                conn,
+                strategy_id=ids["strategy_id"],
+                instrument_id=ids["perp_instrument_id"],
+            )
+            spot_pos = get_open_position(
+                conn,
+                strategy_id=ids["strategy_id"],
+                instrument_id=ids["spot_instrument_id"],
+            )
+
+        assert perp_pos is not None
+        assert spot_pos is not None
+        # Same a2_intent_uuid on both legs
+        assert (
+            perp_pos.metadata["a2_intent_uuid"]
+            == spot_pos.metadata["a2_intent_uuid"]
+        )
+        # Distinct legs
+        assert perp_pos.metadata["a2_leg"] == "perp"
+        assert spot_pos.metadata["a2_leg"] == "spot"
+        # entry_paper_fill_uuid present
+        assert "entry_paper_fill_uuid" in perp_pos.metadata
+        assert "entry_paper_fill_uuid" in spot_pos.metadata
+
+    def test_constant_fixture_writes_no_positions(self, fresh_db):
+        """Regression: zero fires → zero positions, zero skip increments."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            summary = runner.run(conn)
+            conn.commit()
+
+        assert summary.a2_intents_fired == 0
+        assert summary.evaluations_skipped_already_positioned == 0
+        with _connect() as conn:
+            assert paper_position_count(conn, strategy_id=ids["strategy_id"]) == 0
+
+    def test_entry_fill_metadata_carries_a2_phase(self, fresh_db):
+        """Per Day 28a reviewer convention: entry fills include a2_phase='entry'."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT metadata FROM paper.fills "
+                    "WHERE strategy_id = %s ORDER BY id;",
+                    (ids["strategy_id"],),
+                )
+                rows = cur.fetchall()
+
+        # Two entry fills, both with a2_phase=entry
+        assert len(rows) == 2
+        for (meta,) in rows:
+            assert meta["a2_phase"] == "entry"

@@ -40,6 +40,9 @@ from strategies.a2_basis.config.profile_selector import (
 from strategies.a2_basis.signal.cost_threshold import (
     compute_a2_round_trip_threshold_bps,
 )
+from strategies.a2_basis.data.positions import (
+    open_position,
+)
 from strategies.a2_basis.signal.evaluate import (
     A2SignalConfig,
     A2SignalDecision,
@@ -132,6 +135,7 @@ class A2RunSummary:
     evaluations_skipped_zero_or_near_zero_stdev: int
     evaluations_skipped_z_below_threshold: int
     evaluations_skipped_cost_not_cleared: int
+    evaluations_skipped_already_positioned: int
     a2_intents_fired: int
     replay_results: list[ReplayResult]
 
@@ -264,7 +268,14 @@ class A2PaperResearchRunner:
         skip_zero_stdev = 0
         skip_z_below = 0
         skip_cost_not_cleared = 0
+        skip_already_positioned = 0
         evaluations_total = 0
+        # Day 28a: in-memory anti-reentry state. Position writes go to
+        # paper.positions after replay_intents succeeds.
+        positioned = False
+        perp_intent_captured = None
+        spot_intent_captured = None
+        position_opened_at = None
 
         n = len(self._observations)
         for i in range(n):
@@ -304,14 +315,73 @@ class A2PaperResearchRunner:
                     skip_cost_not_cleared += 1
                 continue
 
+            # Day 28a: hard-block anti-reentry. Once we have fired,
+            # all subsequent non-FLAT decisions are skipped.
+            if positioned:
+                skip_already_positioned += 1
+                continue
+
             # Non-FLAT decision: construct 2 intents (perp + spot legs).
-            intents.extend(self._build_intents(current_obs, evaluation))
+            new_intents = self._build_intents(current_obs, evaluation)
+            intents.extend(new_intents)
+
+            # Capture position data for the post-replay paper.positions
+            # write. _build_intents returns [perp_intent, spot_intent].
+            perp_intent_captured = new_intents[0]
+            spot_intent_captured = new_intents[1]
+            position_opened_at = as_of
+            positioned = True
 
         results = replay_intents(
             conn, intents,
             fetcher=self._trade_fetcher,
             fetch_source=self._fetch_source,
         )
+
+        # Day 28a: persist paper.positions for the (at most one) intent that
+        # fired. paper.positions is materialized state; source of truth remains
+        # paper.fills. The UNIQUE (strategy_id, instrument_id) constraint is
+        # the DB-level backstop for the in-loop anti-reentry flag above.
+        if positioned:
+            a2_iuuid = perp_intent_captured.extra_metadata["a2_intent_uuid"]
+            open_position(
+                conn,
+                strategy_id=self._strategy_id,
+                portfolio_id=self._portfolio_id,
+                account_id=self._account_id,
+                instrument_id=self._perp_instrument_id,
+                quantity=(
+                    perp_intent_captured.quantity
+                    if perp_intent_captured.side == "buy"
+                    else -perp_intent_captured.quantity
+                ),
+                avg_entry_price=perp_intent_captured.decision_reference_price,
+                opened_at=position_opened_at,
+                metadata={
+                    "a2_intent_uuid": a2_iuuid,
+                    "a2_leg": "perp",
+                    "entry_paper_fill_uuid": str(perp_intent_captured.paper_fill_uuid),
+                },
+            )
+            open_position(
+                conn,
+                strategy_id=self._strategy_id,
+                portfolio_id=self._portfolio_id,
+                account_id=self._account_id,
+                instrument_id=self._spot_instrument_id,
+                quantity=(
+                    spot_intent_captured.quantity
+                    if spot_intent_captured.side == "buy"
+                    else -spot_intent_captured.quantity
+                ),
+                avg_entry_price=spot_intent_captured.decision_reference_price,
+                opened_at=position_opened_at,
+                metadata={
+                    "a2_intent_uuid": a2_iuuid,
+                    "a2_leg": "spot",
+                    "entry_paper_fill_uuid": str(spot_intent_captured.paper_fill_uuid),
+                },
+            )
 
         # Number of A2 intents fired = half the replay results (one per leg).
         a2_intents_fired = len(intents) // 2
@@ -323,6 +393,7 @@ class A2PaperResearchRunner:
             evaluations_skipped_zero_or_near_zero_stdev=skip_zero_stdev,
             evaluations_skipped_z_below_threshold=skip_z_below,
             evaluations_skipped_cost_not_cleared=skip_cost_not_cleared,
+            evaluations_skipped_already_positioned=skip_already_positioned,
             a2_intents_fired=a2_intents_fired,
             replay_results=results,
         )
@@ -363,6 +434,7 @@ class A2PaperResearchRunner:
             extra_metadata={
                 "a2_intent_uuid": a2_intent_uuid_str,
                 "a2_leg": "perp",
+                "a2_phase": "entry",
             },
         )
 
@@ -383,6 +455,7 @@ class A2PaperResearchRunner:
             extra_metadata={
                 "a2_intent_uuid": a2_intent_uuid_str,
                 "a2_leg": "spot",
+                "a2_phase": "entry",
             },
         )
 

@@ -42,7 +42,7 @@ FIXTURE_DIR = Path(__file__).resolve().parent.parent / "fixtures" / "a2_basis"
 
 
 def test_harness_constant_fixture_zero_fires(fresh_db):
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json",
@@ -78,7 +78,7 @@ def test_harness_constant_fixture_zero_fires(fresh_db):
 
 
 def test_harness_spike_fixture_one_fire_with_two_legs(fresh_db):
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json",
@@ -105,7 +105,7 @@ def test_harness_spike_fixture_one_fire_with_two_legs(fresh_db):
 
 
 def test_harness_output_has_required_top_level_keys(fresh_db):
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json",
@@ -134,7 +134,7 @@ def test_harness_output_has_required_top_level_keys(fresh_db):
 
 
 def test_harness_perp_block_has_required_keys(fresh_db):
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json",
         symbol="SOLUSDT",
@@ -160,7 +160,7 @@ def test_harness_perp_block_has_required_keys(fresh_db):
 
 
 def test_harness_spot_block_has_required_keys(fresh_db):
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json",
         symbol="SOLUSDT",
@@ -197,7 +197,7 @@ def test_harness_round_trip_matches_helper(fresh_db):
     """Per reviewer correction: do not hardcode round-trip numbers.
     The harness's round_trip block must match what
     compute_a2_round_trip_threshold_bps produces."""
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
 
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_constant.json",
@@ -236,7 +236,7 @@ def test_harness_output_is_json_serializable(fresh_db):
     """run_harness's return value must be json.dumps()-able for CLI use."""
     import json
 
-    _alembic("upgrade", "0010")
+    _alembic("upgrade", "0011")
     config = HarnessConfig(
         fixture_path=FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json",
         symbol="SOLUSDT",

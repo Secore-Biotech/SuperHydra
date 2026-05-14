@@ -481,6 +481,9 @@ def run_harness(config: HarnessConfig) -> dict[str, Any]:
         "evaluations_skipped_cost_not_cleared": (
             summary.evaluations_skipped_cost_not_cleared
         ),
+        "evaluations_skipped_already_positioned": (
+            summary.evaluations_skipped_already_positioned
+        ),
         "a2_intents_fired": summary.a2_intents_fired,
         "paper_fills_before": paper_fills_before,
         "paper_fills_after": paper_fills_after,
