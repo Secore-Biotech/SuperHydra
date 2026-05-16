@@ -334,6 +334,13 @@ class A2PaperResearchRunner:
         self._spot_instrument_id = spot_instrument_id
         self._venue = venue
         self._base_symbol = base_symbol
+        # Step 3: leg-specific symbols for replay fetch routing.
+        # UUID derivation continues to use self._base_symbol so that
+        # paper_fill_uuid stays stable across the perp/spot split.
+        # Only the PaperReplayIntent.symbol field uses these; the
+        # A2DualFetcher uses them to route fetch_window calls.
+        self._perp_symbol = f"{base_symbol}_PERP"
+        self._spot_symbol = f"{base_symbol}_SPOT"
         self._quantity_per_intent = quantity_per_intent
         self._signal_config = signal_config or A2SignalConfig()
         # run_id is mixed into every paper_fill_uuid hash so that
@@ -608,7 +615,7 @@ class A2PaperResearchRunner:
             portfolio_id=self._portfolio_id,
             account_id=self._account_id,
             instrument_id=self._perp_instrument_id,
-            symbol=self._base_symbol,
+            symbol=self._perp_symbol,
             side=perp_side,
             quantity=self._quantity_per_intent,
             decision_reference_price=current_obs.perp_price,
@@ -625,7 +632,7 @@ class A2PaperResearchRunner:
             portfolio_id=self._portfolio_id,
             account_id=self._account_id,
             instrument_id=self._spot_instrument_id,
-            symbol=self._base_symbol,
+            symbol=self._spot_symbol,
             side=spot_side,
             quantity=self._quantity_per_intent,
             decision_reference_price=current_obs.spot_price,
@@ -778,7 +785,7 @@ class A2PaperResearchRunner:
             portfolio_id=self._portfolio_id,
             account_id=self._account_id,
             instrument_id=self._perp_instrument_id,
-            symbol=self._base_symbol,
+            symbol=self._perp_symbol,
             side=perp_exit_side,
             quantity=self._quantity_per_intent,
             decision_reference_price=current_obs.perp_price,
@@ -794,7 +801,7 @@ class A2PaperResearchRunner:
             portfolio_id=self._portfolio_id,
             account_id=self._account_id,
             instrument_id=self._spot_instrument_id,
-            symbol=self._base_symbol,
+            symbol=self._spot_symbol,
             side=spot_exit_side,
             quantity=self._quantity_per_intent,
             decision_reference_price=current_obs.spot_price,

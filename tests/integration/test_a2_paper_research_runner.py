@@ -850,3 +850,176 @@ class TestExitLogic:
         assert summary.a2_exits_fired_basis_converged == 0
         assert summary.a2_exits_fired_time_forced == 0
         assert summary.positions_open_at_end_of_run == 0
+
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Step 3 prep: leg-specific symbols in paper.fills
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class _RecordingFetcher:
+    """Test-only fetcher that records every fetch_window call. Returns
+    empty trade list (matches _NoopFetcher behaviour for slippage),
+    but captures the symbol argument so tests can verify leg-routing."""
+
+    def __init__(self):
+        self.calls = []
+
+    def fetch_window(self, symbol, start, end):
+        self.calls.append((symbol, start, end))
+        return []
+
+
+class TestLegSpecificSymbols:
+    """Step 3 lock: the runner emits leg-specific symbols on intents so
+    that A2DualFetcher can route replay calls to perp vs spot fetcher.
+
+    paper.fills has no `symbol` column — intent.symbol is consumed by
+    replay_runner._replay_one() when it calls fetcher.fetch_window(...)
+    and never persisted. These tests verify the routing-end-to-end by
+    capturing what the runner passes to its fetcher."""
+
+    def test_entry_intents_pass_leg_specific_symbols_to_fetcher(self, fresh_db):
+        """Single-spike fixture: 1 entry → 2 fetch_window calls (perp + spot
+        leg). Verify each call uses the leg-specific symbol."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+        recording = _RecordingFetcher()
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=recording,
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+        # 2 fetch_window calls: one for perp leg, one for spot leg.
+        assert len(recording.calls) == 2
+        symbols = {call[0] for call in recording.calls}
+        assert symbols == {"SOLUSDT_PERP", "SOLUSDT_SPOT"}
+
+    def test_complete_trade_passes_4_leg_specific_calls(self, fresh_db):
+        """Complete trade: 1 entry + 1 exit = 4 fetch_window calls.
+        Each must use the leg-specific symbol of the leg it serves."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+        recording = _RecordingFetcher()
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_complete_trade.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=recording,
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+        # 4 fetch_window calls (entry perp, entry spot, exit perp, exit spot)
+        assert len(recording.calls) == 4
+        symbols = [call[0] for call in recording.calls]
+        # Exactly 2 of each
+        assert symbols.count("SOLUSDT_PERP") == 2
+        assert symbols.count("SOLUSDT_SPOT") == 2
+        # No bare SOLUSDT (Step 2 hard constraint)
+        assert "SOLUSDT" not in symbols
+
+    def test_uuid_stability_preserved_across_leg_symbol_change(self, fresh_db):
+        """Hard constraint: UUID derivation uses base_symbol, not leg-
+        specific symbol, so paper_fill_uuids must be stable. Verify by
+        re-running and checking same UUIDs surface."""
+        _alembic("upgrade", "0011")
+        suffix = uuid.uuid4().hex[:8]
+        with _connect() as conn:
+            ids = _bootstrap_a2_registry(conn, suffix)
+            conn.commit()
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT paper_fill_uuid
+                    FROM paper.fills
+                    WHERE strategy_id = %s
+                    ORDER BY paper_fill_uuid;
+                    """,
+                    (ids["strategy_id"],),
+                )
+                first_uuids = [row[0] for row in cur.fetchall()]
+        # Second run with identical inputs should produce identical UUIDs
+        # (idempotency contract). The leg-symbol change must NOT have
+        # affected UUID derivation.
+        with _connect() as conn:
+            observations = load_basis_fixture(
+                FIXTURE_DIR / "SOLUSDT_BASIS_60obs_one_spike.json"
+            )
+            runner = A2PaperResearchRunner(
+                basis_source=observations,
+                trade_fetcher=_NoopFetcher(),
+                fetch_source="archive",
+                strategy_id=ids["strategy_id"],
+                portfolio_id=ids["portfolio_id"],
+                account_id=ids["account_id"],
+                perp_instrument_id=ids["perp_instrument_id"],
+                spot_instrument_id=ids["spot_instrument_id"],
+                venue="binance",
+                base_symbol="SOLUSDT",
+                quantity_per_intent=Decimal("10.0"),
+            )
+            runner.run(conn)
+            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT paper_fill_uuid
+                    FROM paper.fills
+                    WHERE strategy_id = %s
+                    ORDER BY paper_fill_uuid;
+                    """,
+                    (ids["strategy_id"],),
+                )
+                second_uuids = [row[0] for row in cur.fetchall()]
+        # Same 2 UUIDs across both runs (paper.fills writer's hash-mismatch
+        # silent-no-op preserved the original UUIDs).
+        assert len(first_uuids) == 2
+        assert first_uuids == second_uuids
