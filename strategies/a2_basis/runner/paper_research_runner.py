@@ -260,6 +260,7 @@ class A2PaperResearchRunner:
         cost_bundle: A2CostBundle | None = None,
         uncertainty_margin_fraction: Decimal = DEFAULT_UNCERTAINTY_MARGIN_FRACTION,
         signal_config: A2SignalConfig | None = None,
+        run_id: str | None = None,
     ) -> None:
         if quantity_per_intent <= 0:
             raise ValueError(
@@ -335,6 +336,17 @@ class A2PaperResearchRunner:
         self._base_symbol = base_symbol
         self._quantity_per_intent = quantity_per_intent
         self._signal_config = signal_config or A2SignalConfig()
+        # run_id is mixed into every paper_fill_uuid hash so that
+        # different runs produce different UUIDs and ON CONFLICT
+        # (paper_fill_uuid) DO NOTHING does not silently swallow inserts.
+        # When None (legacy callers), UUIDs are deterministic from
+        # observation identity alone (original Day 24 behaviour).
+        #
+        # run_id is also injected into every fill's extra_metadata at
+        # intent-construction time (key "empirical_run_id"). This is
+        # set at construction — not via post-hoc UPDATE — because
+        # paper.fills is append-only (trigger forbids UPDATE/DELETE).
+        self._run_id = run_id
 
     # ─── Public API ────────────────────────────────────────────────────
 
@@ -574,6 +586,22 @@ class A2PaperResearchRunner:
         # Shared metadata across legs.
         a2_intent_uuid_str = str(intent_uuid)
 
+        # Base metadata for both legs; run_id injected at construction
+        # time because paper.fills is append-only (no UPDATE allowed).
+        perp_meta = {
+            "a2_intent_uuid": a2_intent_uuid_str,
+            "a2_leg": "perp",
+            "a2_phase": "entry",
+        }
+        spot_meta = {
+            "a2_intent_uuid": a2_intent_uuid_str,
+            "a2_leg": "spot",
+            "a2_phase": "entry",
+        }
+        if self._run_id is not None:
+            perp_meta["empirical_run_id"] = self._run_id
+            spot_meta["empirical_run_id"] = self._run_id
+
         perp_intent = PaperReplayIntent(
             paper_fill_uuid=perp_leg_uuid,
             strategy_id=self._strategy_id,
@@ -588,11 +616,7 @@ class A2PaperResearchRunner:
             cost_profile_name=self._cost_bundle.perp_profile.profile_name,
             cost_profile_hash=self._cost_bundle.perp_profile.content_hash,
             intended_fill_at=current_obs.sampled_at,
-            extra_metadata={
-                "a2_intent_uuid": a2_intent_uuid_str,
-                "a2_leg": "perp",
-                "a2_phase": "entry",
-            },
+            extra_metadata=perp_meta,
         )
 
         spot_intent = PaperReplayIntent(
@@ -609,11 +633,7 @@ class A2PaperResearchRunner:
             cost_profile_name=self._cost_bundle.spot_profile.profile_name,
             cost_profile_hash=self._cost_bundle.spot_profile.content_hash,
             intended_fill_at=current_obs.sampled_at,
-            extra_metadata={
-                "a2_intent_uuid": a2_intent_uuid_str,
-                "a2_leg": "spot",
-                "a2_phase": "entry",
-            },
+            extra_metadata=spot_meta,
         )
 
         return [perp_intent, spot_intent]
@@ -621,9 +641,10 @@ class A2PaperResearchRunner:
     def _make_intent_uuid(self, eval_time: datetime) -> UUID:
         """Deterministic UUID for one A2 intent.
 
-        Idempotency: re-running the same observations produces the same
-        intent UUID. The Day 20.1 writer's hash-mismatch detection
-        means re-running with identical content is a silent no-op.
+        When run_id is set, it is mixed into the hash so each run
+        produces unique UUIDs and ON CONFLICT does not silently drop
+        inserts from repeat runs. When run_id is None (legacy), UUIDs
+        are deterministic from observation identity alone.
         """
         canonical = (
             f"a2_basis_research|intent|"
@@ -632,6 +653,8 @@ class A2PaperResearchRunner:
             f"{self._base_symbol}|"
             f"{eval_time.astimezone(timezone.utc).isoformat()}"
         )
+        if self._run_id is not None:
+            canonical += f"|run:{self._run_id}"
         digest = hashlib.sha256(canonical.encode("utf-8")).digest()
         return UUID(bytes=digest[:16])
 
@@ -640,6 +663,8 @@ class A2PaperResearchRunner:
         if leg not in ("perp", "spot"):
             raise ValueError(f"leg must be 'perp' or 'spot', got {leg!r}")
         canonical = f"a2_basis_research|{leg}|{intent_uuid}"
+        if self._run_id is not None:
+            canonical += f"|run:{self._run_id}"
         digest = hashlib.sha256(canonical.encode("utf-8")).digest()
         return UUID(bytes=digest[:16])
 
@@ -731,6 +756,22 @@ class A2PaperResearchRunner:
                 exit_eval.current_basis_bps
             )
 
+        perp_exit_meta = {
+            **common_pnl_metadata,
+            "a2_intent_uuid": a2_intent_uuid,
+            "a2_leg": "perp",
+            "a2_entry_paper_fill_uuid": str(entry_perp_intent.paper_fill_uuid),
+        }
+        spot_exit_meta = {
+            **common_pnl_metadata,
+            "a2_intent_uuid": a2_intent_uuid,
+            "a2_leg": "spot",
+            "a2_entry_paper_fill_uuid": str(entry_spot_intent.paper_fill_uuid),
+        }
+        if self._run_id is not None:
+            perp_exit_meta["empirical_run_id"] = self._run_id
+            spot_exit_meta["empirical_run_id"] = self._run_id
+
         perp_intent = PaperReplayIntent(
             paper_fill_uuid=perp_exit_uuid,
             strategy_id=self._strategy_id,
@@ -745,12 +786,7 @@ class A2PaperResearchRunner:
             cost_profile_name=self._cost_bundle.perp_profile.profile_name,
             cost_profile_hash=self._cost_bundle.perp_profile.content_hash,
             intended_fill_at=current_obs.sampled_at,
-            extra_metadata={
-                **common_pnl_metadata,
-                "a2_intent_uuid": a2_intent_uuid,
-                "a2_leg": "perp",
-                "a2_entry_paper_fill_uuid": str(entry_perp_intent.paper_fill_uuid),
-            },
+            extra_metadata=perp_exit_meta,
         )
         spot_intent = PaperReplayIntent(
             paper_fill_uuid=spot_exit_uuid,
@@ -766,12 +802,7 @@ class A2PaperResearchRunner:
             cost_profile_name=self._cost_bundle.spot_profile.profile_name,
             cost_profile_hash=self._cost_bundle.spot_profile.content_hash,
             intended_fill_at=current_obs.sampled_at,
-            extra_metadata={
-                **common_pnl_metadata,
-                "a2_intent_uuid": a2_intent_uuid,
-                "a2_leg": "spot",
-                "a2_entry_paper_fill_uuid": str(entry_spot_intent.paper_fill_uuid),
-            },
+            extra_metadata=spot_exit_meta,
         )
 
         return [perp_intent, spot_intent]
@@ -807,6 +838,8 @@ class A2PaperResearchRunner:
             f"{self._quantity_per_intent}|"
             f"{a2_intent_uuid}"
         )
+        if self._run_id is not None:
+            canonical += f"|run:{self._run_id}"
         digest = hashlib.sha256(canonical.encode("utf-8")).digest()
         return UUID(bytes=digest[:16])
 
