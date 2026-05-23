@@ -77,14 +77,45 @@ def _build_fetcher(allow_noop: bool):
     """Return the trade fetcher to use for this run.
 
     If --allow-noop-fetcher was passed, import the test-only _NoopFetcher.
-    Otherwise, use the real Binance trade fetcher.
+    Otherwise, construct A2DualFetcher with archive-based perp and spot
+    fetchers.
+
+    Why archives (not live REST):
+      - Deterministic: same bytes on every run, no network variance.
+      - Free: no rate-limit pressure, no API key required.
+      - Full history: data.binance.vision serves all months since launch.
+
+    A2DualFetcher is the integration point for any future fetcher swap
+    (live REST for canary, alternative venue, etc.) — callers only see
+    the TradeFetcher protocol.
     """
     if allow_noop:
         from tests.fixtures._noop_fetcher import _NoopFetcher
         return _NoopFetcher()
-    # Real fetcher — import from the venue adapter
-    from venues.binance.trade_fetcher import BinanceTradeFetcher
-    return BinanceTradeFetcher()
+
+    # Real archive-backed dual fetcher for historical backtesting.
+    from data.ingestion.vendors.binance.archive_trade_fetcher import (
+        BinanceArchiveTradeFetcher,
+    )
+    from data.ingestion.vendors.binance.spot_archive_trade_fetcher import (
+        BinanceSpotArchiveTradeFetcher,
+    )
+    from strategies.a2_basis.data.dual_fetcher import A2DualFetcher
+
+    perp_fetcher = BinanceArchiveTradeFetcher()
+    spot_fetcher = BinanceSpotArchiveTradeFetcher()
+
+    # The runner emits intent.symbol as "{base_symbol}_PERP" / "{base_symbol}_SPOT"
+    # (set in paper_research_runner.__init__ from base_symbol="SOLUSDT").
+    # A2DualFetcher matches on these and calls the underlying fetcher with
+    # the bare base_symbol ("SOLUSDT").
+    return A2DualFetcher(
+        perp_fetcher=perp_fetcher,
+        spot_fetcher=spot_fetcher,
+        perp_symbol="SOLUSDT_PERP",
+        spot_symbol="SOLUSDT_SPOT",
+        base_symbol="SOLUSDT",
+    )
 
 
 def _connect():
