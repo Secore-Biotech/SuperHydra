@@ -41,17 +41,23 @@ def main() -> int:
     print(f"Cache dir exists pre-fetch: {cache_dir.exists()}")
     print()
 
-    # Fetch BTCUSDT spot for two months: 2024-01 and 2024-02
-    # Small window, well within Binance's archive range, well-known
-    # high-volume instrument so the archives must exist.
+    # Fetch BTCUSDT spot for THREE months spanning the timestamp-format
+    # transition: 2024-01, 2024-02 (ms format) plus 2025-01 (μs format).
+    # This catches future schema drift in either era.
     start = datetime(2024, 1, 1, tzinfo=timezone.utc)
-    end = datetime(2024, 3, 1, tzinfo=timezone.utc)
-    print(f"Fetching BTCUSDT spot 1d klines: {start.date()} to {end.date()}")
-    print(f"Expected count: ~60 daily bars")
-    print()
+    end_phase1 = datetime(2024, 3, 1, tzinfo=timezone.utc)
+    print(f"Phase 1: Fetching ms-era BTCUSDT spot 1d: {start.date()} → {end_phase1.date()}")
+    klines_ms = fetcher.fetch_window("BTCUSDT", start, end_phase1)
+    print(f"  Returned: {len(klines_ms)} klines (expected ~60)")
 
-    klines = fetcher.fetch_window("BTCUSDT", start, end)
-    print(f"Returned: {len(klines)} klines")
+    start_2025 = datetime(2025, 1, 1, tzinfo=timezone.utc)
+    end_2025 = datetime(2025, 2, 1, tzinfo=timezone.utc)
+    print(f"Phase 2: Fetching μs-era BTCUSDT spot 1d: {start_2025.date()} → {end_2025.date()}")
+    klines_us = fetcher.fetch_window("BTCUSDT", start_2025, end_2025)
+    print(f"  Returned: {len(klines_us)} klines (expected ~31)")
+
+    klines = klines_ms + klines_us
+    print(f"Combined: {len(klines)} klines across both timestamp formats")
 
     if not klines:
         print("FAIL: no klines returned. Possible causes:")
@@ -80,9 +86,13 @@ def main() -> int:
 
     # Sanity checks
     issues = []
-    if len(klines) < 50 or len(klines) > 70:
+    if len(klines_ms) < 50 or len(klines_ms) > 70:
         issues.append(
-            f"unexpected count: {len(klines)} (expected ~60 for 2 months daily)"
+            f"unexpected ms-era count: {len(klines_ms)} (expected ~60 for 2 months daily)"
+        )
+    if len(klines_us) < 25 or len(klines_us) > 35:
+        issues.append(
+            f"unexpected μs-era count: {len(klines_us)} (expected ~31 for 1 month daily)"
         )
     if first.venue != "binance":
         issues.append(f"first.venue = {first.venue!r}, expected 'binance'")
@@ -116,20 +126,36 @@ def main() -> int:
     if not cached:
         issues.append("no zip files in cache after fetch")
 
-    # Second-pass: refetch the same window, should be instant from cache
-    print("Second pass (should be instant — cache hit)...")
+    # Second-pass: refetch ms-era window, should be instant from cache
+    print("Second pass on ms-era window (should be instant — cache hit)...")
     t_start = __import__("time").monotonic()
-    klines2 = fetcher.fetch_window("BTCUSDT", start, end)
+    klines2 = fetcher.fetch_window("BTCUSDT", start, end_phase1)
     t_elapsed = __import__("time").monotonic() - t_start
     print(f"  Returned {len(klines2)} klines in {t_elapsed:.3f}s")
 
-    if len(klines2) != len(klines):
+    if len(klines2) != len(klines_ms):
         issues.append(
-            f"second pass returned {len(klines2)}, first pass returned {len(klines)}"
+            f"second pass returned {len(klines2)}, first pass ms-era returned {len(klines_ms)}"
         )
     if t_elapsed > 1.0:
         issues.append(
             f"second pass took {t_elapsed:.2f}s, expected <1s (cache hit)"
+        )
+
+    # Second-pass: refetch μs-era window, should also be instant from cache
+    print("Second pass on μs-era window (should be instant — cache hit)...")
+    t_start2 = __import__("time").monotonic()
+    klines2_us = fetcher.fetch_window("BTCUSDT", start_2025, end_2025)
+    t_elapsed2 = __import__("time").monotonic() - t_start2
+    print(f"  Returned {len(klines2_us)} klines in {t_elapsed2:.3f}s")
+
+    if len(klines2_us) != len(klines_us):
+        issues.append(
+            f"μs second pass returned {len(klines2_us)}, first pass μs returned {len(klines_us)}"
+        )
+    if t_elapsed2 > 1.0:
+        issues.append(
+            f"μs second pass took {t_elapsed2:.2f}s, expected <1s (cache hit)"
         )
 
     print()

@@ -262,6 +262,27 @@ def _iter_klines_in_window(
                     yield kline
 
 
+def _parse_binance_archive_timestamp(ts_str: str) -> datetime:
+    """Parse a Binance archive timestamp. Spot archives changed from ms to
+    μs granularity sometime in early 2025; this helper detects by digit count.
+
+    13 digits → milliseconds since epoch (pre-2025 spot, all perp)
+    16 digits → microseconds since epoch (2025+ spot)
+
+    Raises ValueError on any other length.
+    """
+    digit_count = len(ts_str)
+    if digit_count == 13:
+        return datetime.fromtimestamp(int(ts_str) / 1_000, tz=timezone.utc)
+    elif digit_count == 16:
+        return datetime.fromtimestamp(int(ts_str) / 1_000_000, tz=timezone.utc)
+    else:
+        raise ValueError(
+            f"unexpected timestamp digit count: {digit_count} for {ts_str!r}; "
+            f"expected 13 (ms) or 16 (μs)"
+        )
+
+
 def _parse_kline_row(
     row: list[str],
     *,
@@ -272,13 +293,13 @@ def _parse_kline_row(
     """Parse one CSV row from a Binance spot kline archive.
 
     Column order is identical to USDⓈ-M futures klines:
-      0: open_time (ms)
+      0: open_time (ms pre-2025; μs from 2025+; detected by digit count)
       1: open
       2: high
       3: low
       4: close
       5: volume (base)
-      6: close_time (ms)
+      6: close_time (ms pre-2025; μs from 2025+; not parsed)
       7: quote_volume
       8: trade_count
       9: taker_buy_volume (base)
@@ -291,7 +312,7 @@ def _parse_kline_row(
         venue="binance",
         instrument=symbol,
         interval=interval,
-        open_time=datetime.fromtimestamp(int(row[0]) / 1000, tz=timezone.utc),
+        open_time=_parse_binance_archive_timestamp(row[0]),
         open=Decimal(row[1]),
         high=Decimal(row[2]),
         low=Decimal(row[3]),

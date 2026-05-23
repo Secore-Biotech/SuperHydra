@@ -27,6 +27,7 @@ import pytest
 from data.ingestion.vendors.binance.klines_archive_spot_fetcher import (
     BinanceKlinesArchiveSpotFetcher,
     _months_overlapping,
+    _parse_binance_archive_timestamp,
     _sort_and_dedupe,
 )
 from data.ingestion.vendors.binance.kline import BinanceKline
@@ -85,6 +86,23 @@ class _StubTransport:
 
 def _ts_ms(year: int, month: int, day: int) -> int:
     return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp() * 1000)
+
+def _make_kline_csv_row_us(
+    *, open_time_us: int, open_p: str, high: str, low: str, close: str,
+    volume: str, quote_volume: str, trade_count: int,
+) -> list[str]:
+    """Build one CSV row with MICROSECOND timestamps (post-2025 Binance spot format)."""
+    close_time_us = open_time_us + 86_400_000_000 - 1  # 1d bar in μs
+    return [
+        str(open_time_us), open_p, high, low, close, volume,
+        str(close_time_us), quote_volume, str(trade_count),
+        volume, quote_volume, "0",
+    ]
+
+
+def _ts_us(year: int, month: int, day: int) -> int:
+    return int(datetime(year, month, day, tzinfo=timezone.utc).timestamp() * 1_000_000)
+
 
 
 # Spot URL prefix (the load-bearing difference from perp)
@@ -401,3 +419,85 @@ class TestArchiveAbsent:
         assert len(transport.calls) == 1
         assert "/data/spot/" in transport.calls[0]
         assert "/data/futures/" not in transport.calls[0]
+
+
+
+class TestTimestampFormatDetection:
+    """Binance spot archive timestamps changed from ms (pre-2025) to μs (2025+).
+
+    These tests verify that both formats are parsed correctly by digit-count
+    detection, and that malformed timestamps raise cleanly.
+    """
+
+    def test_helper_ms_format(self):
+        """13-digit timestamp parses as milliseconds."""
+        result = _parse_binance_archive_timestamp("1704067200000")
+        assert result == datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    def test_helper_us_format(self):
+        """16-digit timestamp parses as microseconds."""
+        result = _parse_binance_archive_timestamp("1735689600000000")
+        assert result == datetime(2025, 1, 1, tzinfo=timezone.utc)
+
+    def test_helper_rejects_unexpected_digit_count(self):
+        """Anything not 13 or 16 digits raises ValueError."""
+        with pytest.raises(ValueError, match="unexpected timestamp digit count"):
+            _parse_binance_archive_timestamp("123456")
+        with pytest.raises(ValueError, match="unexpected timestamp digit count"):
+            _parse_binance_archive_timestamp("12345678901234567890")
+
+    def test_fetch_window_with_us_timestamps(self, tmp_path):
+        """Spot archive with 2025+ microsecond timestamps parses end-to-end."""
+        rows = [
+            _make_kline_csv_row_us(
+                open_time_us=_ts_us(2025, 1, 15),
+                open_p="93576", high="95151", low="92888", close="94591",
+                volume="10373", quote_volume="975444194", trade_count=1516556,
+            ),
+            _make_kline_csv_row_us(
+                open_time_us=_ts_us(2025, 1, 16),
+                open_p="94591", high="97839", low="94392", close="96984",
+                volume="21970", quote_volume="2118411852", trade_count=3569079,
+            ),
+        ]
+        archive = _make_archive_bytes(rows)
+        url = f"{SPOT_URL_PREFIX}BTCUSDT/1d/BTCUSDT-1d-2025-01.zip"
+        f = BinanceKlinesArchiveSpotFetcher(
+            cache_dir=tmp_path,
+            transport=_StubTransport({url: archive}),
+        )
+        result = f.fetch_window(
+            "BTCUSDT",
+            datetime(2025, 1, 15, tzinfo=timezone.utc),
+            datetime(2025, 1, 17, tzinfo=timezone.utc),
+        )
+        assert len(result) == 2
+        assert result[0].open_time == datetime(2025, 1, 15, tzinfo=timezone.utc)
+        assert result[1].open_time == datetime(2025, 1, 16, tzinfo=timezone.utc)
+        assert result[0].close == Decimal("94591")
+
+    def test_fetch_window_with_ms_timestamps_still_works(self, tmp_path):
+        """Regression: pre-2025 ms-format archives still parse correctly
+        after the μs detection logic was added."""
+        rows = [
+            _make_kline_csv_row(
+                open_time_ms=_ts_ms(2024, 1, 15),
+                open_p="42283", high="44184", low="42180", close="44179",
+                volume="27174", quote_volume="1169995682", trade_count=1114623,
+            ),
+        ]
+        archive = _make_archive_bytes(rows)
+        url = f"{SPOT_URL_PREFIX}BTCUSDT/1d/BTCUSDT-1d-2024-01.zip"
+        f = BinanceKlinesArchiveSpotFetcher(
+            cache_dir=tmp_path,
+            transport=_StubTransport({url: archive}),
+        )
+        result = f.fetch_window(
+            "BTCUSDT",
+            datetime(2024, 1, 15, tzinfo=timezone.utc),
+            datetime(2024, 1, 16, tzinfo=timezone.utc),
+        )
+        assert len(result) == 1
+        assert result[0].open_time == datetime(2024, 1, 15, tzinfo=timezone.utc)
+        assert result[0].close == Decimal("44179")
+
