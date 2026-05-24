@@ -1,3 +1,34 @@
+# SUPERSEDED — do not implement
+
+This scope was drafted and locked at commit 2eeb99c on 2026-05-24
+before rereading `notes/exploration_log.md`. The exploration record
+shows that same-venue Binance delta-neutral funding capture was
+already measured (sim_hedged_carry_v2) and produced ~3.2% annualized
+gross on $10k notional over 3 years. The Sharpe 10.76 result was
+explicitly diagnosed in the log as smooth-cashflow artifact, not
+deployable strategy edge.
+
+Three additional strategy directions were also killed during the
+same exploration arc:
+- Cross-venue basis arbitrage (cross-venue stdev tighter than
+  same-venue at 1h resolution)
+- Cross-venue dislocation events (~4/year >±10 bps, median 1h
+  persistence)
+- USDT/USD dispersion (4 events ≥±25 bps in 3 years)
+
+This note is retained as audit trail. The scope below it is not
+the next-session scope. See `notes/exploration_log.md` for the
+research record and the open question it ends on: "what direction
+is worth opening as fresh scope?"
+
+The next-session direction is hydra-next migration work, not a
+new strategy simulator. Strategy direction is unresolved; the
+canary-gate migration is infrastructure needed by any future
+surviving engine and has no opportunity cost while strategy is
+unresolved.
+
+---
+
 # Next session: funding-capture execution-friction simulator
 
 Status: SCOPE LOCKED, NOT YET IMPLEMENTED.
