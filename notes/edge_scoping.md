@@ -88,6 +88,16 @@ Source: `notes/exploration_log.md`, `notes/a1_audit_findings.md`, `notes/cross_v
 
 ---
 
+### 3.3 Data-limited / unresolved (probed, sample-short or coverage-blocked)
+
+Probes that ran end-to-end on the production code path with clean data hygiene, but did **not** clear the sample-sufficiency thresholds locked in §5 of their respective probe specs. Per the operator-locked decision rule for under-sample probes, the economic gate is NOT overread as a formal kill, even when the under-sample evidence is directionally unfavorable. These probes stay in research; they do not advance to promotion, and they are not pre-registered as killed. They become eligible for re-run when the data ceiling that limited them is lifted, with the decision-rule branch for each outcome pre-specified before re-run.
+
+This category is deliberately distinct from §3.1 (empirically killed) and §3.2 (structurally closed by setup). An entry here is **inconclusive**, not closed. The distinction matters because §3.1 / §3.2 entries are pre-registered as not-to-retest, whereas §3.3 entries are explicitly retest-eligible under the originating spec when data permits.
+
+**Entries:**
+
+- **Vol-event persistence (BTCUSDT/ETHUSDT, 24h σ → 1/3/7-day directional).** Probe outcome: data-coverage limited; persistence hypothesis directionally disfavored, formal verdict inconclusive. Sample sufficiency short by 6 train events and 17 OOS days on the locked 80/20 calendar split; data ceiling at 2026-04-30 (Binance's published monthly archive horizon at run time). Economic gate FAIL under-sample on all three horizons (mean net −62 to −106 bps, win rate 38–41%, cost coverage negative). Direction is informative for future scoping but does not authorise reversal or any spec rescue in this entry, per probe spec §8 non-precedent rule. Full record: `docs/decisions/2026-05-28-vol-event-persistence-probe-outcome.md`. Eligible for re-run once the 2026-05 Binance monthly archive publishes (≈ early June 2026); the re-run is mechanical — no code changes — and decision-rule branches for each possible outcome are pre-specified in the §10 decision-log entry.
+
 ## 4. Structurally plausible — open space
 
 A direction is plausibly open *only if all of the following hold*:
