@@ -43,6 +43,7 @@ to do with a suspect run).
 """
 from __future__ import annotations
 
+import bisect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext
@@ -79,6 +80,13 @@ _DECIMAL_PRECISION: Final[int] = 28
 
 # Venue fact, not a spec gate: Binance perps settle funding 3x/day (8h).
 _FUNDING_INTERVAL_HOURS: Final[int] = 8
+
+# Maximum tolerated gap between consecutive funding records inside (or
+# overlapping) the holding window. Two normal 8h settlements span 8h; one
+# missing settlement opens a 16h gap. 12h sits between those, so a single
+# missing print trips the check but normal cadence (with millisecond
+# jitter) does not.
+_FUNDING_GAP_MAX_HOURS: Final[int] = 12
 
 # Pipeline-quality heuristic (not a §5/§6 gate): fraction of would-trade
 # events lost to data gaps above which the run is flagged suspect.
@@ -191,7 +199,14 @@ def sigma_window_open_times(anchor: datetime) -> list[datetime]:
 
 
 def expected_funding_times(anchor: datetime, horizon_days: int) -> list[datetime]:
-    """Funding settlement instants in (A, A + horizon·24h], 8h apart."""
+    """Nominal funding settlement instants in (A, A + horizon·24h], 8h apart.
+
+    Provided as a diagnostic helper for callers reasoning about the venue's
+    *expected* settlement schedule. NOT used as a lookup key inside this
+    module: real settlement timestamps carry sub-second jitter, so exact-
+    instant lookup misses by milliseconds. The pipeline sums funding by
+    interval membership (see _funding_pnl_bps_with_gap_check) instead.
+    """
     end = anchor + timedelta(days=horizon_days)
     times: list[datetime] = []
     t = anchor + timedelta(hours=_FUNDING_INTERVAL_HOURS)
@@ -319,16 +334,66 @@ class _BuildResult:
     suspect_candidates: int
 
 
-def _sum_funding_bps(
-    funding_by_time: dict[datetime, FundingRate], times: list[datetime]
+def _funding_pnl_bps_with_gap_check(
+    funding_sorted: Sequence[FundingRate],
+    funding_times: Sequence[datetime],
+    anchor: datetime,
+    horizon_days: int,
 ) -> Decimal | None:
-    """Sum funding over the expected times, or None if any is missing."""
+    """Funding P&L over the holding window, with a cadence-agnostic gap guard.
+
+    JITTER-IMMUNE BY CONSTRUCTION: filters funding records by interval
+    membership (funding_time strictly in (A, A+h·24h]). Real Binance
+    funding_time fields carry sub-second jitter (e.g. 08:00:00.013); the
+    previous exact-instant dict lookup missed every jittered record, which
+    is the defect this replaces.
+
+    COMPLETENESS GUARD: Wasseem's operator-locked rule (i):
+      Relevant stream = funding records with A-8h <= funding_time <= end+8h.
+      Sort by time. If any consecutive gap that overlaps (A, end] exceeds
+      12h, return None (skip funding_gap).
+    Tolerates millisecond offsets and normal 8h cadence; catches a missing
+    8h settlement (creates a 16h gap > 12h) or a truncated/holey export.
+
+    Args:
+        funding_sorted: funding records for the instrument, sorted ascending
+            by funding_time.
+        funding_times: parallel list of funding_time values, for bisect.
+        anchor, horizon_days: holding window (A, A + horizon_days·24h].
+
+    Returns:
+        funding P&L in bps if the window is covered cleanly; None on
+        gap-skip or fully-empty stream.
+    """
+    end = anchor + timedelta(days=horizon_days)
+    stream_start = anchor - timedelta(hours=_FUNDING_INTERVAL_HOURS)
+    stream_end = end + timedelta(hours=_FUNDING_INTERVAL_HOURS)
+
+    i_lo = bisect.bisect_left(funding_times, stream_start)
+    i_hi = bisect.bisect_right(funding_times, stream_end)
+    stream = funding_sorted[i_lo:i_hi]
+    if not stream:
+        # No funding visible within ±8h of the holding window — data hole.
+        return None
+
+    # Consecutive-gap check on records inside the relevant stream. A gap
+    # "overlaps (A, end]" iff the next record is past A AND the previous
+    # record is before end (the two intervals share more than an endpoint).
+    gap_threshold = timedelta(hours=_FUNDING_GAP_MAX_HOURS)
+    for i in range(1, len(stream)):
+        t_prev = stream[i - 1].funding_time
+        t_curr = stream[i].funding_time
+        if (t_curr - t_prev) > gap_threshold:
+            if t_curr > anchor and t_prev < end:
+                return None  # SKIP_FUNDING_GAP
+
+    # Interval-membership sum: every settlement strictly after open, up to
+    # and including close. Sub-second jitter is irrelevant — a record at
+    # 08:00:00.013 is unambiguously inside (A, A+24h] for A=00:00.
     total = Decimal("0")
-    for t in times:
-        fr = funding_by_time.get(t)
-        if fr is None:
-            return None
-        total += fr.funding_rate
+    for f in stream:
+        if anchor < f.funding_time <= end:
+            total += f.funding_rate
     with localcontext() as ctx:
         ctx.prec = _DECIMAL_PRECISION
         return total * _BPS
@@ -347,7 +412,11 @@ def build_forward_returns(
     only; compute_forward_return runs strictly after all presence checks.
     """
     by_open = {k.open_time: k for k in klines}
-    funding_by_time = {f.funding_time: f for f in funding}
+    # Sort funding once; pass sorted list + times to _attempt_horizon, which
+    # bisects the relevant stream per horizon. The previous dict-keyed-by-
+    # funding_time approach silently missed jittered timestamps.
+    funding_sorted = sorted(funding, key=lambda f: f.funding_time)
+    funding_times = [f.funding_time for f in funding_sorted]
     last_open = max(by_open) if by_open else None
 
     out: list[ForwardReturn] = []
@@ -381,8 +450,8 @@ def build_forward_returns(
         gap_this_event = False
         for h in _HORIZONS_DAYS:
             outcome = _attempt_horizon(
-                d, a, h, entry_bar, by_open, funding_by_time, last_open,
-                venue, instrument, out,
+                d, a, h, entry_bar, by_open, funding_sorted, funding_times,
+                last_open, venue, instrument, out,
             )
             if outcome is _HorizonOutcome.BUILT:
                 built += 1
@@ -415,7 +484,8 @@ def _attempt_horizon(
     horizon_days: int,
     entry_bar: BinanceKline,
     by_open: dict[datetime, BinanceKline],
-    funding_by_time: dict[datetime, FundingRate],
+    funding_sorted: Sequence[FundingRate],
+    funding_times: Sequence[datetime],
     last_open: datetime | None,
     venue: str,
     instrument: str,
@@ -432,8 +502,8 @@ def _attempt_horizon(
     if exit_bar is None:
         return _HorizonOutcome.SKIP_MISSING_EXIT
 
-    funding_bps = _sum_funding_bps(
-        funding_by_time, expected_funding_times(anchor, horizon_days)
+    funding_bps = _funding_pnl_bps_with_gap_check(
+        funding_sorted, funding_times, anchor, horizon_days
     )
     if funding_bps is None:
         return _HorizonOutcome.SKIP_FUNDING_GAP

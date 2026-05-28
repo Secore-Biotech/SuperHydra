@@ -29,7 +29,7 @@ from strategies.vol_event_persistence.runner.event_pipeline import (
     expected_funding_times,
     run_pipeline,
     sigma_window_open_times,
-    _sum_funding_bps,
+    _funding_pnl_bps_with_gap_check,
 )
 
 _UTC = timezone.utc
@@ -106,22 +106,25 @@ def test_daily_anchors_naive_raises():
         daily_anchors(datetime(2026, 1, 1), _t(days=5))
 
 
-# ===== _sum_funding_bps =====
+# ===== _funding_pnl_bps_with_gap_check =====
 
 
-def test_sum_funding_all_present():
+def test_funding_pnl_all_present():
+    """Three on-grid records inside (A, A+24h] sum to 3 bps."""
     a = _t(days=2)
-    times = expected_funding_times(a, 1)  # 3 times
-    fmap = {t: _funding(t, "0.0001") for t in times}
-    total = _sum_funding_bps(fmap, times)
+    times = expected_funding_times(a, 1)  # A+8h, A+16h, A+24h
+    fs = [_funding(t, "0.0001") for t in times]
+    fs_sorted = sorted(fs, key=lambda f: f.funding_time)
+    times_sorted = [f.funding_time for f in fs_sorted]
+    total = _funding_pnl_bps_with_gap_check(fs_sorted, times_sorted, a, 1)
     assert total == Decimal("0.0001") * 3 * Decimal("10000")  # = 3 bps
 
 
-def test_sum_funding_missing_returns_none():
+def test_funding_pnl_empty_stream_returns_none():
+    """No funding records at all in ±8h of holding window -> None."""
     a = _t(days=2)
-    times = expected_funding_times(a, 1)
-    fmap = {t: _funding(t, "0.0001") for t in times[:-1]}  # drop last
-    assert _sum_funding_bps(fmap, times) is None
+    total = _funding_pnl_bps_with_gap_check([], [], a, 1)
+    assert total is None
 
 
 # ===== build_vol_series =====
@@ -176,12 +179,23 @@ def test_detect_events_insufficient_history_skips():
 
 
 def _full_klines_and_funding(a: datetime):
-    """Entry bar + all three horizon exit bars + full funding for h=7."""
+    """Entry bar + all three horizon exit bars + full funding for h=7.
+
+    Includes funding records BEFORE the anchor (back to A-72h) so the gap-
+    check rule has real predecessors to compare against — matches reality
+    (Binance publishes funding continuously, not starting at the event).
+    """
     klines = [_kline(a - timedelta(hours=1), "100")]  # entry
     for h in (1, 3, 7):
         klines.append(_kline(a + timedelta(days=h) - timedelta(hours=1),
                              f"{100 + h}"))
-    funding = [_funding(t, "0.0001") for t in expected_funding_times(a, 7)]
+    # Pre-A funding at A-72h, A-64h, ..., A-8h, A (10 records, including
+    # the A-anchor settlement itself — real Binance publishes funding at
+    # 00/08/16 daily, so A=00:00 has a settlement just like any other).
+    pre_times = [a - timedelta(hours=h) for h in range(72, -1, -8)]
+    # In-window funding through A+168h (for h=7).
+    in_times = expected_funding_times(a, 7)
+    funding = [_funding(t, "0.0001") for t in pre_times + list(in_times)]
     return klines, funding
 
 
@@ -330,3 +344,70 @@ def test_run_pipeline_suspect_flag_on_funding_gap():
         assert s.forward_returns_built == 0
         assert s.suspect_skip_rate > DATA_QUALITY_SUSPECT_THRESHOLD
         assert s.data_quality_suspect is True
+
+
+# ===== Funding model: jitter immunity + gap-check (commit-8 amendment) =====
+
+
+def test_jittered_funding_times_included():
+    """Sub-second jitter (e.g. .013s) must NOT cause misses. This is the
+    real Binance shape — exact-instant lookup was the original defect."""
+    a = _t(days=100)
+    klines, _ = _full_klines_and_funding(a)
+    pre_times = [a - timedelta(hours=h) for h in range(72, -1, -8)]
+    in_times = expected_funding_times(a, 7)
+    # Add 13ms jitter to every funding record — mirrors real venue data
+    funding = [
+        _funding(t + timedelta(milliseconds=13), "0.0001")
+        for t in pre_times + list(in_times)
+    ]
+    d = _decision(a, EventDirection.LONG)
+    r = build_forward_returns([d], klines, funding, _V, _I)
+    assert r.event_candidates == 1
+    assert r.forward_returns_built == 3, "jittered funding caused false skip"
+    assert r.skipped_funding_gap == 0
+
+
+def test_exact_grid_funding_still_works():
+    """Regression: exact :00 funding (no jitter) still sums correctly."""
+    a = _t(days=100)
+    klines, funding = _full_klines_and_funding(a)
+    d = _decision(a, EventDirection.LONG)
+    r = build_forward_returns([d], klines, funding, _V, _I)
+    assert r.forward_returns_built == 3
+    assert r.skipped_funding_gap == 0
+
+
+def test_missing_middle_settlement_triggers_gap_skip():
+    """Removing one mid-window funding record creates a 16h consecutive
+    gap > 12h overlapping (A, end] -> SKIP_FUNDING_GAP for affected horizons."""
+    a = _t(days=100)
+    klines, funding = _full_klines_and_funding(a)
+    # Drop A+24h (in the middle of the h=3 and h=7 windows; just after h=1 close)
+    missing = a + timedelta(hours=24)
+    funding = [f for f in funding if f.funding_time != missing]
+    d = _decision(a, EventDirection.LONG)
+    r = build_forward_returns([d], klines, funding, _V, _I)
+    # h=1 ends at A+24h: gap (A+16h, A+32h) = 16h, t_prev=A+16h < end=A+24h
+    # AND t_curr=A+32h > A, so it overlaps (A, A+24h] -> skip.
+    # h=3 and h=7 windows also span the gap -> skip.
+    assert r.skipped_funding_gap == 3
+    assert r.forward_returns_built == 0
+
+
+def test_endpoint_jitter_alone_does_not_skip():
+    """Uniform millisecond jitter (no missing records) must not trip the
+    gap-check. Jitter adds at most ~1 ms per gap; nowhere near 12h."""
+    a = _t(days=100)
+    klines, _ = _full_klines_and_funding(a)
+    pre_times = [a - timedelta(hours=h) for h in range(72, -1, -8)]
+    in_times = expected_funding_times(a, 7)
+    # Different jitter per record to make it more realistic
+    funding = [
+        _funding(t + timedelta(milliseconds=(i % 17)), "0.0001")
+        for i, t in enumerate(pre_times + list(in_times))
+    ]
+    d = _decision(a, EventDirection.LONG)
+    r = build_forward_returns([d], klines, funding, _V, _I)
+    assert r.skipped_funding_gap == 0
+    assert r.forward_returns_built == 3
