@@ -113,3 +113,98 @@ class PerpOrderIntent:
                 f"direction {self.direction.value!r}; expected "
                 f"{expected_side.value!r}"
             )
+
+
+# ===== Close intent (exit) =====
+#
+# A close is a distinct type, not an overloaded entry. An entry carries a
+# direction whose side it must match; a close carries the ORIGINAL
+# direction plus the OPPOSITE side, explicitly marked as an exit. Modeling
+# the close as its own type keeps entry validation strict and prevents a
+# close (e.g. SELL to exit a LONG) from being mis-attributed as a fresh
+# SHORT signal in gates/attribution.
+
+CLOSE_INTENT_SCHEMA_VERSION: Final[str] = "perp_close_intent.v0"
+
+# The side that CLOSES a position opened in a given direction.
+_DIRECTION_TO_CLOSE_SIDE = {
+    EventDirection.LONG: OrderSide.SELL,   # close a long by selling
+    EventDirection.SHORT: OrderSide.BUY,   # close a short by buying
+}
+
+
+def event_id_for(venue: str, instrument: str, as_of: datetime) -> str:
+    """Deterministic natural key identifying one event.
+
+    One event occurs per (venue, instrument) per evaluation day, so the
+    triple (venue, instrument, as_of) uniquely identifies it. Used to pair
+    an entry with its close in attribution, independent of whether an
+    intent_uuid has been assigned yet.
+
+    Readable rather than hashed: a human-legible key is easier to debug,
+    and any malformed as_of (e.g. stray microseconds) surfaces directly
+    in the key rather than being hidden behind a digest.
+    """
+    return f"{venue}:{instrument}:{as_of.isoformat()}"
+
+
+@dataclass(frozen=True)
+class PerpCloseIntent:
+    """A single-leg perp exit, closing a previously opened entry.
+
+    Distinct from PerpOrderIntent: this is explicitly an exit, never a new
+    directional signal. It retains the original direction for attribution
+    and carries the opposite side to flatten the position.
+
+    Fields:
+        entry_intent_uuid: the entry's intent_uuid if one was assigned;
+            may be None. Secondary linkage to the entry order.
+        original_event_id: the event natural key (see event_id_for). The
+            primary, always-present linkage between entry and close.
+        original_direction: the entry's direction (LONG or SHORT). Retained
+            so attribution knows which way the position was held.
+        close_side: the side that flattens the position. Must be the
+            opposite of the side implied by original_direction.
+        quantity: absolute base-asset quantity to close (matches the entry).
+        venue, instrument: identity (mirror the entry).
+        as_of: when the close is generated (the holding-horizon timestamp).
+        sizing_config_hash: lineage, carried from the entry.
+        schema_version: this intent's schema version.
+    """
+
+    entry_intent_uuid: str | None
+    original_event_id: str
+    original_direction: EventDirection
+    close_side: OrderSide
+    quantity: Decimal
+    venue: str
+    instrument: str
+    as_of: datetime
+    sizing_config_hash: str
+    schema_version: str = CLOSE_INTENT_SCHEMA_VERSION
+
+    def __post_init__(self) -> None:
+        if self.as_of.tzinfo is None:
+            raise ValueError("as_of must be timezone-aware")
+        if not self.original_event_id:
+            raise ValueError("original_event_id must be non-empty")
+        if self.original_direction not in (EventDirection.LONG, EventDirection.SHORT):
+            raise ValueError(
+                f"original_direction must be LONG or SHORT (a FLAT decision "
+                f"never opened a position), got {self.original_direction!r}"
+            )
+        if not isinstance(self.quantity, Decimal):
+            raise TypeError("quantity must be Decimal")
+        if self.quantity <= Decimal("0"):
+            raise ValueError(f"quantity must be positive, got {self.quantity}")
+        if not self.venue or not self.venue.islower():
+            raise ValueError(f"venue must be lowercase non-empty, got {self.venue!r}")
+        if not self.instrument:
+            raise ValueError("instrument must be non-empty")
+        expected_close_side = _DIRECTION_TO_CLOSE_SIDE[self.original_direction]
+        if self.close_side != expected_close_side:
+            raise ValueError(
+                f"close_side {self.close_side.value!r} does not flatten a "
+                f"{self.original_direction.value!r} position; expected "
+                f"{expected_close_side.value!r}"
+            )

@@ -161,3 +161,122 @@ def test_intent_accepts_explicit_uuid():
         intent_uuid="11111111-1111-1111-1111-111111111111",
     )
     assert intent.intent_uuid == "11111111-1111-1111-1111-111111111111"
+
+
+# ===== event_id_for =====
+
+from strategies.vol_event_persistence.sizing.order_intent import (  # noqa: E402
+    CLOSE_INTENT_SCHEMA_VERSION,
+    PerpCloseIntent,
+    event_id_for,
+)
+
+
+def test_event_id_deterministic():
+    a = event_id_for("binance", "BTCUSDT", _AS_OF)
+    b = event_id_for("binance", "BTCUSDT", _AS_OF)
+    assert a == b
+
+
+def test_event_id_distinct_per_coordinate():
+    base = event_id_for("binance", "BTCUSDT", _AS_OF)
+    assert event_id_for("binance", "ETHUSDT", _AS_OF) != base
+    assert event_id_for("okx", "BTCUSDT", _AS_OF) != base
+    assert event_id_for("binance", "BTCUSDT",
+                        datetime(2026, 1, 2, 0, 0, 0, tzinfo=timezone.utc)) != base
+
+
+def test_event_id_readable_format():
+    eid = event_id_for("binance", "BTCUSDT", _AS_OF)
+    assert eid == "binance:BTCUSDT:2026-01-01T00:00:00+00:00"
+
+
+# ===== PerpCloseIntent =====
+
+
+def test_close_schema_version_value():
+    assert CLOSE_INTENT_SCHEMA_VERSION == "perp_close_intent.v0"
+
+
+def _close(
+    *,
+    original_direction: EventDirection = EventDirection.LONG,
+    close_side: OrderSide = OrderSide.SELL,
+    qty: str = "1.0",
+    event_id: str = "binance:BTCUSDT:2026-01-01T00:00:00+00:00",
+    uuid: str | None = None,
+) -> PerpCloseIntent:
+    return PerpCloseIntent(
+        entry_intent_uuid=uuid,
+        original_event_id=event_id,
+        original_direction=original_direction,
+        close_side=close_side,
+        quantity=Decimal(qty),
+        venue="binance",
+        instrument="BTCUSDT",
+        as_of=_AS_OF,
+        sizing_config_hash="abc123",
+    )
+
+
+def test_close_valid_long_origin_sells():
+    c = _close(original_direction=EventDirection.LONG, close_side=OrderSide.SELL)
+    assert c.original_direction is EventDirection.LONG
+    assert c.close_side is OrderSide.SELL
+    assert c.schema_version == CLOSE_INTENT_SCHEMA_VERSION
+
+
+def test_close_valid_short_origin_buys():
+    c = _close(original_direction=EventDirection.SHORT, close_side=OrderSide.BUY)
+    assert c.original_direction is EventDirection.SHORT
+    assert c.close_side is OrderSide.BUY
+
+
+def test_close_rejects_long_origin_with_buy_side():
+    with pytest.raises(ValueError, match="does not flatten"):
+        _close(original_direction=EventDirection.LONG, close_side=OrderSide.BUY)
+
+
+def test_close_rejects_short_origin_with_sell_side():
+    with pytest.raises(ValueError, match="does not flatten"):
+        _close(original_direction=EventDirection.SHORT, close_side=OrderSide.SELL)
+
+
+def test_close_rejects_flat_original_direction():
+    with pytest.raises(ValueError, match="LONG or SHORT"):
+        _close(original_direction=EventDirection.FLAT, close_side=OrderSide.SELL)
+
+
+def test_close_rejects_empty_event_id():
+    with pytest.raises(ValueError, match="non-empty"):
+        _close(event_id="")
+
+
+def test_close_rejects_naive_as_of():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        PerpCloseIntent(
+            entry_intent_uuid=None,
+            original_event_id="binance:BTCUSDT:x",
+            original_direction=EventDirection.LONG,
+            close_side=OrderSide.SELL,
+            quantity=Decimal("1"),
+            venue="binance",
+            instrument="BTCUSDT",
+            as_of=datetime(2026, 1, 1, 0, 0, 0),  # naive
+            sizing_config_hash="abc123",
+        )
+
+
+def test_close_rejects_non_positive_quantity():
+    with pytest.raises(ValueError, match="positive"):
+        _close(qty="0")
+
+
+def test_close_carries_entry_uuid_when_present():
+    c = _close(uuid="11111111-1111-1111-1111-111111111111")
+    assert c.entry_intent_uuid == "11111111-1111-1111-1111-111111111111"
+
+
+def test_close_entry_uuid_may_be_none():
+    c = _close(uuid=None)
+    assert c.entry_intent_uuid is None
