@@ -45,22 +45,28 @@ The intersection of {not-terminal} ∩ {falsifiable} ∩ {in-envelope} is the ac
 | Thousand-factor ensemble (QAnalytics/Panton-style) | Trading | Out-of-envelope | No (as posed) | No | Edge, if any, lives in 5,000-factor generation + ensemble + execution/neutralization — the institutional infrastructure `§4` bullet 4 excludes. "Combination of weak signals" is not a falsifiable hypothesis | derived; QAnalytics deck (unvalidated) |
 | Legacy MM (old Hydra) | Legacy | Frozen | — | — | +$108 cumulative on record; frozen under old-Hydra plan, behind the roadmap §7 firewall, out of edge-scoping remit | `old_hydra_mm_final_pnl.md`, `old_hydra_freeze_plan.md` |
 | Legacy L4/L9/L3/Polymarket strategies | Legacy | Frozen / closed | — | — | Closed or frozen under old-Hydra freeze; not in scope for new-program edge search | `old_hydra_freeze_plan.md` |
-| A3 — cash-and-carry | Trading | **Untested** | Yes (if specified) | **TBD — pending §4 screen** | Never honestly tested. Distinct object (locked carry from dated futures/perp structure) IF dated-futures, not perp funding (else it's same-venue basis carry, already killed). Capital efficiency at $50k is the likely binding constraint | roadmap; pending screen |
-| Volatility dislocation (vol shock → ?, not persistence) | Trading | **Untested** | TBD | TBD | Genuinely distinct from Section A persistence ONLY if a different measured object, not a longer-horizon view of the same intraday dislocation. Must clear `§6` same-object test before counting as new | roadmap; pending §6 screen |
+| A3 — dated-futures cash-and-carry | Trading | Out-of-envelope (infrastructure), conditional | Yes (defined as A3b) | No — requires Deribit/CME onboarding not in substrate | Roadmap §3.1.3 defines it (BTC futures vs spot); deferred behind futures-venue onboarding; promotion gate "A1+A2 at scale" now unreachable (A1 op-rejected, A2 killed). Economics UNTESTED — scope block, not edge verdict | `a3_definition.md` (`6f72ebc`) |
+| Volatility dislocation → liquidity recovery / spread compression | Trading | Provisional FAIL (§4 bullet 5) | Yes (object); no deployable shape | No deployable shape in-envelope | Survives §6 as distinct object, but every deployment shape is excluded (market-making), non-standalone (execution overlay), or already-killed (basis/MR/vol-persistence). Pending operator naming a shape outside those | `vol_dislocation_liquidity_recovery_s4_screen.md` (`3c7c8f4`) |
 
 ## What remains in the search space
 
-After the full record, the intersection {not-terminal} ∩ {plausibly falsifiable} ∩ {plausibly in-envelope} contains exactly two candidates, both conditional:
+As of `6f72ebc` / `3c7c8f4`, both previously conditional candidates have resolved:
 
-1. **A3 cash-and-carry** — live only if (a) it is dated-futures carry, not perp-funding carry (the latter is `§3.1` same-venue basis carry, already killed), and (b) it survives the `§4` capital-efficiency screen at $50k. Either failure moves it to empirically-killed or out-of-envelope. **Next action if pursued: the §4 paper screen, before any spec.**
+- **A3** is defined as dated-futures cash-and-carry and is classified as **Out-of-envelope (infrastructure), conditional**. It is not eligible for a normal §4 screen unless the program first makes a standalone decision to fund Deribit/CME-style dated-futures onboarding. Its economics remain untested; this is a scope/infrastructure block, not an edge verdict.
+- **Volatility dislocation → liquidity recovery / spread compression** survives the §6 same-object test but currently has **no deployable in-envelope position shape**. It is therefore **Provisional FAIL (§4 bullet 5)** unless the operator names a deployment shape outside the excluded A–D cases.
+- **Section A** remains the only unresolved mechanical thread. It is data-limited and re-runnable only when the required Binance 2026-05 archive data is available.
 
-2. **Volatility dislocation** — live only if it is a genuinely different measured object from Section A's persistence test, surviving the `§6` same-object screen. If it is "the same statistical object in a longer window," `§6` already kills it. **Next action if pursued: the §6 screen, before any spec.**
-
-Everything else in the new-program tree is terminal. The cross-sectional / market-neutral / factor family (Sleeve B) is the most-explored region of the project, not an open one: five candidates, four distinct failure classes (signal absence, construction fragility, data governance, parameter fragility), all pre-registered and killed. Re-describing that family attractively (e.g. "market-neutral dispersion like QAnalytics") does not move it out of the killed column.
+Therefore, the live search space contains no immediately screen-ready candidate. Any next candidate must either:
+1. resolve one of the pending strategic decisions above, or
+2. introduce a genuinely new, falsifiable, in-envelope economic mechanism not already represented in this map.
 
 ## The earned conclusion
 
-SuperHydra is no longer in idea-generation mode for the new-program tree. It is in idea-validation mode, with at most two conditional candidates left to validate. If both A3 and vol-dislocation fail their screens, the honest outcome is that the next step is not "find another strategy from the existing mechanism set" — it is to find an economic mechanism not already represented anywhere on this map, or to accept that the search space under the current envelope is exhausted. "No attractive next candidate" is a legitimate, earned outcome, and is more valuable than re-litigating a killed direction in fresh language.
+SuperHydra is no longer in idea-generation mode for the new-program tree, and as of this reconciliation it is past idea-validation too: both conditional candidates have resolved. A3 is out-of-envelope behind futures-venue infrastructure whose promotion gate (A1+A2 at scale) is now unreachable; vol-dislocation is a provisional §4 FAIL with no deployable in-envelope shape. The only unresolved thread is Section A, which is mechanical (data-limited, re-runnable now that the 2026-05 archive has published) and carries a pre-specified verdict path — it is not a new direction.
+
+Everything else in the tree is terminal. The cross-sectional / market-neutral / factor family (Sleeve B) is the most-explored region of the project, not an open one: five candidates, four distinct failure classes, all pre-registered and killed. Re-describing that family attractively (e.g. "market-neutral dispersion like QAnalytics") does not move it out of the killed column.
+
+So the live search space contains no immediately screen-ready candidate. Pending Section A's rerun verdict, the next step is not "find another strategy from the existing mechanism set" — it is to find a genuinely new, falsifiable, in-envelope economic mechanism not already on this map, or to accept that the search space under the current envelope is exhausted. "No attractive next candidate" is a legitimate, earned outcome, more valuable than re-litigating a killed direction in fresh language.
 
 ## Maintenance
 
