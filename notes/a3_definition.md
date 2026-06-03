@@ -1,63 +1,72 @@
-# A3 — Definition (template, pending operator decision)
+# A3 — Definition and Status (resolved from records)
 
-**Status:** Open template. A3 has no source specification in the repo — it exists only as a label in the roadmap and in discussion. This note does not define A3; it states the fork that must be resolved before A3 can be screened, and ends on a required operator decision. **Nothing below is a spec.**
+**Status:** Resolved. A3 is **defined** by the roadmap (not undefined as previously assumed) and is **structurally deferred** by program design. This note replaces the earlier template. No probe, no code, no spec.
 **Author:** Wasseem Katt
 **Date:** 2026-06-02
-**Why this is a template, not a verdict:** there is no `a3_*` design document in the project record. The only "A3" string in the kill record (`sleeve_b_quality_kill_action.md`) refers to an unrelated data-source reformulation, not a cash-and-carry strategy. So A3's content is a decision the operator holds, not a fact recoverable from records. Drafting the answer would be inventing the spec — forbidden by the project's define-before-build discipline.
+**Supersedes:** the prior `a3_definition.md` template, which assumed A3 had no source definition. It does — `SuperHydra_FreshStart_Roadmap_v2_1.docx §3.1.3` defines it. The operator-decision the template requested is unnecessary; the roadmap already made it.
 
 ---
 
-## 1. The fork: two completely different things hide under "A3"
+## 0. Disambiguation (two unrelated "A3" labels in the repo)
 
-### A3a — perp-funding / spot-perp carry
+Grep for "A3" returns two things that share a string and nothing else:
 
-Construction: long spot, short perp, harvest funding. If this is what A3 means, it is **not untested.** It sits directly on top of directions already terminal on the map:
+- **Sleeve B Stage-A sub-gate A3** — "source agreement," a data-integrity check in the Sleeve B pre-registration framework (e.g. candidate #2's DeFiLlama-vs-on-chain reformulation). **Irrelevant here.**
+- **Sleeve A engine A3** — the cash-and-carry engine. **This note.**
 
-- **A1** (fixed-threshold and burst-activation funding capture) — data-limited and operationally rejected.
-- **Naive funding carry** — empirically killed (§3.1), Sharpe ~10.7 diagnosed as a cashflow artifact.
-- **Same-venue basis carry** (Binance perp/spot) — empirically killed (§3.1), net edge absent at size.
+Anyone re-greping later must not conflate them.
 
-If A3 = A3a, it is **already killed** and does not earn a §4 screen. It would move straight to the empirically-killed column with a pointer to the A1 / naive-funding / same-venue-basis rows.
+## 1. What A3 is (from the roadmap, verbatim source)
 
-### A3b — dated-futures cash-and-carry
+`§3.1.3 Engine A3 — Cash-and-carry`:
 
-Construction: spot (e.g. BTC) vs **dated quarterly futures**, capturing the locked basis to expiry. If this is what A3 means, it is **genuinely distinct**: different instrument (dated quarterly, not perp), different economic mechanism (calendar basis converging to zero at expiry, not perpetual funding), different financing and roll structure. Nothing on the map measures this object. A3b is the only branch that earns a §4 screen.
+> "Deferred until later. Adds futures-venue onboarding (Deribit or CME), which is operational friction not warranted on day one. Promoted only when A1 and A2 are both at scale and the engineering team has bandwidth for a venue addition without disrupting either."
 
-## 2. The data-substrate question (may close A3b before any screen)
+And `§3.1` lists A3 as "cash-and-carry on **BTC futures vs spot**." So the fork is settled by the source:
 
-A3b cannot be screened — let alone specified — unless the data to test it exists in-substrate. The entire project data substrate is **Binance perp + spot**: every fetcher (`BinanceArchiveTradeFetcher`, `BinanceSpotArchiveTradeFetcher`), every fixture, the funding series. Dated quarterly futures are a different instrument class. Before A3b is eligible for a §4 screen, the following must be answered:
+- **A3 = A3b (dated-futures cash-and-carry): long/short BTC spot against a dated futures contract (Deribit or CME), capturing calendar basis as it converges to zero at expiry.**
+- A3 is **not** A3a (perp-funding carry). Perp carry is A1's domain; the roadmap treats A1/A2/A3 as three independent engines (`§3.1`, `§A.2`). The A3a branch of the earlier template is void — it was never what A3 meant.
 
-1. **History coverage.** Is there dated-quarterly-futures archive history of sufficient length and quality for an OOS window comparable to other probes (multi-year)?
-2. **Roll mechanics.** Are the contract roll dates, expiry mechanics, and continuous-series construction rules available and reconstructable from the archive?
-3. **Tradable contract coverage.** Are the contracts that would be traded actually liquid and accessible under the program's account/venue setup at the relevant horizons?
+## 2. Why A3 is distinct from every killed direction
 
-If the answer to any of these is no, A3b is **out-of-envelope on data availability** — the same structural wall that killed Sleeve B #2 (point-in-time fee data structurally unavailable). In that case A3b moves toward out-of-envelope *without* a §4 screen, and since A3a is already-killed, **A3 closes entirely on definitional + data grounds.**
-
-## 3. Consequence table
-
-| If A3 is defined as… | Then A3 is… | Next gate |
+| Dimension | Killed funding/basis directions | A3 (dated-futures cash-and-carry) |
 |---|---|---|
-| A3a (perp-funding / spot-perp carry) | Already empirically killed (A1 + naive funding + same-venue basis) | None — move to killed column |
-| A3b (dated-futures cash-and-carry) AND data exists | Genuinely untested | §4 screen (capital efficiency at $50k is the likely binding constraint) |
-| A3b but dated-futures data does NOT exist in-substrate | Out-of-envelope (data availability) | None — move to out-of-envelope; A3 closes |
-| Something else | Undefined | State it; re-run this fork |
+| Venue | Binance perp/spot | **Deribit or CME** (dated futures) |
+| Instrument | Perpetual contracts | **Dated quarterly futures** |
+| Mechanism | Perpetual funding / perp-spot basis | **Calendar basis converging to zero at expiry** |
+| Return source | Funding payments / spot-perp spread | **Spot-vs-dated convergence (locked carry to expiry)** |
 
-## 4. Eligibility statement
+This is a genuinely different measured object from A1 (funding), A2 (perp-vs-spot basis), and the §3.1 same-venue/cross-venue basis kills. A3 is **not** already-killed.
 
-> **A3 is not eligible for a §4 screen until this fork is resolved.** As written, "A3 cash-and-carry" is a label without a measured object. A screen run against an undefined direction is wasted motion — and under one branch (A3a) the screen is unnecessary because the direction is already killed.
+## 3. Why A3 is not a live near-term candidate anyway — its promotion gate is unreachable
 
-## 5. Operator decision required
+A3 being distinct does not make it pursuable now. The roadmap defers A3 explicitly, and the deferral is structural, not incidental:
+
+1. **Data/infrastructure precondition.** A3 requires Deribit or CME dated-futures onboarding — data, contract/roll mechanics, and a tradable venue not in the current substrate (Binance perp/spot/funding/metrics). The roadmap calls this "operational friction not warranted on day one." This is a `§4` bullet-4 footprint cost (net-new venue integration) and a data-availability wall comparable to the one that killed Sleeve B #2 (PIT data structurally unavailable).
+2. **The promotion precondition is now unreachable.** A3's stated gate is "promoted only when **A1 and A2 are both at scale**." As of the direction map (`c9d1c17`): **A1 is operationally rejected, A2 is empirically killed.** Neither will reach scale. So A3's own promotion condition can never be satisfied under the program as it stands.
+
+A3 is therefore **defined, distinct, and structurally blocked** — not by lack of edge (untested), but because the infrastructure to test it is out-of-scope by design and the precondition that would justify that infrastructure (A1/A2 at scale) has failed.
+
+## 4. Status assignment for the direction map
+
+> **A3 (dated-futures cash-and-carry) — Out-of-envelope (infrastructure), conditional.**
+> Defined as A3b. Genuinely distinct from all killed directions. Requires Deribit/CME dated-futures onboarding the substrate does not have and `§4` defers; its roadmap promotion gate ("A1 and A2 both at scale") is unreachable now that A1 is operationally rejected and A2 is killed. Economic status UNTESTED — this is a scope/infrastructure block, not an edge verdict. Re-eligible only if the program deliberately chooses to fund futures-venue onboarding as a standalone bet, independent of the (failed) A1/A2-at-scale precondition.
+
+## 5. The one decision that remains (and it is NOT "what is A3")
+
+A3's definition is settled. The only open question is a program-level one, and it is genuinely the operator's:
 
 ```
-A3 = [ perp carry (A3a)  /  dated-futures carry (A3b)  /  other ]
+Does the program fund Deribit/CME dated-futures onboarding as a STANDALONE bet —
+i.e. decouple A3 from its original "A1 and A2 at scale" precondition —
+given that A3 is now the only distinct, non-killed trading object left
+but sits entirely behind net-new venue infrastructure?
+
+  [ no:  A3 stays out-of-envelope; the new-program trading search space is exhausted ]
+  [ yes: A3 becomes a deliberate infrastructure investment; write its §4 screen
+         against the standalone-onboarding cost, NOT against the dead A1/A2 gate ]
 ```
 
-And, if A3b:
-
-```
-Dated quarterly futures data in-substrate?  [ yes / no / unknown — needs a data-availability check ]
-```
-
-Once both are answered, A3's row on `direction_map.md` resolves to one of: empirically-killed (A3a), untested-and-§4-eligible (A3b + data), or out-of-envelope (A3b, no data). Until then it stays Untested / pending-definition and earns nothing.
+This is not a "define A3" decision (done) and not a "find a strategy" decision. It is a capital/scope decision about whether to build a new venue integration to test the last distinct object on the map. Under the family-capital mission and the $50k / solo-operator envelope, the prior leans **no** — venue onboarding for a single deferred engine is heavy infrastructure for an untested edge — but that is the operator's call, not a records fact.
 
 — end —
